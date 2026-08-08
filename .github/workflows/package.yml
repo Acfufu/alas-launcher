@@ -159,6 +159,7 @@ jobs:
             APP=target/release/bundle/macos/AzurLaneAutoScript.app
             cp -r AzurLaneAutoScript "$APP/Contents/"
             rdfind -minsize 128 -makehardlinks true "$APP"
+            mv "$APP" AzurLaneAutoScript.app
             uv run python - <<EOF
             import tarfile, lzma
             with tarfile.open('AzurLaneAutoScript-${{ runner.os }}-$(uname -m).tar.xz', 'x:xz', preset=9|lzma.PRESET_EXTREME) as t:
@@ -258,6 +259,7 @@ jobs:
         if: github.ref_type == 'tag'
         with:
           prerelease: true
+          update_release: true
           files: |
             AzurLaneAutoScript-${{ runner.os }}-*
             AzurLaneAutoScript-CN-${{ runner.os }}-*
