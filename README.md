@@ -17,6 +17,42 @@ ALAS Launcher: 一种新型的 [AzurLaneAutoScript](https://github.com/LmeSzinc/
 - MacOS: 打开 `AzurLaneAutoScript.app`。如果报错则需要先打开终端，运行 `xattr -dr com.apple.quarantine AzurLaneAutoScript.app` （因为我没有林檎开发者给程序签名）
 - Linux: 打开 `alas-launcher`。注意程序依赖 `libwebkit2gtk-4.1` 和较新的 `glibc` （用 Ubuntu 22.04 跑的 CI）。如果没有，可能这启动器没法跑，但是 ALAS 本体跑起来应该没问题的
 
+构建 (Build)
+---
+本地构建 macOS 的 `.app`：
+
+1. 依赖：[Rust](https://rustup.rs) (stable)、Node.js (提供 npx)、Xcode Command Line Tools
+2. 构建：
+   ```bash
+   npx --yes @tauri-apps/cli@2 build --bundles app
+   ```
+   产物在 `target/release/bundle/macos/AzurLaneAutoScript.app`。
+
+3. 注意：上面的产物只是启动器外壳，没有 ALAS 本体。完整可用需要把 payload（python toolkit / git / adb / ALAS 仓库）放进 `Contents/AzurLaneAutoScript` —— 正式发布包由 GitHub Actions 自动拼装（见 `.github/workflows/package.yml`）。本地可以从已有安装拷贝：
+   ```bash
+   APP=target/release/bundle/macos/AzurLaneAutoScript.app
+   cp -R /Applications/AzurLaneAutoScript.app/Contents/AzurLaneAutoScript "$APP/Contents/"
+   ```
+4. 完整产物统一放到 `release/` 目录（已 gitignore，避免误提交）：
+   ```bash
+   cp -R target/release/bundle/macos/AzurLaneAutoScript.app release/
+   ```
+
+发布 (Release)
+---
+发布由 GitHub Actions 自动完成：推送 tag 即触发 `.github/workflows/package.yml`，三个平台 (macOS/Linux/Windows) 并行构建完整包并上传到 Releases。
+
+```bash
+git tag v0.1.0            # 版本号与 tauri.conf.json 的 version 一致
+git push origin v0.1.0    # 触发 CI
+```
+
+也可以手动把本地构建的 `.app` 传上去（例如跳过完整 CI 构建）：
+
+```bash
+gh release create v0.1.0 release/AzurLaneAutoScript.app --title "v0.1.0" --notes "..."
+```
+
 许可协议
 ---
 因为 ALAS 用 GPLv3 所以咱也用 GPLv3。依赖软件大多是Apache2，BSD3啥的，请自行去上游找吧。。。
