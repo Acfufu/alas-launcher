@@ -16,6 +16,42 @@ Go to Releases on the right, download the archive for your system and CPU archit
 - MacOS: Open `AzurLaneAutoScript.app`. If there's an error, open Terminal and run `xattr -dr com.apple.quarantine AzurLaneAutoScript.app` (because I don't have an Apple developer certificate to sign the program)
 - Linux: Run `alas-launcher`. Note that the program depends on `libwebkit2gtk-4.1` and a recent `glibc` (CI runs on Ubuntu 22.04). If you don't have these, the launcher might not work, but ALAS itself should run fine
 
+Building
+---
+Build the macOS `.app` locally:
+
+1. Prerequisites: [Rust](https://rustup.rs) (stable), Node.js (for npx), Xcode Command Line Tools
+2. Build:
+   ```bash
+   npx --yes @tauri-apps/cli@2 build --bundles app
+   ```
+   Output: `target/release/bundle/macos/AzurLaneAutoScript.app`.
+
+3. Note: the output above is only the launcher shell, without ALAS itself. To make it fully functional, the payload (python toolkit / git / adb / ALAS repo) must be placed into `Contents/AzurLaneAutoScript` — official release packages are assembled automatically by GitHub Actions (see `.github/workflows/package.yml`). Locally, you can copy it from an existing installation:
+   ```bash
+   APP=target/release/bundle/macos/AzurLaneAutoScript.app
+   cp -R /Applications/AzurLaneAutoScript.app/Contents/AzurLaneAutoScript "$APP/Contents/"
+   ```
+4. Keep complete builds in the `release/` directory (gitignored, to avoid accidental commits):
+   ```bash
+   cp -R target/release/bundle/macos/AzurLaneAutoScript.app release/
+   ```
+
+Releasing
+---
+Releases are assembled automatically by GitHub Actions: pushing a tag triggers `.github/workflows/package.yml`, which builds the full package for all three platforms (macOS/Linux/Windows) in parallel and uploads them to Releases.
+
+```bash
+git tag v0.1.0            # version must match the `version` in tauri.conf.json
+git push origin v0.1.0    # triggers CI
+```
+
+You can also manually upload a locally built `.app` (e.g., to skip the full CI build):
+
+```bash
+gh release create v0.1.0 release/AzurLaneAutoScript.app --title "v0.1.0" --notes "..."
+```
+
 License
 ---
 Since ALAS uses GPLv3, we use GPLv3 too. Most dependencies use Apache2, BSD3, etc. - please check upstream repos for details.

@@ -153,13 +153,12 @@ jobs:
             cp ../deploy.unix.yaml config/deploy.yaml
 
             cd ${{ github.workspace }}
-            mkdir -p AzurLaneAutoScript.app/Contents/MacOS
-            cp target/release/alas-launcher AzurLaneAutoScript.app/Contents/MacOS/
-            mkdir -p AzurLaneAutoScript.app/Contents/Resources
-            cp icons/icon.icns AzurLaneAutoScript.app/Contents/Resources/
-            cp -r AzurLaneAutoScript AzurLaneAutoScript.app/Contents/
-            cp Info.plist AzurLaneAutoScript.app/Contents/
-            rdfind -minsize 128 -makehardlinks true AzurLaneAutoScript.app
+            # Build the .app with the canonical Tauri bundler (proper Info.plist
+            # generation + embedded icon), then inject the ALAS payload.
+            npx --yes @tauri-apps/cli@2 build --bundles app
+            APP=target/release/bundle/macos/AzurLaneAutoScript.app
+            cp -r AzurLaneAutoScript "$APP/Contents/"
+            rdfind -minsize 128 -makehardlinks true "$APP"
             uv run python - <<EOF
             import tarfile, lzma
             with tarfile.open('AzurLaneAutoScript-${{ runner.os }}-$(uname -m).tar.xz', 'x:xz', preset=9|lzma.PRESET_EXTREME) as t:
