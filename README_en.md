@@ -27,7 +27,7 @@ Build the macOS `.app` locally:
    ```
    Output: `target/release/bundle/macos/AzurLaneAutoScript.app`.
 
-3. Note: the output above is only the launcher shell, without ALAS itself. To make it fully functional, the payload (python toolkit / git / adb / ALAS repo) must be placed into `Contents/AzurLaneAutoScript` — official release packages are assembled automatically by GitHub Actions (see `.github/workflows/package.yml`). Locally, you can copy it from an existing installation:
+3. Note: the output above is only the launcher shell, without ALAS itself. To make it fully functional, the payload (python toolkit / git / adb / ALAS repo) must be placed into `Contents/AzurLaneAutoScript`. Locally, you can copy it from an existing installation:
    ```bash
    APP=target/release/bundle/macos/AzurLaneAutoScript.app
    cp -R /Applications/AzurLaneAutoScript.app/Contents/AzurLaneAutoScript "$APP/Contents/"
@@ -39,16 +39,11 @@ Build the macOS `.app` locally:
 
 Releasing
 ---
-Releases are assembled automatically by GitHub Actions: pushing a tag triggers `.github/workflows/package.yml`, which builds the full package for all three platforms (macOS/Linux/Windows) in parallel and uploads them to Releases.
+Releasing is manual: build the complete `.app` locally (see build steps above, including payload), put it in `release/`, then publish:
 
 ```bash
 git tag v0.1.0            # version must match the `version` in tauri.conf.json
-git push origin v0.1.0    # triggers CI
-```
-
-You can also manually upload a locally built `.app` (e.g., to skip the full CI build):
-
-```bash
+git push origin v0.1.0
 gh release create v0.1.0 release/AzurLaneAutoScript.app --title "v0.1.0" --notes "..."
 ```
 
@@ -79,7 +74,7 @@ Technical Details
 4. Following binss's blog, chose MXNet 1.9.1 and a newer NumPy version. Interestingly, this NumPy version removed `np.bool`, so monkey-patched MXNet to add this type back.
 5. Since cnocr only accepts mxnet \[1.5.0, 1.7.0\), modified the version when packaging.
 6. Used Tauri for the shell. Original GUI's Electron could probably work on Mac, but it looked messy so I gave up after brief research.
-7. Packaging scripts, all on GitHub Actions, see `.github/workflows`.
+7. Packaging is fully manual: build the launcher shell with Tauri, assemble the payload (toolkit / git / adb / ALAS) into a complete `.app`, then release manually.
 8. Removed some duplicate files. Not sure why *-nix symlinks were all packed as copies, or if it was due to `cp` with hardlinks? Anyway, just deduped with hardlinks. Too lazy to investigate deeper compression.
 
 Directory Structure

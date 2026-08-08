@@ -28,7 +28,7 @@ ALAS Launcher: 一种新型的 [AzurLaneAutoScript](https://github.com/LmeSzinc/
    ```
    产物在 `target/release/bundle/macos/AzurLaneAutoScript.app`。
 
-3. 注意：上面的产物只是启动器外壳，没有 ALAS 本体。完整可用需要把 payload（python toolkit / git / adb / ALAS 仓库）放进 `Contents/AzurLaneAutoScript` —— 正式发布包由 GitHub Actions 自动拼装（见 `.github/workflows/package.yml`）。本地可以从已有安装拷贝：
+3. 注意：上面的产物只是启动器外壳，没有 ALAS 本体。完整可用需要把 payload（python toolkit / git / adb / ALAS 仓库）放进 `Contents/AzurLaneAutoScript`。本地可以从已有安装拷贝：
    ```bash
    APP=target/release/bundle/macos/AzurLaneAutoScript.app
    cp -R /Applications/AzurLaneAutoScript.app/Contents/AzurLaneAutoScript "$APP/Contents/"
@@ -40,16 +40,11 @@ ALAS Launcher: 一种新型的 [AzurLaneAutoScript](https://github.com/LmeSzinc/
 
 发布 (Release)
 ---
-发布由 GitHub Actions 自动完成：推送 tag 即触发 `.github/workflows/package.yml`，三个平台 (macOS/Linux/Windows) 并行构建完整包并上传到 Releases。
+发布是手动操作：本地构建完整 `.app`（见上文构建步骤，含 payload），放进 `release/`，然后发版：
 
 ```bash
 git tag v0.1.0            # 版本号与 tauri.conf.json 的 version 一致
-git push origin v0.1.0    # 触发 CI
-```
-
-也可以手动把本地构建的 `.app` 传上去（例如跳过完整 CI 构建）：
-
-```bash
+git push origin v0.1.0
 gh release create v0.1.0 release/AzurLaneAutoScript.app --title "v0.1.0" --notes "..."
 ```
 
@@ -80,7 +75,7 @@ gh release create v0.1.0 release/AzurLaneAutoScript.app --title "v0.1.0" --notes
 4. 根据 binss 佬的博客选择了编译 MXNet 1.9.1 版本，并且选择了一个较新的 NumPy 版本。奇妙的是 NumPy 这个版本没了 `np.bool`，于是在 mxnet 里🐒补丁了一下给这个类型加了上去。
 5. 因为 cnocr 只认 mxnet \[1.5.0, 1.7.0\)，所以在拼好包的时候魔改了一下版本。
 6. 用 Tauri 搓了层壳。理论上原 GUI 用的 Electron 不是不能用吧，在 Mac 上应该可以跑，但怎么看都很草，我研究两下就放弃了。
-7. 打包脚本，全程 GitHub Actions，见 `.github/workflows`。
+7. 打包流程全手动：Tauri 构建启动器外壳，拼装 payload（toolkit / git / adb / ALAS）成完整 `.app`，再手动发 Release。
 8. 稍微去了一下重复文件，不知道为啥 *-nix 应该是符号链接的全给包成了复制，还是说原本应该是硬链接 `cp` 导致的？不知道，反正直接硬链接去重了。懒得研究深度缩小体积了。
 
 目录结构
