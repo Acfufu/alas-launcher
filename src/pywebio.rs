@@ -53,18 +53,16 @@ use crate::menu_model::ControlLabels;
 const HOME_QUIESCE: Duration = Duration::from_secs(6);
 /// Observation window after a scheduler click, watching for the button
 /// re-render (label flip) that confirms the click landed. Re-renders arrive
-/// immediately after the callback, so a short window suffices; the 1s
-/// callback-id staleness means a re-click must reuse a fresh id whenever one
-/// rendered.
+/// immediately after the callback, so a short window suffices. The window is
+/// observation-only: the click is NEVER repeated (bug-fix task-6b: the ALAS
+/// scheduler boot takes 2-5s, so the flip cannot arrive in time; a re-click
+/// would deliver a SECOND callback and double-spawn the scheduler).
 const CONFIRM_WINDOW: Duration = Duration::from_millis(1500);
 /// Granularity of each socket read. Keeps the <1s callback-id staleness race
 /// bounded: after a spec arrives we react within ~this many ms.
 const READ_POLL: Duration = Duration::from_millis(250);
 /// Upper bound for a single ws write.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-/// How many extra scheduler clicks to attempt without confirmation before
-/// giving up and returning Ok (the poll loop self-heals the state line).
-const MAX_RETRIES: u32 = 2;
 
 /// Parse the pinned pywebio version from a requirements.txt payload.
 ///
@@ -319,13 +317,16 @@ fn connect(port: u16, deadline: Instant) -> Result<tungstenite::WebSocket<TcpStr
 ///
 /// Confirmation semantics (todo 5): delivering the scheduler `callback` IS
 /// success. `Err` only on connect failure, protocol mismatch (binary frame),
-/// button-not-found or timeout. The label flip after the click is a
-/// retry-tolerance signal only, NEVER a success gate — under webui language
-/// drift the flip may never match `labels`, and the click must still count
-/// as delivered. Without confirmation, up to [`MAX_RETRIES`] re-clicks are
-/// attempted (fresh id when the button re-rendered, last-ditch with the old
-/// one otherwise; the server's ProcessManager guards make double-clicks
-/// safe), then Ok — the poll loop self-heals the tray state line.
+/// button-not-found or timeout. The label flip after the click is an
+/// observation-only confirmation signal — under webui language drift the
+/// flip may never match `labels`, and the click must still count as
+/// delivered. ONCE the callback is sent the click is NEVER repeated: a
+/// second callback would double-spawn the ALAS scheduler (its boot takes
+/// 2-5s, longer than the flip-observation window, so a re-click could never
+/// be confirmation-driven — bug-fix task-6b). Ok is returned on the label
+/// flip, on CONFIRM_WINDOW elapse, on connection close or on timeout; a
+/// genuinely dropped click is retryable by the user, and the poll loop
+/// self-heals the tray state line.
 ///
 /// Each attempt runs against a single short-lived ws session (no long-lived
 /// connection, no heartbeat, no login flow) bounded by `timeout` (default
@@ -350,8 +351,6 @@ pub(crate) fn click_scheduler(
 
     let mut phase = Phase::Home;
     let mut seen: Vec<ServerMessage> = Vec::new();
-    let mut last_click_id: Option<String> = None;
-    let mut retries = 0u32;
     let mut confirm_started = Instant::now();
 
     loop {
@@ -390,7 +389,9 @@ pub(crate) fn click_scheduler(
                     if label != action.label_before(labels) {
                         // Oracle MAJOR-1: label is locate-only, never a gate.
                         // Language drift or a stale render still clicks; the
-                        // ProcessManager guards make double-clicks safe.
+                        // user-visible direction (Start/Stop) is decided
+                        // before this session, and the confirm phase never
+                        // re-clicks.
                         debug!(
                             target: "pywebio",
                             "scheduler button label {label:?} != expected {:?}; clicking anyway",
@@ -399,25 +400,20 @@ pub(crate) fn click_scheduler(
                     }
                     ws.send(Message::text(callback_event(&id, 0)))
                         .context("send scheduler click failed")?;
-                    last_click_id = Some(id);
                     confirm_started = Instant::now();
                     phase = Phase::Confirm;
                 }
             }
             Phase::Confirm => {
+                // Observation-only: the callback was already delivered — NEVER
+                // click again (a second callback double-spawns the scheduler;
+                // its 2-5s boot outlives any flip-observation window). Return
+                // Ok on the label flip; CONFIRM_WINDOW elapse, close, binary
+                // frame, read error and deadline all return Ok below.
                 let loc = locate_buttons(&seen, labels);
-                if let Some((id, label)) = loc.scheduler_button() {
+                if let Some((_, label)) = loc.scheduler_button() {
                     if label == action.label_after(labels) {
                         return Ok(());
-                    }
-                    let fresh_render = last_click_id.as_deref() != Some(id.as_str());
-                    if retries < MAX_RETRIES && (fresh_render || confirm_started.elapsed() >= CONFIRM_WINDOW)
-                    {
-                        ws.send(Message::text(callback_event(&id, 0)))
-                            .context("send scheduler click (retry) failed")?;
-                        last_click_id = Some(id);
-                        confirm_started = Instant::now();
-                        retries += 1;
                     }
                 }
             }
@@ -771,7 +767,7 @@ mod client_tests {
 #[cfg(test)]
 mod real_payload_tests {
     use super::*;
-    use crate::menu_model::{control_labels, scheduler_alive, ControlLabels};
+    use crate::menu_model::{control_labels, ControlLabels};
     use std::io::{Read, Write};
     use std::os::unix::process::CommandExt;
     use std::path::Path;
@@ -1072,6 +1068,11 @@ mod real_payload_tests {
         eprintln!("baseline scheduler child count = {baseline}");
 
         // ---- START ----
+        // Exact-count assertion (bug-fix task-6b): one Start click must spawn
+        // EXACTLY one scheduler child (baseline + 1). A re-click regression
+        // would deliver a second callback and double-spawn, overshooting to
+        // baseline + 2 — the wait below would then time out and the assert
+        // would fail (the old `>1` predicate could not tell them apart).
         eprintln!("click_scheduler(Start)");
         click_scheduler(TEST_PORT, SchedulerAction::Start, &labels_zh(), CLICK_TIMEOUT)
             .expect("click_scheduler(Start) failed");
@@ -1080,18 +1081,20 @@ mod real_payload_tests {
             backend_pid,
             reload,
             START_TIMEOUT,
-            scheduler_alive,
+            |count| count == baseline + 1,
         );
-        assert!(
-            scheduler_alive(started),
-            "scheduler child never appeared within {START_TIMEOUT:?}"
+        assert_eq!(
+            started,
+            baseline + 1,
+            "exactly one scheduler child must appear after Start; count {started} (a double spawn would show {})",
+            baseline + 2,
         );
         assert_eq!(
             webui_status(TEST_PORT),
             200,
             "webui died while scheduler running"
         );
-        eprintln!("scheduler STARTED: child count {started}, webui still 200");
+        eprintln!("scheduler STARTED: child count {started} (baseline {baseline} + 1), webui still 200");
 
         // ---- STOP ----
         eprintln!("click_scheduler(Stop)");
@@ -1102,11 +1105,12 @@ mod real_payload_tests {
             backend_pid,
             reload,
             STOP_TIMEOUT,
-            |count| !scheduler_alive(count),
+            |count| count == baseline,
         );
-        assert!(
-            !scheduler_alive(stopped),
-            "scheduler child did not disappear within {STOP_TIMEOUT:?}"
+        assert_eq!(
+            stopped,
+            baseline,
+            "scheduler child count must return to the pre-Start baseline; count {stopped}"
         );
         assert_eq!(webui_status(TEST_PORT), 200, "webui died after scheduler stop");
         eprintln!("scheduler STOPPED: child count {stopped}, webui still 200");
