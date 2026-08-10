@@ -29,7 +29,7 @@ pub enum BackendStatus {
 /// never see or lock it); kept as-is from the pre-deep-module layout.
 /// `status` drives the tray menu labels/enabled state; `backend` holds the
 /// live process handle; `start_failed` distinguishes "stopped" from "last
-/// start attempt failed" so the tray can show "Backend: start failed" instead
+/// start attempt failed" so the tray can show the start-failed label instead
 /// of silently reverting to Start.
 pub struct BackendState {
     pub status: BackendStatus,

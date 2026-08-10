@@ -136,8 +136,8 @@ fn main() -> Result<()> {
                         if let Err(e) = backend.start(port) {
                             // Same as today: the splash stays on the "Starting GUI"
                             // page, main window stays hidden. The module set
-                            // Stopped + start_failed so the tray shows
-                            // "Backend: start failed".
+                            // Stopped + start_failed so the tray shows the
+                            // localized start-failed label.
                             error!("Failed to start backend: {e}");
                         } else {
                             splash.destroy().unwrap();
