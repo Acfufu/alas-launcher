@@ -221,17 +221,21 @@ fn load_i18n(alas_dir: &Path, language: &str) -> serde_json::Value {
 ///
 /// Produced by spawning `date +"%F %T"` (macOS provides it; this module is
 /// cfg-gated to macOS in main.rs, so win/linux are unaffected). No chrono
-/// dependency is worth adding for one timestamp. On spawn failure, falls back
-/// to the lexicographic maximum "9999-12-31 23:59:59" — every task classifies
-/// as Waiting — so the menu still renders rather than erroring.
-pub fn now_str() -> String {
+/// dependency is worth adding for one timestamp.
+///
+/// On spawn failure this returns `Err` and the caller degrades the task
+/// section ([`crate::menu_model::poll_decision`]) — there is deliberately NO
+/// fallback timestamp: a fake far-future clock silently classifies every task
+/// as Waiting. The old "9999-12-31 23:59:59" sentinel hid exactly that bug
+/// (a failed clock made the whole menu read Waiting).
+pub fn now_str() -> Result<String> {
     match std::process::Command::new("date").args(["+%F %T"]).output() {
         Ok(out) if out.status.success() => {
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
         }
-        _ => {
-            warn!("`date +\"%F %T\"` failed; classifying all tasks as Waiting");
-            "9999-12-31 23:59:59".to_string()
+        other => {
+            warn!("`date +\"%F %T\"` failed ({other:?}); task section will degrade");
+            Err(anyhow!("`date +\"%F %T\"` failed"))
         }
     }
 }
@@ -478,7 +482,7 @@ mod tests {
             eprintln!("real ALAS payload not present; skipping real-surface check");
             return;
         }
-        let tasks = fetch_tasks(payload, &now_str(), "zh-CN").unwrap();
+        let tasks = fetch_tasks(payload, &now_str().unwrap(), "zh-CN").unwrap();
         assert!(!tasks.is_empty(), "real payload must yield enabled tasks");
         assert!(tasks.iter().any(|t| !t.name.is_empty()));
         println!("real payload: {} enabled tasks\n{tasks:#?}", tasks.len());

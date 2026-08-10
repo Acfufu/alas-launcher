@@ -114,6 +114,63 @@ pub fn menu_diff_changed(old: &[Task], new: &[Task]) -> bool {
         || new.iter().any(|t| !old_commands.contains(t.command.as_str()))
 }
 
+/// One poll cycle's decision: the section to render, whether the menu must be
+/// rebuilt, and the new cache contents when they changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PollOutcome {
+    /// Section the task area should render next.
+    pub section: TaskSection,
+    /// Whether the menu must be rebuilt (section kind changed, or the task
+    /// command set changed).
+    pub changed: bool,
+    /// New task cache contents when `changed` (None otherwise — the caller
+    /// keeps the old cache).
+    pub replace_cache: Option<Vec<Task>>,
+}
+
+/// Pure poll-cycle decision: given the backend status, the fetch result, the
+/// currently-rendered section and the cached task list, what to render next.
+///
+/// This is the EXACT decision previously inlined in `tray::poll_once` —
+/// extracted so the rebuild logic is testable without threads, files or
+/// processes. It never touches I/O: the clock string and the fetch result are
+/// injected (the clock seam is `alas_tasks::fetch_tasks` already taking the
+/// `now_str` parameter), so the tests below lock the rebuild logic itself.
+pub fn poll_decision(
+    status: BackendStatus,
+    fetched: Result<Vec<Task>, ()>,
+    last_section: TaskSection,
+    cached: &[Task],
+) -> PollOutcome {
+    if status != BackendStatus::Running {
+        return PollOutcome {
+            section: TaskSection::Degraded,
+            changed: last_section != TaskSection::Degraded,
+            replace_cache: None,
+        };
+    }
+    match fetched {
+        Err(()) => PollOutcome {
+            section: TaskSection::Degraded,
+            changed: last_section != TaskSection::Degraded,
+            replace_cache: None,
+        },
+        Ok(tasks) => {
+            let section = if tasks.is_empty() {
+                TaskSection::Empty
+            } else {
+                TaskSection::Tasks
+            };
+            let changed = last_section != section || menu_diff_changed(cached, &tasks);
+            PollOutcome {
+                section,
+                changed,
+                replace_cache: changed.then_some(tasks),
+            }
+        }
+    }
+}
+
 /// Status line for the (disabled) status menu item.
 pub fn label_for(status: BackendStatus) -> &'static str {
     match status {
@@ -419,7 +476,7 @@ mod tests {
             return;
         }
         let tasks =
-            alas_tasks::fetch_tasks(payload, &alas_tasks::now_str(), "zh-CN").unwrap();
+            alas_tasks::fetch_tasks(payload, &alas_tasks::now_str().unwrap(), "zh-CN").unwrap();
         for item in task_section_items(&tasks) {
             match item {
                 TaskMenuItem::GroupHeader { id, text } => println!("[{id}] {text}"),
@@ -536,5 +593,86 @@ mod tests {
             task_section(BackendStatus::Initializing, Err(())),
             TaskSection::Degraded
         );
+    }
+
+    // ---- poll_decision --------------------------------------------------------
+
+    /// Minimal task fixture: command doubles as name, all else defaulted.
+    fn task(cmd: &str) -> Task {
+        Task {
+            name: cmd.to_string(),
+            command: cmd.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn poll_decision_running_ok_changed_replaces_cache() {
+        let cached = vec![task("Daily")];
+        let new = vec![task("Daily"), task("Hard")];
+        let outcome = poll_decision(
+            BackendStatus::Running,
+            Ok(new.clone()),
+            TaskSection::Empty,
+            &cached,
+        );
+        assert_eq!(outcome.section, TaskSection::Tasks);
+        assert!(outcome.changed);
+        assert_eq!(outcome.replace_cache, Some(new));
+    }
+
+    #[test]
+    fn poll_decision_running_ok_unchanged_keeps_cache() {
+        let cached = vec![task("Daily")];
+        let outcome = poll_decision(
+            BackendStatus::Running,
+            Ok(cached.clone()),
+            TaskSection::Tasks,
+            &cached,
+        );
+        assert_eq!(outcome.section, TaskSection::Tasks);
+        assert!(!outcome.changed);
+        assert_eq!(outcome.replace_cache, None);
+    }
+
+    #[test]
+    fn poll_decision_running_err_degrades() {
+        let from_tasks =
+            poll_decision(BackendStatus::Running, Err(()), TaskSection::Tasks, &[task("Daily")]);
+        assert_eq!(from_tasks.section, TaskSection::Degraded);
+        assert!(from_tasks.changed); // Tasks -> Degraded is a render change
+        assert_eq!(from_tasks.replace_cache, None);
+        // Already degraded -> no rebuild churn.
+        let from_degraded = poll_decision(BackendStatus::Running, Err(()), TaskSection::Degraded, &[]);
+        assert!(!from_degraded.changed);
+    }
+
+    #[test]
+    fn poll_decision_not_running_always_degrades() {
+        for status in [BackendStatus::Stopped, BackendStatus::Initializing] {
+            let from_tasks = poll_decision(status, Ok(vec![task("Daily")]), TaskSection::Tasks, &[]);
+            assert_eq!(from_tasks.section, TaskSection::Degraded);
+            assert!(from_tasks.changed);
+            assert_eq!(from_tasks.replace_cache, None);
+            let from_empty = poll_decision(status, Ok(vec![]), TaskSection::Empty, &[]);
+            assert!(from_empty.changed);
+            let from_degraded = poll_decision(status, Err(()), TaskSection::Degraded, &[]);
+            assert!(!from_degraded.changed);
+        }
+    }
+
+    #[test]
+    fn poll_decision_initial_empty_stays_empty() {
+        let outcome = poll_decision(BackendStatus::Running, Ok(vec![]), TaskSection::Empty, &[]);
+        assert_eq!(outcome.section, TaskSection::Empty);
+        assert!(!outcome.changed);
+        assert_eq!(outcome.replace_cache, None);
+    }
+
+    #[test]
+    fn poll_decision_cache_replacement_carries_new_tasks() {
+        let new = vec![task("Guild")];
+        let outcome = poll_decision(BackendStatus::Running, Ok(new.clone()), TaskSection::Empty, &[]);
+        assert_eq!(outcome.replace_cache, Some(new));
     }
 }
