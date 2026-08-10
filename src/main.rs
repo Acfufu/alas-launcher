@@ -118,6 +118,11 @@ fn main() -> Result<()> {
                             let content = format!("Failed loading ALAS, reason: {}\n\nPlease run alas-launcher from terminal for detailed logs", e);
                             let url = Url::parse(&text_to_splash(&content)).unwrap();
                             splash.navigate(url).unwrap();
+                            // Init failure must not leave the state machine stuck in
+                            // Initializing (toggle disabled forever): fall back to
+                            // Stopped so the menu enables "Start Backend" and the
+                            // user can retry from the menu bar.
+                            backend.lock().unwrap().status = BackendStatus::Stopped;
                             return;
                         }
                         info!("Starting gui.py on http://127.0.0.1:{}/", port);
