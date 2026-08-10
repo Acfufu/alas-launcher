@@ -29,8 +29,8 @@ use crate::{
     alas_tasks::{self, Task},
     backend::{toggle_decision, BackendLifecycle, BackendStateSnapshot, BackendStatus, ToggleAction},
     menu_model::{
-        poll_decision, status_text, task_section, task_section_items, toggle_enabled,
-        toggle_label, TaskMenuItem, TaskSection,
+        control_labels, poll_decision, status_text, task_section, task_section_items,
+        toggle_enabled, toggle_label, ControlLabels, TaskMenuItem, TaskSection,
     },
 };
 
@@ -78,6 +78,7 @@ pub fn build_tray(
         refresh: refresh_tx,
     };
 
+    let labels = load_control_labels();
     let menu = build_menu(
         app.handle(),
         &BackendStateSnapshot {
@@ -86,6 +87,7 @@ pub fn build_tray(
         },
         &[],
         TaskSection::Empty,
+        &labels,
     )?;
 
     let thread_shared = shared.clone();
@@ -149,12 +151,13 @@ fn build_menu(
     snapshot: &BackendStateSnapshot,
     tasks: &[Task],
     section: TaskSection,
+    labels: &ControlLabels,
 ) -> tauri::Result<Menu<tauri::Wry>> {
-    let status = MenuItem::with_id(app, "tray-status", status_text(snapshot), false, None::<&str>)?;
+    let status = MenuItem::with_id(app, "tray-status", status_text(snapshot, labels), false, None::<&str>)?;
     let toggle = MenuItem::with_id(
         app,
         "tray-toggle",
-        toggle_label(snapshot.status),
+        toggle_label(snapshot.status, labels),
         toggle_enabled(snapshot.status),
         None::<&str>,
     )?;
@@ -217,16 +220,28 @@ fn push_row(
 }
 
 /// Where the main window should point for a given backend status.
-pub(crate) fn main_page_url(status: BackendStatus, port: u16) -> Url {
+pub(crate) fn main_page_url(status: BackendStatus, port: u16, labels: &ControlLabels) -> Url {
     match status {
         BackendStatus::Running => Url::parse(&crate::backend::webui_url(port)).unwrap(),
-        BackendStatus::Stopped | BackendStatus::Initializing => stopped_page_url(),
+        BackendStatus::Stopped | BackendStatus::Initializing => stopped_page_url(labels),
     }
 }
 
-/// Minimal inline page shown while the backend is not running.
-fn stopped_page_url() -> Url {
-    let html = "<!doctype html><html><head><meta charset=\"utf-8\"><style>html,body{height:100%;margin:0;display:flex;align-items:center;justify-content:center;background:#fff;color:#111;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;}p{font-size:15px;}</style></head><body><p>Backend stopped. Click Start in the menu bar.</p></body></html>";
+/// Minimal inline page shown while the backend is not running; the copy is
+/// localized via the labels table (sep "：" → zh template, else en template).
+fn stopped_page_url(labels: &ControlLabels) -> Url {
+    let text = if labels.sep == "：" {
+        format!(
+            "{}{}{}。点击菜单栏「{}」。",
+            labels.scheduler, labels.sep, labels.stopped, labels.start
+        )
+    } else {
+        format!(
+            "{}{}{}. Click \"{}\" in the menu bar.",
+            labels.scheduler, labels.sep, labels.stopped, labels.start
+        )
+    };
+    let html = format!("<!doctype html><html><head><meta charset=\"utf-8\"><style>html,body{{height:100%;margin:0;display:flex;align-items:center;justify-content:center;background:#fff;color:#111;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;}}p{{font-size:15px;}}</style></head><body><p>{text}</p></body></html>");
     let b64 = BASE64_STANDARD.encode(html.as_bytes());
     Url::parse(&format!("data:text/html;charset=utf-8;base64,{}", b64)).unwrap()
 }
@@ -243,23 +258,24 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
     // disabled anyway; this also makes a second click during a 60s start
     // window a no-op — BLOCKER-3: never two backends).
     let action = toggle_decision(&shared.backend.snapshot());
+    let labels = load_control_labels();
     match action {
         ToggleAction::NoOp => return,
         ToggleAction::Stop => {
             shared.backend.stop();
-            navigate_main(app, main_page_url(BackendStatus::Stopped, port));
+            navigate_main(app, main_page_url(BackendStatus::Stopped, port, &labels));
         }
         ToggleAction::Start => {
             // Show "initializing…" (and make re-entry a no-op) for the whole
             // spawn window, which may take up to 60s.
             shared.backend.begin_start();
             match shared.backend.start(port) {
-                Ok(()) => navigate_main(app, main_page_url(BackendStatus::Running, port)),
+                Ok(()) => navigate_main(app, main_page_url(BackendStatus::Running, port, &labels)),
                 Err(e) => {
                     warn!("Failed to start backend: {e}");
                     // Status is now Stopped + start_failed (set inside the
                     // module); the window stays on the stopped page and the
-                    // next menu rebuild shows "Backend: start failed".
+                    // next menu rebuild shows the localized failed label.
                 }
             }
         }
@@ -277,7 +293,8 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
 fn rebuild_menu(app: &AppHandle, shared: &TrayShared, section: TaskSection) {
     let snapshot = shared.backend.snapshot();
     let tasks = shared.tasks.lock().unwrap().clone();
-    let Ok(menu) = build_menu(app, &snapshot, &tasks, section) else {
+    let labels = load_control_labels();
+    let Ok(menu) = build_menu(app, &snapshot, &tasks, section, &labels) else {
         return;
     };
     if let Some(tray) = app.tray_by_id("main-tray") {
@@ -334,6 +351,15 @@ fn deploy_language() -> Option<String> {
         .map(String::from)
 }
 
+/// Tray control labels resolved from deploy.yaml language + the ALAS i18n
+/// file (current dir); missing payload → built-in zh-CN table, never panic.
+fn load_control_labels() -> ControlLabels {
+    let lang = deploy_language().unwrap_or_else(|| "zh-CN".to_string());
+    let alas_dir = std::env::current_dir().unwrap_or_default();
+    let i18n = alas_tasks::load_i18n(&alas_dir, &lang);
+    control_labels(&lang, &i18n)
+}
+
 /// Point the main window at `url` (errors are non-fatal).
 fn navigate_main(app: &AppHandle, url: Url) {
     if let Some(window) = app.get_webview_window("main") {
@@ -347,19 +373,59 @@ fn navigate_main(app: &AppHandle, url: Url) {
 mod tests {
     use super::*;
 
+    /// zh-CN builtin labels (no payload present) for the URL tests.
+    fn zh_labels() -> ControlLabels {
+        control_labels("zh-CN", &serde_json::json!({}))
+    }
+
     #[test]
     fn main_page_url_running_is_webui() {
+        let labels = zh_labels();
         assert_eq!(
-            main_page_url(BackendStatus::Running, 22267),
+            main_page_url(BackendStatus::Running, 22267, &labels),
             Url::parse("http://127.0.0.1:22267/").unwrap()
         );
     }
 
     #[test]
     fn main_page_url_stopped_and_initializing_are_data_pages() {
-        let stopped = main_page_url(BackendStatus::Stopped, 22267);
+        let labels = zh_labels();
+        let stopped = main_page_url(BackendStatus::Stopped, 22267, &labels);
         assert!(stopped.as_str().starts_with("data:text/html"));
-        let initializing = main_page_url(BackendStatus::Initializing, 22267);
+        let initializing = main_page_url(BackendStatus::Initializing, 22267, &labels);
         assert!(initializing.as_str().starts_with("data:text/html"));
+    }
+
+    #[test]
+    fn stopped_page_url_localizes_template_by_sep() {
+        let decode = |url: &Url| {
+            let b64 = url.as_str().split(',').nth(1).unwrap();
+            String::from_utf8(BASE64_STANDARD.decode(b64).unwrap()).unwrap()
+        };
+        // Full-width "：" → zh template with 「」quotes.
+        let zh = decode(&stopped_page_url(&control_labels("zh-CN", &serde_json::json!({}))));
+        assert!(zh.contains("调度器：已停止。点击菜单栏「启动」。"));
+        // Half-width ": " → en template (en-US and ja-JP share it).
+        let en = decode(&stopped_page_url(&control_labels("en-US", &serde_json::json!({}))));
+        assert!(en.contains("Scheduler: stopped. Click \"Start\" in the menu bar."));
+        let ja = decode(&stopped_page_url(&control_labels("ja-JP", &serde_json::json!({}))));
+        assert!(ja.contains("スケジューラー: 停止済み. Click \"実行\" in the menu bar."));
+    }
+
+    #[test]
+    fn load_control_labels_missing_payload_falls_back_to_zh_cn() {
+        // Empty dir: load_i18n → empty object and no deploy.yaml → zh-CN;
+        // the full chain yields builtin zh-CN labels, never panicking.
+        let empty_dir =
+            std::env::temp_dir().join(format!("tray-behavior-align-{}", std::process::id()));
+        let i18n = alas_tasks::load_i18n(&empty_dir, "zh-CN");
+        assert_eq!(i18n, serde_json::json!({}));
+        let labels = control_labels("zh-CN", &i18n);
+        assert_eq!(labels.scheduler, "调度器");
+        assert_eq!(labels.failed, "启动失败");
+        assert_eq!(labels.sep, "：");
+        // Live call must not panic regardless of ambient cwd.
+        let live = load_control_labels();
+        assert!(!live.scheduler.is_empty());
     }
 }

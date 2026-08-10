@@ -171,20 +171,11 @@ pub fn poll_decision(
     }
 }
 
-/// Status line for the (disabled) status menu item.
-pub fn label_for(status: BackendStatus) -> &'static str {
-    match status {
-        BackendStatus::Initializing => "Backend: initializing…",
-        BackendStatus::Running => "Backend: running",
-        BackendStatus::Stopped => "Backend: stopped",
-    }
-}
-
 /// Text of the Start/Stop toggle item.
-pub fn toggle_label(status: BackendStatus) -> &'static str {
+pub fn toggle_label(status: BackendStatus, labels: &ControlLabels) -> String {
     match status {
-        BackendStatus::Running => "Stop Backend",
-        BackendStatus::Stopped | BackendStatus::Initializing => "Start Backend",
+        BackendStatus::Running => labels.stop.clone(),
+        BackendStatus::Stopped | BackendStatus::Initializing => labels.start.clone(),
     }
 }
 
@@ -194,14 +185,20 @@ pub fn toggle_enabled(status: BackendStatus) -> bool {
     matches!(status, BackendStatus::Running | BackendStatus::Stopped)
 }
 
-/// Full status text for the status row: "start failed" outranks the plain
-/// status label.
-pub fn status_text(snapshot: &BackendStateSnapshot) -> String {
-    if snapshot.start_failed {
-        "Backend: start failed".to_string()
+/// Status line for the (disabled) status menu item, composed as
+/// `{scheduler}{sep}{word}` ("调度器：运行中"); "start failed" outranks the
+/// plain status word.
+pub fn status_text(snapshot: &BackendStateSnapshot, labels: &ControlLabels) -> String {
+    let word = if snapshot.start_failed {
+        &labels.failed
     } else {
-        label_for(snapshot.status).to_string()
-    }
+        match snapshot.status {
+            BackendStatus::Initializing => &labels.initializing,
+            BackendStatus::Running => &labels.running,
+            BackendStatus::Stopped => &labels.stopped,
+        }
+    };
+    format!("{}{}{}", labels.scheduler, labels.sep, word)
 }
 
 /// Localized labels for the tray's scheduler-control rows (status line +
@@ -307,17 +304,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn label_for_matrix() {
-        assert_eq!(label_for(BackendStatus::Initializing), "Backend: initializing…");
-        assert_eq!(label_for(BackendStatus::Running), "Backend: running");
-        assert_eq!(label_for(BackendStatus::Stopped), "Backend: stopped");
-    }
-
-    #[test]
     fn toggle_label_matrix() {
-        assert_eq!(toggle_label(BackendStatus::Running), "Stop Backend");
-        assert_eq!(toggle_label(BackendStatus::Stopped), "Start Backend");
-        assert_eq!(toggle_label(BackendStatus::Initializing), "Start Backend");
+        // The toggle shows the labels table's stop/start words per status,
+        // for every supported language.
+        for lang in ["zh-CN", "zh-TW", "en-US", "ja-JP"] {
+            let labels = expected_labels(lang);
+            assert_eq!(toggle_label(BackendStatus::Running, &labels), labels.stop, "lang {lang}");
+            assert_eq!(
+                toggle_label(BackendStatus::Stopped, &labels),
+                labels.start,
+                "lang {lang}"
+            );
+            assert_eq!(
+                toggle_label(BackendStatus::Initializing, &labels),
+                labels.start,
+                "lang {lang}"
+            );
+        }
     }
 
     #[test]
@@ -329,21 +332,27 @@ mod tests {
 
     #[test]
     fn status_text_prefers_start_failed() {
+        let labels = expected_labels("zh-CN");
         let stopped_failed = BackendStateSnapshot {
             status: BackendStatus::Stopped,
             start_failed: true,
         };
-        assert_eq!(status_text(&stopped_failed), "Backend: start failed");
+        assert_eq!(status_text(&stopped_failed, &labels), "调度器：启动失败");
         let stopped_clean = BackendStateSnapshot {
             status: BackendStatus::Stopped,
             start_failed: false,
         };
-        assert_eq!(status_text(&stopped_clean), "Backend: stopped");
+        assert_eq!(status_text(&stopped_clean, &labels), "调度器：已停止");
         let running_clean = BackendStateSnapshot {
             status: BackendStatus::Running,
             start_failed: false,
         };
-        assert_eq!(status_text(&running_clean), "Backend: running");
+        assert_eq!(status_text(&running_clean, &labels), "调度器：运行中");
+        let initializing_clean = BackendStateSnapshot {
+            status: BackendStatus::Initializing,
+            start_failed: false,
+        };
+        assert_eq!(status_text(&initializing_clean, &labels), "调度器：启动中…");
     }
 
     // ---- control_labels -------------------------------------------------------
