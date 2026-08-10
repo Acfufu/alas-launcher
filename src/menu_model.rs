@@ -204,6 +204,104 @@ pub fn status_text(snapshot: &BackendStateSnapshot) -> String {
     }
 }
 
+/// Localized labels for the tray's scheduler-control rows (status line +
+/// Start/Stop toggle), following the webui language. `scheduler`, `running`,
+/// `start` and `stop` come from the ALAS i18n file when the keys exist and
+/// are strings; `stopped`, `initializing`, `failed` and `sep` ALWAYS come
+/// from the built-in table. `sep` also decides the stopped-page template
+/// style: full-width "：" → zh template, half-width ": " → en template.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlLabels {
+    pub scheduler: String,
+    pub running: String,
+    pub stopped: String,
+    pub initializing: String,
+    pub failed: String,
+    pub start: String,
+    pub stop: String,
+    pub sep: String,
+}
+
+/// Built-in label table, keyed by webui language; any unknown or empty
+/// language falls back to zh-CN.
+fn builtin_labels(lang: &str) -> ControlLabels {
+    let (scheduler, running, stopped, initializing, failed, start, stop, sep) = match lang {
+        "zh-TW" => (
+            "調度器",
+            "執行中",
+            "已停止",
+            "啟動中…",
+            "啟動失敗",
+            "啟動",
+            "停止",
+            "：",
+        ),
+        "en-US" => (
+            "Scheduler",
+            "Running",
+            "stopped",
+            "initializing…",
+            "start failed",
+            "Start",
+            "Stop",
+            ": ",
+        ),
+        "ja-JP" => (
+            "スケジューラー",
+            "実行中",
+            "停止済み",
+            "起動中…",
+            "起動失敗",
+            "実行",
+            "中止",
+            // Half-width ": " (en template), NOT the full-width "：".
+            ": ",
+        ),
+        // zh-CN doubles as the fallback for any unknown or empty language.
+        _ => (
+            "调度器",
+            "运行中",
+            "已停止",
+            "启动中…",
+            "启动失败",
+            "启动",
+            "停止",
+            "：",
+        ),
+    };
+    ControlLabels {
+        scheduler: scheduler.into(),
+        running: running.into(),
+        stopped: stopped.into(),
+        initializing: initializing.into(),
+        failed: failed.into(),
+        start: start.into(),
+        stop: stop.into(),
+        sep: sep.into(),
+    }
+}
+
+/// The tray's scheduler-control labels for `lang` and the parsed i18n file:
+/// payload values win for scheduler/running/start/stop when present and
+/// string-typed, everything else falls back to the built-in table. Pure —
+/// no file I/O, no tauri types.
+pub fn control_labels(lang: &str, i18n: &serde_json::Value) -> ControlLabels {
+    let mut labels = builtin_labels(lang);
+    if let Some(s) = i18n["Gui"]["Overview"]["Scheduler"].as_str() {
+        labels.scheduler = s.to_string();
+    }
+    if let Some(s) = i18n["Gui"]["Overview"]["Running"].as_str() {
+        labels.running = s.to_string();
+    }
+    if let Some(s) = i18n["Gui"]["Button"]["Start"].as_str() {
+        labels.start = s.to_string();
+    }
+    if let Some(s) = i18n["Gui"]["Button"]["Stop"].as_str() {
+        labels.stop = s.to_string();
+    }
+    labels
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,6 +344,102 @@ mod tests {
             start_failed: false,
         };
         assert_eq!(status_text(&running_clean), "Backend: running");
+    }
+
+    // ---- control_labels -------------------------------------------------------
+
+    /// i18n payload fixture with the four control keys set.
+    fn i18n_value(scheduler: &str, running: &str, start: &str, stop: &str) -> serde_json::Value {
+        serde_json::json!({
+            "Gui": {
+                "Overview": { "Scheduler": scheduler, "Running": running },
+                "Button": { "Start": start, "Stop": stop },
+            }
+        })
+    }
+
+    /// Expected full label set per language, from the REAL ALAS payload
+    /// cross-check (evidence task-1: zero delta vs the built-in table).
+    fn expected_labels(lang: &str) -> ControlLabels {
+        let (scheduler, running, stopped, initializing, failed, start, stop, sep) = match lang {
+            "zh-TW" => ("調度器", "執行中", "已停止", "啟動中…", "啟動失敗", "啟動", "停止", "："),
+            "en-US" => ("Scheduler", "Running", "stopped", "initializing…", "start failed", "Start", "Stop", ": "),
+            "ja-JP" => ("スケジューラー", "実行中", "停止済み", "起動中…", "起動失敗", "実行", "中止", ": "),
+            _ => ("调度器", "运行中", "已停止", "启动中…", "启动失败", "启动", "停止", "："),
+        };
+        ControlLabels {
+            scheduler: scheduler.into(),
+            running: running.into(),
+            stopped: stopped.into(),
+            initializing: initializing.into(),
+            failed: failed.into(),
+            start: start.into(),
+            stop: stop.into(),
+            sep: sep.into(),
+        }
+    }
+
+    #[test]
+    fn control_labels_matrix_all_fields_four_languages() {
+        // Payload values (verified in evidence) drive the i18n-sourced
+        // fields; every field of every language asserted exactly.
+        let cases = [
+            ("zh-CN", "调度器", "运行中", "启动", "停止"),
+            ("zh-TW", "調度器", "執行中", "啟動", "停止"),
+            ("en-US", "Scheduler", "Running", "Start", "Stop"),
+            ("ja-JP", "スケジューラー", "実行中", "実行", "中止"),
+        ];
+        for (lang, scheduler, running, start, stop) in cases {
+            let labels = control_labels(lang, &i18n_value(scheduler, running, start, stop));
+            assert_eq!(labels, expected_labels(lang), "lang {lang}");
+        }
+    }
+
+    #[test]
+    fn control_labels_empty_i18n_uses_builtin_table() {
+        let empty = serde_json::json!({});
+        for lang in ["zh-CN", "zh-TW", "en-US", "ja-JP"] {
+            let labels = control_labels(lang, &empty);
+            assert_eq!(labels, expected_labels(lang), "lang {lang}");
+        }
+    }
+
+    #[test]
+    fn control_labels_unknown_language_falls_back_zh_cn() {
+        let empty = serde_json::json!({});
+        for lang in ["xx-XX", "", "zh-cn", "EN"] {
+            let labels = control_labels(lang, &empty);
+            assert_eq!(labels, expected_labels("zh-CN"), "lang {lang:?}");
+        }
+    }
+
+    #[test]
+    fn control_labels_non_string_values_fall_back_to_builtin() {
+        // Keys present but wrong-typed: number, null, object, array — every
+        // field must come from the built-in table instead.
+        let bogus = serde_json::json!({
+            "Gui": {
+                "Overview": { "Scheduler": 42, "Running": null },
+                "Button": { "Start": { "x": 1 }, "Stop": ["no"] },
+            }
+        });
+        for lang in ["zh-CN", "zh-TW", "en-US", "ja-JP"] {
+            let labels = control_labels(lang, &bogus);
+            assert_eq!(labels, expected_labels(lang), "lang {lang}");
+        }
+    }
+
+    #[test]
+    fn control_labels_partial_payload_overrides_only_present_keys() {
+        let partial = serde_json::json!({
+            "Gui": { "Overview": { "Scheduler": "OnlyThis" } }
+        });
+        let labels = control_labels("zh-CN", &partial);
+        assert_eq!(labels.scheduler, "OnlyThis");
+        assert_eq!(labels.running, expected_labels("zh-CN").running);
+        assert_eq!(labels.start, expected_labels("zh-CN").start);
+        assert_eq!(labels.stop, expected_labels("zh-CN").stop);
+        assert_eq!(labels.sep, expected_labels("zh-CN").sep);
     }
 
     #[test]

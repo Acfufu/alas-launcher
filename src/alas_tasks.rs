@@ -205,7 +205,7 @@ pub fn fetch_tasks(alas_dir: &Path, now_str: &str, language: &str) -> Result<Vec
 
 /// Read + parse the i18n file for `language`; any failure → empty object
 /// (display names are cosmetic, never fatal).
-fn load_i18n(alas_dir: &Path, language: &str) -> serde_json::Value {
+pub(crate) fn load_i18n(alas_dir: &Path, language: &str) -> serde_json::Value {
     let path = alas_dir
         .join("module")
         .join("config")
