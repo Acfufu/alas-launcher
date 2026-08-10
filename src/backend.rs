@@ -1,6 +1,7 @@
 use std::{
     net::TcpStream,
     process::{Command, ExitStatus},
+    sync::Mutex,
     thread::sleep,
     time::Duration,
 };
@@ -24,11 +25,12 @@ pub enum BackendStatus {
     Stopped,
 }
 
-/// Shared whole-backend lifecycle state, owned as `Arc<Mutex<BackendState>>`
-/// by main.rs and handed (cloned) to tray.rs. `status` drives the tray menu
-/// labels/enabled state; `backend` holds the live process handle; `start_failed`
-/// distinguishes "stopped" from "last start attempt failed" so the tray can
-/// show "Backend: start failed" instead of silently reverting to Start.
+/// Whole-backend lifecycle state. Internal to [`BackendLifecycle`] (callers
+/// never see or lock it); kept as-is from the pre-deep-module layout.
+/// `status` drives the tray menu labels/enabled state; `backend` holds the
+/// live process handle; `start_failed` distinguishes "stopped" from "last
+/// start attempt failed" so the tray can show "Backend: start failed" instead
+/// of silently reverting to Start.
 pub struct BackendState {
     pub status: BackendStatus,
     pub backend: Option<ManagedBackend>,
@@ -43,6 +45,15 @@ impl Default for BackendState {
             start_failed: false,
         }
     }
+}
+
+/// Lock-free copy of the parts of [`BackendState`] the tray renders, taken
+/// via [`BackendLifecycle::snapshot`]. No process handle, no lock held after
+/// the call returns.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BackendStateSnapshot {
+    pub status: BackendStatus,
+    pub start_failed: bool,
 }
 
 pub struct ManagedBackend {
@@ -103,6 +114,14 @@ impl ManagedBackend {
             Ok(ExitStatus::default())
         }
     }
+
+    /// Test seam: wrap an already-spawned process group so lifecycle tests can
+    /// inject a fake backend without ever touching `new()` (and its 60s port
+    /// readiness wait).
+    #[cfg(test)]
+    pub(crate) fn from_child(child: GroupChild) -> Self {
+        Self { child: Some(child) }
+    }
 }
 
 impl Drop for ManagedBackend {
@@ -125,5 +144,260 @@ impl Drop for ManagedBackend {
                 }
             }
         }
+    }
+}
+
+/// Deep lifecycle module for the ALAS backend: all the ordering behavior (the
+/// terminate-before-spawn contract, port readiness, start_failed, Drop
+/// residue cleanup, process-group termination) lives here behind a small
+/// interface — `status` / `snapshot` / `begin_start` / `start` / `stop` /
+/// `mark_stopped`. The `Mutex` is INTERNAL: callers never lock it, so lock
+/// discipline (brief reads, no lock across the long spawn) cannot leak out.
+pub struct BackendLifecycle {
+    state: Mutex<BackendState>,
+    // Internal seam so `start()` is testable without spawning python: tests
+    // inject a fake spawner; production wraps ManagedBackend::new.
+    spawner: Box<dyn Fn(u16) -> Result<ManagedBackend> + Send + Sync>,
+}
+
+impl Default for BackendLifecycle {
+    fn default() -> Self {
+        Self::new_with_spawner(ManagedBackend::new)
+    }
+}
+
+impl BackendLifecycle {
+    /// Build a lifecycle whose spawn step runs `spawner` instead of
+    /// `ManagedBackend::new` — the test seam.
+    ///
+    /// Note: `Sync` is required (not just `Send`) so `Arc<BackendLifecycle>`
+    /// can be shared across the Ready thread and the tray poll thread.
+    pub fn new_with_spawner<F: Fn(u16) -> Result<ManagedBackend> + Send + Sync + 'static>(
+        spawner: F,
+    ) -> Self {
+        Self {
+            state: Mutex::new(BackendState::default()),
+            spawner: Box::new(spawner),
+        }
+    }
+
+    /// Current lifecycle status (brief lock, no handle out).
+    pub fn status(&self) -> BackendStatus {
+        self.state.lock().unwrap().status
+    }
+
+    /// Copy of the render-relevant state (status + start_failed).
+    pub fn snapshot(&self) -> BackendStateSnapshot {
+        let state = self.state.lock().unwrap();
+        BackendStateSnapshot {
+            status: state.status,
+            start_failed: state.start_failed,
+        }
+    }
+
+    /// Mark the backend as initializing (and clear any previous start-failed
+    /// flag) BEFORE the possibly-long spawn. Callers invoke this first so the
+    /// menu shows "initializing…" and a concurrent toggle is a no-op
+    /// (BLOCKER-3: never two backends).
+    pub fn begin_start(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.status = BackendStatus::Initializing;
+        state.start_failed = false;
+    }
+
+    /// Start the backend on `port`.
+    ///
+    /// ORDERING CONTRACT (Metis BLOCKER-2): the old backend MUST be fully
+    /// terminated AND dropped BEFORE a new gui.py spawns — ManagedBackend's
+    /// Drop scans every process for ALAS_LAUNCHER_PID and would kill a
+    /// freshly spawned child. The take/terminate/drop sequence therefore runs
+    /// entirely OUTSIDE the lock and before the spawn.
+    ///
+    /// No lock is held across the spawn either: the port-readiness wait inside
+    /// `ManagedBackend::new` can take up to 60s, and status readers (the tray
+    /// poll thread reads the status every 10s) must never block on it.
+    pub fn start(&self, port: u16) -> Result<()> {
+        let old = {
+            let mut state = self.state.lock().unwrap();
+            state.status = BackendStatus::Initializing;
+            state.start_failed = false;
+            state.backend.take()
+        };
+        // Outside the lock: fully terminate + drop the old backend before any
+        // new process can exist.
+        terminate_old(old);
+        match (self.spawner)(port) {
+            Ok(backend) => {
+                let mut state = self.state.lock().unwrap();
+                state.backend = Some(backend);
+                state.status = BackendStatus::Running;
+                Ok(())
+            }
+            Err(e) => {
+                // Consistent start-failure marking for BOTH callers (Ready
+                // thread and tray toggle) — previously the Ready thread left
+                // start_failed unset.
+                let mut state = self.state.lock().unwrap();
+                state.status = BackendStatus::Stopped;
+                state.start_failed = true;
+                Err(e)
+            }
+        }
+    }
+
+    /// Stop the backend (if any): status -> Stopped, start_failed cleared,
+    /// then the process is terminated and dropped OUTSIDE the lock. Always
+    /// ends Stopped; never panics on a missing backend.
+    pub fn stop(&self) -> BackendStatus {
+        let old = {
+            let mut state = self.state.lock().unwrap();
+            state.status = BackendStatus::Stopped;
+            state.start_failed = false;
+            state.backend.take()
+        };
+        terminate_old(old);
+        BackendStatus::Stopped
+    }
+
+    /// Plain-Stopped transition for the setup-failure path: a setup error is
+    /// not a backend-start failure, so `start_failed` is left untouched.
+    pub fn mark_stopped(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.status = BackendStatus::Stopped;
+    }
+}
+
+/// ORDERING CONTRACT, shared by `start()` and `stop()`: the old backend is
+/// fully terminated (SIGTERM -> kill) and then dropped — the Drop impl runs
+/// the ALAS_LAUNCHER_PID kill-all scan — while no new process exists. Called
+/// with the lifecycle lock already released.
+fn terminate_old(old: Option<ManagedBackend>) {
+    if let Some(mut old) = old {
+        let _ = old.terminate();
+        // Drop completes the residue scan here.
+        drop(old);
+    }
+}
+
+/// The webui root URL for `port` (owns the port concept; plain String, no
+/// tauri dependency).
+pub fn webui_url(port: u16) -> String {
+    format!("http://127.0.0.1:{}/", port)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// A harmless real process group the fake spawner hands back. `sleep 60`
+    /// dies instantly on SIGTERM; the lifecycle's Drop kills it if a test
+    /// leaves it running.
+    fn sleep_child() -> GroupChild {
+        Command::new("sleep").arg("60").group_spawn().unwrap()
+    }
+
+    fn ok_spawner() -> impl Fn(u16) -> Result<ManagedBackend> {
+        |_| Ok(ManagedBackend::from_child(sleep_child()))
+    }
+
+    /// Deterministic liveness check (ps exits non-zero when the pid is gone;
+    /// on ps failure assume alive so the test never false-passes).
+    fn process_is_alive(pid: u32) -> bool {
+        Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "pid="])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(true)
+    }
+
+    /// A spawner that records every spawned child's pid (Arc by value so the
+    /// returned closure needs no borrow and is 'static).
+    fn recording_spawner(pids: Arc<Mutex<Vec<u32>>>) -> impl Fn(u16) -> Result<ManagedBackend> {
+        move |_| {
+            let child = sleep_child();
+            pids.lock().unwrap().push(child.id());
+            Ok(ManagedBackend::from_child(child))
+        }
+    }
+
+    #[test]
+    fn start_success_sets_running() {
+        let lc = BackendLifecycle::new_with_spawner(ok_spawner());
+        lc.start(22267).unwrap();
+        assert_eq!(lc.status(), BackendStatus::Running);
+        assert!(!lc.snapshot().start_failed);
+    }
+
+    #[test]
+    fn start_failure_sets_stopped_start_failed() {
+        let lc = BackendLifecycle::new_with_spawner(|_| Err(anyhow!("boom")));
+        let err = lc.start(22267).unwrap_err();
+        assert_eq!(err.to_string(), "boom");
+        assert_eq!(lc.status(), BackendStatus::Stopped);
+        assert!(lc.snapshot().start_failed);
+    }
+
+    #[test]
+    fn begin_start_sets_initializing_and_clears_failed() {
+        let lc = BackendLifecycle::new_with_spawner(|_| Err(anyhow!("boom")));
+        let _ = lc.start(22267); // leaves Stopped + start_failed
+        lc.begin_start();
+        let s = lc.snapshot();
+        assert_eq!(s.status, BackendStatus::Initializing);
+        assert!(!s.start_failed);
+    }
+
+    #[test]
+    fn stop_with_no_backend_is_stopped_without_panic() {
+        let lc = BackendLifecycle::new_with_spawner(ok_spawner());
+        assert_eq!(lc.stop(), BackendStatus::Stopped);
+        assert!(!lc.snapshot().start_failed);
+    }
+
+    #[test]
+    fn stop_terminates_the_backend() {
+        let pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let lc = BackendLifecycle::new_with_spawner(recording_spawner(pids.clone()));
+        lc.start(22267).unwrap();
+        let pid = pids.lock().unwrap()[0];
+        assert!(process_is_alive(pid), "child alive right after start");
+        lc.stop();
+        assert_eq!(lc.status(), BackendStatus::Stopped);
+        assert!(!process_is_alive(pid), "stop must terminate the child");
+    }
+
+    #[test]
+    fn mark_stopped_clears_initializing_without_start_failed() {
+        let lc = BackendLifecycle::new_with_spawner(ok_spawner());
+        lc.begin_start();
+        lc.mark_stopped();
+        let s = lc.snapshot();
+        assert_eq!(s.status, BackendStatus::Stopped);
+        assert!(!s.start_failed);
+    }
+
+    /// ORDERING CONTRACT (Metis BLOCKER-2): a second start() must fully
+    /// terminate the first child BEFORE the new spawn — the old backend's
+    /// kill-all Drop scan must never see the fresh process.
+    #[test]
+    fn ordering_contract_second_start_kills_first_child_before_spawn() {
+        let pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let lc = BackendLifecycle::new_with_spawner(recording_spawner(pids.clone()));
+        lc.start(22267).unwrap();
+        lc.start(22267).unwrap();
+        let pids = pids.lock().unwrap().clone();
+        assert_eq!(pids.len(), 2, "two spawns happened");
+        assert_ne!(pids[0], pids[1], "second spawn is a distinct process");
+        assert!(
+            !process_is_alive(pids[0]),
+            "first child must be terminated before the second spawn"
+        );
+        assert!(process_is_alive(pids[1]), "second child stays up");
+    }
+
+    #[test]
+    fn webui_url_format() {
+        assert_eq!(webui_url(22267), "http://127.0.0.1:22267/");
     }
 }
