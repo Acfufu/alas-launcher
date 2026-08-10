@@ -50,6 +50,7 @@ fn main() -> Result<()> {
     let port = port.unwrap_or(22267) as u16;
 
     let backend = Arc::new(Mutex::new(None));
+    let setup_backend = backend.clone();
 
     info!("Starting Webview...");
     tauri::Builder::default()
@@ -60,7 +61,7 @@ fn main() -> Result<()> {
                 .get_webview_window("main")
                 .and_then(|w| w.set_focus().ok());
         }))
-        .setup(|app| {
+        .setup(move |app| {
             tauri::WebviewWindowBuilder::from_config(
                 app,
                 app.config()
@@ -72,6 +73,10 @@ fn main() -> Result<()> {
             )?
             .on_page_load(page_load_injector)
             .build()?;
+            #[cfg(target_os = "macos")]
+            if let Err(e) = crate::tray::build_tray(app, setup_backend.clone(), port) {
+                warn!("tray failed: {e}");
+            }
             Ok(())
         })
         .build(tauri::generate_context!())?
