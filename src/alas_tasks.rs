@@ -1,274 +1,203 @@
 //! ALAS task data source for the tray menu's task-list section.
 //!
-//! Two-tier, fail-safe strategy: prefer the live ALAS webui HTTP API, falling
-//! back to the repo's `config/*.yaml` task files.
+//! Data source (mirrors the webui, verified live — see
+//! `.omo/evidence/alas-discovery.md`): the merged scheduler file
+//! `<alas_dir>/config/alas.json` plus the display-name i18n file
+//! `<alas_dir>/module/config/i18n/<language>.json`.
 //!
-//! Tier 1 — [`fetch_tasks`] tries each [`CANDIDATE_PATHS`] endpoint on
-//! `127.0.0.1:<port>` and returns the first whose payload parses to a
-//! non-empty task list (see [`parse_tasks_json`]).
+//! There is NO HTTP API: the ALAS webui is PyWebIO (server-rendered over a
+//! WebSocket); every previously probed JSON endpoint (`/api/tasks`,
+//! `/api/scheduler`, `/tasks`, `/api/task/list`) returns 404. This module is
+//! therefore a pure file reader.
 //!
-//! Tier 2 — [`parse_tasks_config`] reads the ALAS repo's `config/*.yaml`
-//! task files (plus `config/scheduler.yaml` when present).
+//! Parsing mirrors `module/config/config.py` (`get_next_task`): top-level
+//! keys carrying a `Scheduler` object are tasks; `Scheduler.Enable == true`
+//! marks them enabled — disabled tasks (or entries with no `Scheduler` group,
+//! e.g. `Alas`/`General`) are SKIPPED from the result, exactly like the webui
+//! (`if not func.enable: continue`). `Scheduler.NextRun` is a zero-padded
+//! `"YYYY-MM-DD HH:MM:SS"` string (lexicographic order == chronological
+//! order); the display name comes from `Task.<Command>.name` in the i18n
+//! file, falling back to the command key.
 //!
-//! All network I/O is bounded by a caller-supplied timeout applied to both
-//! `connect_timeout` and `set_read_timeout`, so the tray poll thread can
-//! never hang (Metis MAJOR-4).
-//!
-//! Human-gated note: the bundled ALAS payload is NOT part of this dev repo
-//! (it is copied in manually at build time — see README "构建与完整 payload
-//! 组装"), so the real webui endpoint names cannot be verified here.
-//! [`CANDIDATE_PATHS`] is therefore provisional; the confirmation procedure
-//! is documented in `.omo/evidence/task-5-alas-tray-menu.md`.
+//! Status classification mirrors the webui overview (`module/webui/app.py`
+//! `alas_update_overview_task`): enabled tasks whose `NextRun <= now` are
+//! past-due — the FIRST one renders as Running (运行中), the rest as Queued
+//! (队列中) — and future ones as Waiting (等待中). The launcher has no
+//! scheduler-liveness channel, so it always treats the first past-due task as
+//! Running; that is a documented approximation (the webui only does so while
+//! the ALAS scheduler process is alive).
 
 use std::{
-    io::{Read, Write},
-    net::TcpStream,
+    cmp::Ordering,
     path::Path,
-    time::Duration,
 };
 
 use anyhow::{anyhow, Result};
+use tracing::warn;
 
 /// A single ALAS scheduler task as shown (read-only) in the tray menu.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Task {
+    /// Display name from i18n (`Task.<command>.name`), command key as fallback.
     pub name: String,
+    /// `Scheduler.Command` — equals the top-level alas.json key. Stable
+    /// identity for menu diffs (display names are i18n-dependent).
+    pub command: String,
+    /// `Scheduler.Enable` (only enabled tasks are listed).
     pub enabled: bool,
-    pub running: bool,
+    /// Running / Queued / Waiting, per [`classify`] + fetch-time post-processing.
+    pub status: TaskStatus,
+    /// `Scheduler.NextRun` — `"YYYY-MM-DD HH:MM:SS"` (None when absent).
+    pub next_time: Option<String>,
 }
 
-/// Provisional webui endpoints tried in order by [`fetch_tasks`].
-///
-/// These are best-guess conventions, NOT confirmed against the real ALAS
-/// webui (payload not bundled in this repo — see module doc). Confirm with
-/// the procedure in `.omo/evidence/task-5-alas-tray-menu.md` and update this
-/// const + that doc once a real payload is available.
-pub const CANDIDATE_PATHS: &[&str] = &["/api/tasks", "/api/scheduler", "/tasks", "/api/task/list"];
-
-/// Minimal hand-rolled HTTP/1.1 GET. No new dependencies.
-///
-/// Bounded end-to-end: `TcpStream::connect_timeout` for the connect phase and
-/// `set_read_timeout`/`set_write_timeout` for the I/O phases, so a dead or
-/// silent server can never block the caller (the tray poll thread) forever.
-///
-/// Response handling: status line must start with `HTTP/1.1 200`; headers and
-/// body are split at `\r\n\r\n`; when a `Content-Length` header is present the
-/// body must contain at least that many bytes (else `Err("truncated...")`)
-/// and exactly that many are returned; otherwise the body is the remainder of
-/// the stream read to EOF. Chunked transfer encoding is not supported
-/// (assumption — see evidence doc).
-pub fn http_get(host: &str, port: u16, path: &str, timeout: Duration) -> Result<String> {
-    let address: std::net::SocketAddr = format!("{host}:{port}")
-        .parse()
-        .map_err(|e| anyhow!("invalid address {host}:{port}: {e}"))?;
-    let mut stream = TcpStream::connect_timeout(&address, timeout)
-        .map_err(|e| anyhow!("connect to {host}:{port} failed: {e}"))?;
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(|e| anyhow!("set_read_timeout failed: {e}"))?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .map_err(|e| anyhow!("set_write_timeout failed: {e}"))?;
-
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|e| anyhow!("write request failed: {e}"))?;
-
-    let mut bytes = Vec::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        match stream.read(&mut buf) {
-            Ok(0) => break, // EOF
-            Ok(n) => bytes.extend_from_slice(&buf[..n]),
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                return Err(anyhow!("read timed out after {timeout:?}"));
-            }
-            Err(e) => return Err(anyhow!("read failed: {e}")),
+impl Default for Task {
+    fn default() -> Self {
+        Task {
+            name: String::new(),
+            command: String::new(),
+            enabled: false,
+            status: TaskStatus::Waiting,
+            next_time: None,
         }
     }
-
-    let text = String::from_utf8(bytes).map_err(|_| anyhow!("response is not valid UTF-8"))?;
-    parse_http_response(&text)
 }
 
-/// Split an HTTP response into its status line / headers and extract the body.
-fn parse_http_response(text: &str) -> Result<String> {
-    let (head, body) = text
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| anyhow!("malformed HTTP response: no header/body separator"))?;
-    let mut lines = head.split("\r\n");
-    let status_line = lines.next().unwrap_or_default();
-    if !status_line.starts_with("HTTP/1.1 200") {
-        return Err(anyhow!("unexpected status line: {status_line:?}"));
-    }
-    let content_length = lines
-        .filter_map(|line| line.split_once(':'))
-        .find_map(|(key, value)| {
-            if key.trim().eq_ignore_ascii_case("content-length") {
-                value.trim().parse::<usize>().ok()
-            } else {
-                None
-            }
-        });
-    match content_length {
-        Some(cl) => {
-            if body.len() < cl {
-                return Err(anyhow!("truncated: expected {cl} bytes, got {}", body.len()));
-            }
-            Ok(body[..cl].to_string())
-        }
-        None => Ok(body.to_string()),
+/// Scheduler status of a task, mirroring the webui overview scopes
+/// 运行中 / 队列中 / 等待中 (module/webui/app.py).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TaskStatus {
+    /// First past-due task (the one the scheduler is executing, if alive).
+    Running,
+    /// Remaining past-due tasks behind the running one.
+    Queued,
+    /// `NextRun` in the future (or unknown).
+    Waiting,
+}
+
+/// Pure status classification against a local clock string.
+///
+/// Both `next_time` and `now_str` use the zero-padded `"YYYY-MM-DD HH:MM:SS"`
+/// format, so a plain string compare equals a chronological compare (verified
+/// against the real payload: `datetime.fromisoformat` round-trips to exactly
+/// this string — module/config/utils.py). Equal means "due now" → Running.
+///
+/// NOTE: the Running-vs-Queued split is a LIST-LEVEL concern (the first
+/// past-due task is Running, later ones are Queued — module/webui/app.py
+/// `pending_task[:1]` vs `pending_task[1:]`), handled in [`fetch_tasks`], not
+/// here: [`classify`] returns Running for ANY past-due task.
+pub fn classify(next_time: Option<&str>, now_str: &str) -> TaskStatus {
+    match next_time {
+        Some(t) if t <= now_str => TaskStatus::Running,
+        _ => TaskStatus::Waiting,
     }
 }
 
-/// Tolerant JSON task-list parser.
+/// Parse the i18n JSON used for display names (e.g. zh-CN.json).
 ///
-/// Accepts either a top-level array of task objects, or a JSON object that
-/// carries the task array under one of the common keys `tasks`, `data`,
-/// `scheduler` (first match wins). Per object:
-/// - name: first of `name` | `task` | `title` (default: empty string)
-/// - enabled: first of `enabled` | `enable` | `status`; string `status`
-///   values `enabled`/`running`/`on` count as true (default: false)
-/// - running: first of `running` | `status`; string `status` values
-///   `running`/`active` count as true (default: false)
-///
-/// Non-object items are skipped. Malformed JSON is an `Err`; valid JSON of
-/// any other shape yields an empty list (callers fall back to config).
-pub fn parse_tasks_json(s: &str) -> Result<Vec<Task>> {
-    let value: serde_json::Value =
-        serde_json::from_str(s).map_err(|e| anyhow!("invalid task JSON: {e}"))?;
-    let array = match &value {
-        serde_json::Value::Array(a) => a,
-        serde_json::Value::Object(o) => {
-            let mut found = None;
-            for key in ["tasks", "data", "scheduler"] {
-                if let Some(serde_json::Value::Array(a)) = o.get(key) {
-                    found = Some(a);
-                    break;
-                }
-            }
-            match found {
-                Some(a) => a,
-                None => return Ok(Vec::new()),
-            }
-        }
-        _ => return Ok(Vec::new()),
-    };
-    Ok(array.iter().filter_map(task_from_json).collect())
+/// Tolerant: empty content → empty object (a missing/corrupt i18n file must
+/// never take the task menu down — names fall back to command keys).
+/// Garbage content that fails to parse is an `Err` for direct callers;
+/// [`fetch_tasks`] swallows it.
+pub fn parse_i18n(content: &str) -> Result<serde_json::Value> {
+    if content.trim().is_empty() {
+        return Ok(serde_json::Value::Object(serde_json::Map::new()));
+    }
+    serde_json::from_str(content).map_err(|e| anyhow!("invalid i18n json: {e}"))
 }
 
-fn task_from_json(v: &serde_json::Value) -> Option<Task> {
-    let obj = v.as_object()?;
-    let name = ["name", "task", "title"]
-        .iter()
-        .find_map(|k| obj.get(*k).and_then(|v| v.as_str()))
-        .map(String::from)
-        .unwrap_or_default();
-    let status = obj.get("status").and_then(|v| v.as_str());
-    let enabled = obj
-        .get("enabled")
-        .and_then(|v| v.as_bool())
-        .or_else(|| obj.get("enable").and_then(|v| v.as_bool()))
-        .or_else(|| status.map(|s| matches!(s, "enabled" | "running" | "on")))
-        .unwrap_or(false);
-    let running = obj
-        .get("running")
-        .and_then(|v| v.as_bool())
-        .or_else(|| status.map(|s| matches!(s, "running" | "active")))
-        .unwrap_or(false);
-    Some(Task {
-        name,
-        enabled,
-        running,
-    })
-}
-
-/// Fallback data source: read the ALAS repo's `config/*.yaml` task files.
+/// Parse the merged scheduler file `config/alas.json` into the enabled task
+/// list, mirroring `module/config/config.py:get_next_task`.
 ///
-/// Reads top-level `.yaml` files under `dir/config`, excluding `deploy.yaml`
-/// (launcher config, not a task) and `scheduler.yaml` (handled separately).
-/// For each standalone task file: task name = file stem; `enabled` = first of
-/// `enabled` | `enable` | `Scheduler.Enable` | `Scheduler.enable` in the
-/// YAML, defaulting to **true** (a task file existing means the task exists).
-/// `config/scheduler.yaml`, when present, contributes entries from either a
-/// mapping (`task-name: enable-flag`) or a sequence of objects (`name` +
-/// `enable`/`enabled`), each defaulting to enabled.
+/// For every top-level key carrying a `Scheduler` object:
+/// - enabled = `Scheduler.Enable == true`; anything else (false, missing,
+///   non-bool) means disabled and the task is SKIPPED — the webui only lists
+///   enabled tasks (`if not func.enable: continue`), and the discovery
+///   evidence confirmed the real file has no per-task yaml fallback.
+/// - next_time = `Scheduler.NextRun` as an optional string.
+/// - name = i18n `Task.<command>.name`, falling back to the command key.
+/// - status = [`classify`] against `now_str` (only meaningful for enabled
+///   tasks; the Running/Queued split happens in [`fetch_tasks`]).
 ///
-/// `running` is always false: the launcher cannot know ALAS runtime state
-/// from files — runtime state only comes from the webui API path.
-///
-/// Missing `config/` directory or no task files → `Ok(vec![])` (empty, not
-/// an error). Malformed/unreadable individual files are skipped tolerantly so
-/// one bad file cannot kill the whole menu.
-pub fn parse_tasks_config(dir: &Path) -> Result<Vec<Task>> {
-    let config_dir = dir.join("config");
-    let entries = match std::fs::read_dir(&config_dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(Vec::new()),
-    };
+/// Malformed JSON → `Err`; valid JSON with no enabled tasks → `Ok(vec![])`.
+pub fn parse_tasks_alas_json(
+    content: &str,
+    i18n: &serde_json::Value,
+    now_str: &str,
+) -> Result<Vec<Task>> {
+    let root: serde_json::Value =
+        serde_json::from_str(content).map_err(|e| anyhow!("invalid alas.json: {e}"))?;
+    let obj = root
+        .as_object()
+        .ok_or_else(|| anyhow!("alas.json root must be a JSON object"))?;
 
     let mut tasks = Vec::new();
-    let mut scheduler_yaml: Option<std::path::PathBuf> = None;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Some(file_name) = path.file_name().and_then(|n| n.to_str()).map(String::from) else {
-            continue;
+    for (command, task_value) in obj {
+        let Some(scheduler) = task_value.get("Scheduler") else {
+            continue; // no Scheduler group → not a schedulable task (e.g. Alas/General)
         };
-        let Some(stem) = file_name.strip_suffix(".yaml") else {
-            continue;
-        };
-        if stem == "deploy" {
-            continue;
+        if !matches!(scheduler.get("Enable").and_then(|v| v.as_bool()), Some(true)) {
+            continue; // disabled (or malformed Enable) → skipped, like the webui
         }
-        if stem == "scheduler" {
-            scheduler_yaml = Some(path);
-            continue;
-        }
-        let enabled = read_yaml(&path)
-            .and_then(|v| lookup_enabled(&v))
-            .unwrap_or(true);
+        let next_time = scheduler
+            .get("NextRun")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let name = i18n
+            .get("Task")
+            .and_then(|t| t.get(command))
+            .and_then(|entry| entry.get("name"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| command.clone());
         tasks.push(Task {
-            name: stem.to_string(),
-            enabled,
-            running: false,
+            name,
+            command: command.clone(),
+            enabled: true,
+            status: classify(next_time.as_deref(), now_str),
+            next_time,
         });
     }
+    Ok(tasks)
+}
 
-    if let Some(path) = scheduler_yaml {
-        if let Some(value) = read_yaml(&path) {
-            match value {
-                serde_yaml::Value::Mapping(map) => {
-                    for (key, val) in map {
-                        let Some(name) = key.as_str().map(String::from) else {
-                            continue;
-                        };
-                        tasks.push(Task {
-                            name,
-                            enabled: enabled_from_value(&val).unwrap_or(true),
-                            running: false,
-                        });
-                    }
-                }
-                serde_yaml::Value::Sequence(seq) => {
-                    for item in seq {
-                        if item.as_mapping().is_none() {
-                            continue;
-                        }
-                        tasks.push(Task {
-                            name: name_from_value(&item),
-                            enabled: enabled_from_value(&item).unwrap_or(true),
-                            running: false,
-                        });
-                    }
-                }
-                _ => {}
+/// Fetch the task list straight from the ALAS payload files.
+///
+/// - `<alas_dir>/config/alas.json` — merged scheduler data (missing → empty
+///   list, NOT an error: a payload without scheduler data is a valid "no
+///   tasks" state; malformed content IS an error).
+/// - `<alas_dir>/module/config/i18n/{language}.json` — display names; missing
+///   or unparseable → empty i18n (names fall back to command keys), never
+///   fatal.
+///
+/// Post-processing mirrors the webui overview ordering (module/webui/app.py
+/// `alas_update_overview_task`): tasks sorted by `NextRun` ascending (None
+/// last); after sorting, the FIRST task with status Running (earliest
+/// past-due) stays Running, every later past-due task becomes Queued, future
+/// tasks are Waiting.
+pub fn fetch_tasks(alas_dir: &Path, now_str: &str, language: &str) -> Result<Vec<Task>> {
+    let alas_path = alas_dir.join("config").join("alas.json");
+    let content = match std::fs::read_to_string(&alas_path) {
+        Ok(c) => c,
+        Err(_) => return Ok(Vec::new()), // no scheduler file → no tasks, not an error
+    };
+
+    let i18n = load_i18n(alas_dir, language);
+    let mut tasks = parse_tasks_alas_json(&content, &i18n, now_str)?;
+
+    tasks.sort_by(|a, b| match (&a.next_time, &b.next_time) {
+        (Some(x), Some(y)) => x.cmp(y),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    });
+
+    // After sorting, the earliest past-due task is the running one; any
+    // further past-due tasks are queued behind it.
+    if tasks.first().is_some_and(|t| t.status == TaskStatus::Running) {
+        for t in tasks.iter_mut().skip(1) {
+            if t.status == TaskStatus::Running {
+                t.status = TaskStatus::Queued;
             }
         }
     }
@@ -276,94 +205,71 @@ pub fn parse_tasks_config(dir: &Path) -> Result<Vec<Task>> {
     Ok(tasks)
 }
 
-/// Read + parse a YAML file; `None` on any error (tolerant skip).
-fn read_yaml(path: &Path) -> Option<serde_yaml::Value> {
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_yaml::from_str(&text).ok()
+/// Read + parse the i18n file for `language`; any failure → empty object
+/// (display names are cosmetic, never fatal).
+fn load_i18n(alas_dir: &Path, language: &str) -> serde_json::Value {
+    let path = alas_dir
+        .join("module")
+        .join("config")
+        .join("i18n")
+        .join(format!("{language}.json"));
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return serde_json::Value::Object(serde_json::Map::new());
+    };
+    parse_i18n(&content).unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()))
 }
 
-/// `enabled` lookup for a standalone task file:
-/// `enabled` | `enable` | `Scheduler.Enable` | `Scheduler.enable` (booleans).
-fn lookup_enabled(v: &serde_yaml::Value) -> Option<bool> {
-    for key in ["enabled", "enable"] {
-        if let Some(b) = v.get(key).and_then(|x| x.as_bool()) {
-            return Some(b);
-        }
-    }
-    if let Some(scheduler) = v.get("Scheduler") {
-        for key in ["Enable", "enable"] {
-            if let Some(b) = scheduler.get(key).and_then(|x| x.as_bool()) {
-                return Some(b);
-            }
-        }
-    }
-    None
-}
-
-/// `enabled` flag from a scheduler.yaml entry: a bare bool, or an object
-/// carrying `enable`/`enabled`/`Enable`.
-fn enabled_from_value(v: &serde_yaml::Value) -> Option<bool> {
-    match v {
-        serde_yaml::Value::Bool(b) => Some(*b),
-        serde_yaml::Value::Mapping(_) => ["enable", "enabled", "Enable"]
-            .iter()
-            .find_map(|key| v.get(*key).and_then(|x| x.as_bool())),
-        _ => None,
-    }
-}
-
-/// Task name from a scheduler.yaml sequence item: `name` | `task` | `title`.
-fn name_from_value(v: &serde_yaml::Value) -> String {
-    ["name", "task", "title"]
-        .iter()
-        .find_map(|key| v.get(*key).and_then(|x| x.as_str()))
-        .map(String::from)
-        .unwrap_or_default()
-}
-
-/// Dispatcher: webui API first, `config/*.yaml` fallback.
+/// Local clock in the scheduler's string format, `"YYYY-MM-DD HH:MM:SS"`.
 ///
-/// Tries every [`CANDIDATE_PATHS`] entry via [`http_get`] on `127.0.0.1:port`
-/// and returns the first whose body parses to a **non-empty** task list
-/// (guards against an API that returns 200 with an empty/error payload while
-/// the config files have real tasks). If every candidate fails or is empty,
-/// returns [`parse_tasks_config`]'s result (which is `Ok(vec![])` — never an
-/// error — when the payload has no task data at all).
-pub fn fetch_tasks(port: u16, alas_dir: &Path, timeout: Duration) -> Result<Vec<Task>> {
-    for path in CANDIDATE_PATHS {
-        match http_get("127.0.0.1", port, path, timeout) {
-            Ok(body) => {
-                if let Ok(tasks) = parse_tasks_json(&body) {
-                    if !tasks.is_empty() {
-                        return Ok(tasks);
-                    }
-                }
-            }
-            Err(_) => continue,
+/// Produced by spawning `date +"%F %T"` (macOS provides it; this module is
+/// cfg-gated to macOS in main.rs, so win/linux are unaffected). No chrono
+/// dependency is worth adding for one timestamp. On spawn failure, falls back
+/// to the lexicographic maximum "9999-12-31 23:59:59" — every task classifies
+/// as Waiting — so the menu still renders rather than erroring.
+pub fn now_str() -> String {
+    match std::process::Command::new("date").args(["+%F %T"]).output() {
+        Ok(out) if out.status.success() => {
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+        _ => {
+            warn!("`date +\"%F %T\"` failed; classifying all tasks as Waiting");
+            "9999-12-31 23:59:59".to_string()
         }
     }
-    parse_tasks_config(alas_dir)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
-    use std::thread;
 
-    // ---- fixtures ---------------------------------------------------------
+    // ---- fixtures (real values, quoted from the live payload 2026-08-10;
+    //      full Scheduler blocks verbatim from config/alas.json) --------------
 
-    /// Array fixture: 3 tasks with mixed name keys and status values.
-    const JSON_FIXTURE_ARRAY: &str = r#"[
-        {"name": "daily", "enabled": true, "running": false},
-        {"task": "campaign", "enable": false},
-        {"title": "mail", "status": "running"}
-    ]"#;
+    /// Real i18n entries (module/config/i18n/zh-CN.json, `Task.<cmd>.name`).
+    const I18N_FIXTURE: &str = r#"{
+        "Task": {
+            "Main":     { "name": "主线图" },
+            "Exercise": { "name": "演习" },
+            "Tactical": { "name": "战术学院" },
+            "Guild":    { "name": "大舰队" }
+        }
+    }"#;
 
-    /// Object fixture: task array under the common "tasks" key.
-    const JSON_FIXTURE_OBJECT: &str = r#"{"tasks": [{"name": "daily", "enabled": true}]}"#;
+    /// Real scheduler blocks: Main + GemsFarming disabled, General without a
+    /// Scheduler group, Exercise (future), Tactical + Guild (past-due).
+    const ALAS_JSON_FIXTURE: &str = r#"{
+        "General":    { "Retirement": {}, "Storage": {} },
+        "Main":       { "Scheduler": { "Enable": false, "NextRun": "2026-06-01 23:18:00", "Command": "Main", "SuccessInterval": 0, "FailureInterval": 120 }, "Campaign": {} },
+        "Exercise":   { "Scheduler": { "Enable": true, "NextRun": "2026-08-11 00:00:00", "Command": "Exercise", "SuccessInterval": 30, "FailureInterval": 30 } },
+        "Tactical":   { "Scheduler": { "Enable": true, "NextRun": "2026-08-10 20:14:24", "Command": "Tactical", "SuccessInterval": "30-60", "FailureInterval": "120-240" } },
+        "Guild":      { "Scheduler": { "Enable": true, "NextRun": "2026-08-10 21:00:00", "Command": "Guild", "SuccessInterval": 30, "FailureInterval": 30 } },
+        "GemsFarming": { "Scheduler": { "Enable": false, "NextRun": "2026-08-09 08:33:32", "Command": "GemsFarming", "SuccessInterval": 0, "FailureInterval": 120 } }
+    }"#;
 
-    // ---- test helpers ------------------------------------------------------
+    /// Past the Tactical/Guild times, before Exercise.
+    const NOW_FIXTURE: &str = "2026-08-10 22:00:00";
+
+    // ---- test helpers --------------------------------------------------------
 
     /// Temporary directory guard; removed on drop (also on test panic).
     struct TempDir(std::path::PathBuf);
@@ -390,312 +296,193 @@ mod tests {
         }
     }
 
-    /// Mock server: accept one connection, read the request, write `response`.
-    fn serve_response(response: String) -> (u16, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let handle = thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
-                let _ = stream.write_all(response.as_bytes());
-            }
-        });
-        (port, handle)
-    }
-
-    // ---- http_get: happy paths ---------------------------------------------
+    // ---- parse_i18n ------------------------------------------------------------
 
     #[test]
-    fn http_get_happy_with_content_length() {
-        let body = r#"{"tasks":[{"name":"daily","enabled":true}]}"#;
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{body}",
-            body.len()
-        );
-        let (port, handle) = serve_response(response);
-        let got = http_get("127.0.0.1", port, "/api/tasks", Duration::from_secs(2)).unwrap();
-        assert_eq!(got, body);
-        handle.join().unwrap();
+    fn parse_i18n_valid_object() {
+        let v = parse_i18n(I18N_FIXTURE).unwrap();
+        assert_eq!(v["Task"]["Main"]["name"], "主线图");
     }
 
     #[test]
-    fn http_get_happy_no_content_length_read_to_close() {
-        // No Content-Length: body = rest of stream (server drops → EOF).
-        let body = "no-length-body";
-        let response = format!("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{body}");
-        let (port, handle) = serve_response(response);
-        let got = http_get("127.0.0.1", port, "/tasks", Duration::from_secs(2)).unwrap();
-        assert_eq!(got, body);
-        handle.join().unwrap();
-    }
-
-    // ---- http_get: failure paths --------------------------------------------
-
-    #[test]
-    fn http_get_connection_refused_returns_err() {
-        // Bind, note the port, drop the listener → nothing listens there.
-        let port = {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let port = listener.local_addr().unwrap().port();
-            drop(listener);
-            port
-        };
-        let res = http_get("127.0.0.1", port, "/x", Duration::from_secs(2));
-        assert!(res.is_err(), "expected Err, got {:?}", res);
+    fn parse_i18n_empty_is_empty_object() {
+        assert_eq!(parse_i18n("").unwrap(), serde_json::Value::Object(Default::default()));
+        assert_eq!(parse_i18n("  \n ").unwrap(), serde_json::Value::Object(Default::default()));
     }
 
     #[test]
-    fn http_get_timeout_returns_err_bounded() {
-        // Listener accepts but never responds; the read timeout must fire.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let handle = thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 64];
-                let _ = stream.read(&mut buf);
-                thread::sleep(Duration::from_millis(2000)); // never write a response
-            }
-        });
-        let start = std::time::Instant::now();
-        let res = http_get("127.0.0.1", port, "/x", Duration::from_millis(300));
-        let elapsed = start.elapsed();
-        assert!(res.is_err(), "expected Err, got {:?}", res);
-        assert!(
-            elapsed < Duration::from_secs(3),
-            "timeout did not bound the call: {elapsed:?}"
-        );
-        handle.join().unwrap();
+    fn parse_i18n_garbage_is_err() {
+        assert!(parse_i18n("{not json").is_err());
     }
 
-    #[test]
-    fn http_get_malformed_response_returns_err() {
-        let (port, handle) = serve_response("not http\r\n\r\n".to_string());
-        let res = http_get("127.0.0.1", port, "/x", Duration::from_secs(2));
-        assert!(res.is_err(), "expected Err, got {:?}", res);
-        handle.join().unwrap();
-    }
+    // ---- parse_tasks_alas_json --------------------------------------------------
 
     #[test]
-    fn http_get_truncated_body_returns_err() {
-        let response = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort".to_string();
-        let (port, handle) = serve_response(response);
-        let res = http_get("127.0.0.1", port, "/x", Duration::from_secs(2));
-        assert!(res.is_err(), "expected Err, got {:?}", res);
-        assert!(
-            format!("{:?}", res.err()).contains("truncated"),
-            "expected truncated error"
-        );
-        handle.join().unwrap();
-    }
-
-    // ---- parse_tasks_json ----------------------------------------------------
-
-    #[test]
-    fn parse_tasks_json_array_fixture() {
-        let tasks = parse_tasks_json(JSON_FIXTURE_ARRAY).unwrap();
+    fn parse_tasks_alas_json_happy_path() {
+        let i18n = parse_i18n(I18N_FIXTURE).unwrap();
+        let tasks = parse_tasks_alas_json(ALAS_JSON_FIXTURE, &i18n, NOW_FIXTURE).unwrap();
+        // General (no Scheduler), Main + GemsFarming (disabled) are skipped.
         assert_eq!(tasks.len(), 3);
+
+        let exercise = tasks.iter().find(|t| t.command == "Exercise").unwrap();
         assert_eq!(
-            tasks[0],
-            Task {
-                name: "daily".into(),
+            exercise,
+            &Task {
+                name: "演习".into(),
+                command: "Exercise".into(),
                 enabled: true,
-                running: false
+                status: TaskStatus::Waiting, // 2026-08-11 00:00:00 > now
+                next_time: Some("2026-08-11 00:00:00".into()),
             }
         );
-        // name from "task", enabled from "enable"
+
+        let tactical = tasks.iter().find(|t| t.command == "Tactical").unwrap();
+        assert_eq!(tactical.name, "战术学院"); // real i18n name
+        assert_eq!(tactical.next_time.as_deref(), Some("2026-08-10 20:14:24"));
+        // classify-level: past-due => Running (Queued split happens in fetch_tasks).
+        assert_eq!(tactical.status, TaskStatus::Running);
+
+        let guild = tasks.iter().find(|t| t.command == "Guild").unwrap();
+        assert_eq!(guild.name, "大舰队");
+        assert_eq!(guild.next_time.as_deref(), Some("2026-08-10 21:00:00"));
+        assert_eq!(guild.status, TaskStatus::Running);
+
+        // Disabled / non-scheduler entries never appear.
+        assert!(tasks.iter().all(|t| t.enabled));
+        assert!(!tasks.iter().any(|t| t.command == "Main" || t.command == "GemsFarming"));
+    }
+
+    #[test]
+    fn parse_tasks_alas_json_fallback_name_without_i18n() {
+        let empty_i18n = serde_json::Value::Object(Default::default());
+        let tasks = parse_tasks_alas_json(ALAS_JSON_FIXTURE, &empty_i18n, NOW_FIXTURE).unwrap();
+        assert_eq!(tasks.len(), 3);
+        // No i18n → display name falls back to the command key.
+        assert!(tasks.iter().all(|t| t.name == t.command));
+        // Missing single entry also falls back while others resolve.
+        let partial = serde_json::json!({ "Task": { "Exercise": { "name": "演习" } } });
+        let tasks = parse_tasks_alas_json(ALAS_JSON_FIXTURE, &partial, NOW_FIXTURE).unwrap();
+        assert_eq!(tasks.iter().find(|t| t.command == "Exercise").unwrap().name, "演习");
+        assert_eq!(tasks.iter().find(|t| t.command == "Tactical").unwrap().name, "Tactical");
+    }
+
+    #[test]
+    fn parse_tasks_alas_json_malformed_is_err() {
+        let i18n = parse_i18n(I18N_FIXTURE).unwrap();
+        assert!(parse_tasks_alas_json("{not json", &i18n, NOW_FIXTURE).is_err());
+        assert!(parse_tasks_alas_json("", &i18n, NOW_FIXTURE).is_err());
+        assert!(parse_tasks_alas_json("[1,2,3]", &i18n, NOW_FIXTURE).is_err());
+    }
+
+    #[test]
+    fn parse_tasks_alas_json_empty_is_empty_list() {
+        let i18n = parse_i18n(I18N_FIXTURE).unwrap();
+        assert_eq!(parse_tasks_alas_json("{}", &i18n, NOW_FIXTURE).unwrap(), vec![]);
+        // Object with entries but no enabled Scheduler tasks → empty list.
+        let all_disabled = r#"{ "Main": { "Scheduler": { "Enable": false, "NextRun": "2026-06-01 23:18:00", "Command": "Main" } } }"#;
+        assert_eq!(parse_tasks_alas_json(all_disabled, &i18n, NOW_FIXTURE).unwrap(), vec![]);
+    }
+
+    // ---- classify ----------------------------------------------------------------
+
+    #[test]
+    fn classify_matrix() {
+        // past vs now → Running
+        assert_eq!(classify(Some("2026-08-10 20:14:24"), "2026-08-10 22:00:00"), TaskStatus::Running);
+        // future → Waiting
+        assert_eq!(classify(Some("2026-08-11 00:00:00"), "2026-08-10 22:00:00"), TaskStatus::Waiting);
+        // equal boundary → Running (due now)
+        assert_eq!(classify(Some("2026-08-10 22:00:00"), "2026-08-10 22:00:00"), TaskStatus::Running);
+        // None → Waiting
+        assert_eq!(classify(None, "2026-08-10 22:00:00"), TaskStatus::Waiting);
+        // day boundary across midnight
+        assert_eq!(classify(Some("2026-08-09 23:59:59"), "2026-08-10 00:00:00"), TaskStatus::Running);
+    }
+
+    // ---- fetch_tasks -----------------------------------------------------------------
+
+    #[test]
+    fn fetch_tasks_sorted_with_running_queued_waiting() {
+        let tmp = TempDir::new("sorted");
+        let cfg = tmp.path().join("config");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(cfg.join("alas.json"), ALAS_JSON_FIXTURE).unwrap();
+        let i18n_dir = tmp.path().join("module/config/i18n");
+        std::fs::create_dir_all(&i18n_dir).unwrap();
+        std::fs::write(i18n_dir.join("zh-CN.json"), I18N_FIXTURE).unwrap();
+
+        let tasks = fetch_tasks(tmp.path(), NOW_FIXTURE, "zh-CN").unwrap();
+        // Sorted by next_time ascending: Tactical (20:14) < Guild (21:00) < Exercise (next day).
         assert_eq!(
-            tasks[1],
-            Task {
-                name: "campaign".into(),
-                enabled: false,
-                running: false
-            }
+            tasks.iter().map(|t| t.command.as_str()).collect::<Vec<_>>(),
+            vec!["Tactical", "Guild", "Exercise"]
         );
-        // name from "title", status "running" → enabled AND running
-        assert_eq!(
-            tasks[2],
-            Task {
-                name: "mail".into(),
-                enabled: true,
-                running: true
-            }
-        );
+        // First past-due = Running, later past-due = Queued, future = Waiting.
+        assert_eq!(tasks[0].status, TaskStatus::Running);
+        assert_eq!(tasks[0].name, "战术学院");
+        assert_eq!(tasks[1].status, TaskStatus::Queued);
+        assert_eq!(tasks[2].status, TaskStatus::Waiting);
+        assert_eq!(tasks[2].name, "演习");
     }
 
     #[test]
-    fn parse_tasks_json_object_with_tasks_key() {
-        let tasks = parse_tasks_json(JSON_FIXTURE_OBJECT).unwrap();
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].name, "daily");
-        assert!(tasks[0].enabled);
-        assert!(!tasks[0].running);
-    }
-
-    #[test]
-    fn parse_tasks_json_data_key_and_defaults() {
-        // "data" key path; missing enabled → default false; missing name → ""
-        let tasks = parse_tasks_json(r#"{"data": [{"name": "x"}, {"title": "y", "status": "enabled"}]}"#)
-            .unwrap();
-        assert_eq!(tasks.len(), 2);
-        assert!(!tasks[0].enabled);
-        assert!(tasks[1].enabled);
-        assert!(!tasks[1].running);
-        let skipped = parse_tasks_json(r#"{"data": [42, "nope", {"name": "ok"}]}"#).unwrap();
-        assert_eq!(skipped.len(), 1);
-        assert_eq!(skipped[0].name, "ok");
-    }
-
-    #[test]
-    fn parse_tasks_json_empty_ok() {
-        assert_eq!(parse_tasks_json("[]").unwrap(), vec![]);
-        assert_eq!(parse_tasks_json(r#"{"tasks": []}"#).unwrap(), vec![]);
-        assert_eq!(parse_tasks_json(r#"{"unrelated": 1}"#).unwrap(), vec![]);
-    }
-
-    #[test]
-    fn parse_tasks_json_malformed_err() {
-        assert!(parse_tasks_json("{not json").is_err());
-        assert!(parse_tasks_json("").is_err());
-        assert!(parse_tasks_json("garbage").is_err());
-    }
-
-    // ---- parse_tasks_config ----------------------------------------------------
-
-    #[test]
-    fn parse_tasks_config_standalone_and_scheduler_map() {
-        let tmp = TempDir::new("standalone");
-        let cfg = tmp.path().join("config");
-        std::fs::create_dir_all(&cfg).unwrap();
-        std::fs::write(cfg.join("deploy.yaml"), "Deploy:\n  Webui:\n    WebuiPort: 22267\n").unwrap();
-        std::fs::write(cfg.join("daily.yaml"), "enabled: true\n").unwrap();
-        std::fs::write(cfg.join("campaign.yaml"), "enabled: false\n").unwrap();
-        std::fs::write(cfg.join("plain.yaml"), "some: config\n").unwrap(); // no enable key → default true
-        std::fs::write(cfg.join("notes.txt"), "not a task file\n").unwrap(); // non-yaml ignored
-        std::fs::write(cfg.join("scheduler.yaml"), "daily: true\ncampaign: false\n").unwrap();
-
-        let tasks = parse_tasks_config(tmp.path()).unwrap();
-        assert!(tasks.iter().any(|t| t.name == "daily" && t.enabled));
-        assert!(tasks.iter().any(|t| t.name == "campaign" && !t.enabled));
-        assert!(tasks.iter().any(|t| t.name == "plain" && t.enabled));
-        assert!(
-            !tasks.iter().any(|t| t.name == "deploy"),
-            "deploy.yaml must be excluded"
-        );
-        assert!(
-            tasks.iter().all(|t| !t.running),
-            "running must be false from files"
-        );
-    }
-
-    #[test]
-    fn parse_tasks_config_scheduler_sequence() {
-        let tmp = TempDir::new("sched-seq");
-        let cfg = tmp.path().join("config");
-        std::fs::create_dir_all(&cfg).unwrap();
-        std::fs::write(
-            cfg.join("scheduler.yaml"),
-            "- name: daily\n  enable: true\n- task: campaign\n  enabled: false\n",
-        )
-        .unwrap();
-        let tasks = parse_tasks_config(tmp.path()).unwrap();
-        assert_eq!(tasks.len(), 2);
-        assert!(tasks.iter().any(|t| t.name == "daily" && t.enabled));
-        assert!(tasks.iter().any(|t| t.name == "campaign" && !t.enabled));
-    }
-
-    #[test]
-    fn parse_tasks_config_missing_dir_empty() {
-        let tmp = TempDir::new("missing");
-        assert_eq!(parse_tasks_config(tmp.path()).unwrap(), vec![]);
-    }
-
-    #[test]
-    fn parse_tasks_config_empty_config_dir_empty() {
-        let tmp = TempDir::new("empty");
-        std::fs::create_dir_all(tmp.path().join("config")).unwrap();
-        assert_eq!(parse_tasks_config(tmp.path()).unwrap(), vec![]);
-    }
-
-    // ---- fetch_tasks -----------------------------------------------------------
-
-    #[test]
-    fn fetch_tasks_prefers_api_over_config() {
-        // Mock webui: first candidate path returns a task list.
-        let body = r#"{"data": [{"name": "daily", "enabled": true}]}"#;
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        );
-        let (port, handle) = serve_response(response);
-        // Even with a yaml fallback present, the API must win.
-        let tmp = TempDir::new("prefers-api");
-        let cfg = tmp.path().join("config");
-        std::fs::create_dir_all(&cfg).unwrap();
-        std::fs::write(cfg.join("daily.yaml"), "enabled: true\n").unwrap();
-
-        let tasks = fetch_tasks(port, tmp.path(), Duration::from_secs(2)).unwrap();
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].name, "daily");
-        assert!(tasks[0].enabled);
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn fetch_tasks_falls_back_to_config_on_all_404() {
-        // Mock webui that 404s every candidate path.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let handle = thread::spawn(move || {
-            for _ in 0..CANDIDATE_PATHS.len() {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let mut buf = [0u8; 4096];
-                        let _ = stream.read(&mut buf);
-                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-        let tmp = TempDir::new("fallback");
-        let cfg = tmp.path().join("config");
-        std::fs::create_dir_all(&cfg).unwrap();
-        std::fs::write(cfg.join("daily.yaml"), "enabled: true\n").unwrap();
-
-        let tasks = fetch_tasks(port, tmp.path(), Duration::from_secs(2)).unwrap();
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].name, "daily");
-        assert!(tasks[0].enabled);
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn fetch_tasks_empty_api_and_no_config_returns_empty() {
-        // API answers 200 with an empty task list on every path → fallback
-        // with no config dir → Ok(vec![]), NOT Err.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let empty = r#"{"tasks": []}"#;
-        let handle = thread::spawn(move || {
-            for _ in 0..CANDIDATE_PATHS.len() {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let mut buf = [0u8; 4096];
-                        let _ = stream.read(&mut buf);
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{empty}",
-                            empty.len()
-                        );
-                        let _ = stream.write_all(response.as_bytes());
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-        let tmp = TempDir::new("empty-api");
-        let tasks = fetch_tasks(port, tmp.path(), Duration::from_secs(2)).unwrap();
+    fn fetch_tasks_missing_alas_json_is_empty() {
+        let tmp = TempDir::new("missing-alas");
+        let tasks = fetch_tasks(tmp.path(), NOW_FIXTURE, "zh-CN").unwrap();
         assert_eq!(tasks, vec![]);
-        handle.join().unwrap();
+    }
+
+    #[test]
+    fn fetch_tasks_missing_i18n_falls_back_to_command_keys() {
+        let tmp = TempDir::new("missing-i18n");
+        let cfg = tmp.path().join("config");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(cfg.join("alas.json"), ALAS_JSON_FIXTURE).unwrap();
+        // No module/config/i18n dir at all.
+        let tasks = fetch_tasks(tmp.path(), NOW_FIXTURE, "zh-CN").unwrap();
+        assert_eq!(tasks.len(), 3);
+        assert!(tasks.iter().all(|t| t.name == t.command));
+        assert_eq!(tasks[0].status, TaskStatus::Running); // post-processing intact
+        assert_eq!(tasks[1].status, TaskStatus::Queued);
+        assert_eq!(tasks[2].status, TaskStatus::Waiting);
+    }
+
+    #[test]
+    fn fetch_tasks_malformed_alas_json_is_err() {
+        let tmp = TempDir::new("malformed-alas");
+        let cfg = tmp.path().join("config");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(cfg.join("alas.json"), "{not json").unwrap();
+        assert!(fetch_tasks(tmp.path(), NOW_FIXTURE, "zh-CN").is_err());
+    }
+
+    #[test]
+    fn fetch_tasks_nothing_past_due_all_waiting() {
+        let tmp = TempDir::new("all-waiting");
+        let cfg = tmp.path().join("config");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(cfg.join("alas.json"), ALAS_JSON_FIXTURE).unwrap();
+        // Before every task's NextRun → nothing Running, nothing Queued.
+        let tasks = fetch_tasks(tmp.path(), "2026-08-09 00:00:00", "zh-CN").unwrap();
+        assert!(tasks.iter().all(|t| t.status == TaskStatus::Waiting));
+    }
+
+    // ---- real payload (manual-QA channel) --------------------------------------------
+
+    /// Reads the REAL installed ALAS payload when present (read-only) and
+    /// prints the parsed task list — the real-surface proof that the parser
+    /// handles the live file. Skipped (with a note) when the payload is not
+    /// installed on this machine.
+    #[test]
+    fn fetch_tasks_real_payload_if_present() {
+        let payload = Path::new("/Applications/AzurLaneAutoScript.app/Contents/AzurLaneAutoScript");
+        if !payload.join("config").join("alas.json").exists() {
+            eprintln!("real ALAS payload not present; skipping real-surface check");
+            return;
+        }
+        let tasks = fetch_tasks(payload, &now_str(), "zh-CN").unwrap();
+        assert!(!tasks.is_empty(), "real payload must yield enabled tasks");
+        assert!(tasks.iter().any(|t| !t.name.is_empty()));
+        println!("real payload: {} enabled tasks\n{tasks:#?}", tasks.len());
     }
 }

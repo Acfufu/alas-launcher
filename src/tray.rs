@@ -28,9 +28,6 @@ use crate::{
 /// Poll cadence for the task section; also bounds each idle wait of the poll
 /// thread (a refresh signal wakes it early, never later than this).
 const TRAY_POLL_INTERVAL_SECS: Duration = Duration::from_secs(10);
-/// Per-request timeout for the ALAS webui fetch — the poll thread must never
-/// block on the network (Metis MAJOR-4).
-const FETCH_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Which rendering the task section of the menu should use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,9 +113,9 @@ pub fn build_tray(
         let mut last_section = TaskSection::Empty;
         while !thread_shared.stop.load(Ordering::Relaxed) {
             match refresh_rx.recv_timeout(TRAY_POLL_INTERVAL_SECS) {
-                Ok(()) => poll_once(&app_handle, &thread_tray, &thread_shared, port, &mut last_section),
+                Ok(()) => poll_once(&app_handle, &thread_tray, &thread_shared, &mut last_section),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    poll_once(&app_handle, &thread_tray, &thread_shared, port, &mut last_section)
+                    poll_once(&app_handle, &thread_tray, &thread_shared, &mut last_section)
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
@@ -194,9 +191,7 @@ fn build_menu(
 
 /// Read-only text for one task menu item.
 pub(crate) fn task_item_text(t: &Task) -> String {
-    if t.running {
-        format!("{} — running", t.name)
-    } else if t.enabled {
+    if t.enabled {
         format!("{} — enabled", t.name)
     } else {
         format!("{} — disabled", t.name)
@@ -387,20 +382,24 @@ pub(crate) fn task_section(status: BackendStatus, fetch: Result<Vec<Task>, ()>) 
 
 /// Name-set difference between the old and new task lists, used to decide
 /// whether a rebuild is needed. Returned ids are positional in the OLD list
-/// (`task-{i}`); returned tasks come from NEW (name not present in OLD).
+/// (`task-{i}`); returned tasks come from NEW (command not present in OLD).
 /// Both empty => no structural change => caller skips the rebuild.
+///
+/// Identity is the `command` key, NOT the display `name`: names come from the
+/// i18n file (`Task.<command>.name`) and can change with the webui language,
+/// while the command equals the stable alas.json top-level key.
 pub(crate) fn menu_diff(old: &[Task], new: &[Task]) -> (Vec<String>, Vec<Task>) {
-    let new_names: HashSet<&str> = new.iter().map(|t| t.name.as_str()).collect();
+    let new_commands: HashSet<&str> = new.iter().map(|t| t.command.as_str()).collect();
     let to_remove = old
         .iter()
         .enumerate()
-        .filter(|(_, t)| !new_names.contains(t.name.as_str()))
+        .filter(|(_, t)| !new_commands.contains(t.command.as_str()))
         .map(|(i, _)| format!("task-{i}"))
         .collect();
-    let old_names: HashSet<&str> = old.iter().map(|t| t.name.as_str()).collect();
+    let old_commands: HashSet<&str> = old.iter().map(|t| t.command.as_str()).collect();
     let to_add: Vec<Task> = new
         .iter()
-        .filter(|t| !old_names.contains(t.name.as_str()))
+        .filter(|t| !old_commands.contains(t.command.as_str()))
         .cloned()
         .collect();
     (to_remove, to_add)
@@ -408,22 +407,24 @@ pub(crate) fn menu_diff(old: &[Task], new: &[Task]) -> (Vec<String>, Vec<Task>) 
 
 /// One poll cycle: snapshot the status (no network under the lock), fetch
 /// outside any lock when Running, then rebuild only when the rendered section
-/// kind or the task name set changed (anti-flicker). `last_section` tracks
+/// kind or the task command set changed (anti-flicker). `last_section` tracks
 /// what the menu currently renders.
 fn poll_once(
     app: &AppHandle,
     tray: &tauri::tray::TrayIcon,
     shared: &TrayShared,
-    port: u16,
     last_section: &mut TaskSection,
 ) {
-    // (a) status snapshot — no network I/O under the backend lock.
+    // (a) status snapshot — no I/O under the backend lock.
     let status = shared.backend.lock().unwrap().status;
 
     // (b/c) Running -> fetch outside any lock; anything else -> degraded.
+    // Tasks are read from the payload files (config/alas.json + i18n — the
+    // ALAS webui has no JSON API, see alas_tasks module doc).
     let fetched: Result<Vec<Task>, ()> = if status == BackendStatus::Running {
         let alas_dir = std::env::current_dir().unwrap_or_default();
-        alas_tasks::fetch_tasks(port, &alas_dir, FETCH_TIMEOUT).map_err(|_| ())
+        let language = deploy_language().unwrap_or_else(|| "zh-CN".to_string());
+        alas_tasks::fetch_tasks(&alas_dir, &alas_tasks::now_str(), &language).map_err(|_| ())
     } else {
         Err(())
     };
@@ -449,6 +450,17 @@ fn poll_once(
         }
         *last_section = section;
     }
+}
+
+/// Webui language from `config/deploy.yaml` (`Gui.Language`), which selects
+/// the i18n file for task display names. zh-CN fallback — the payload default
+/// (verified live: deploy.yaml `Language: zh-CN`).
+fn deploy_language() -> Option<String> {
+    crate::setup::get_deploy_config()?
+        .get("Gui")?
+        .get("Language")?
+        .as_str()
+        .map(String::from)
 }
 
 /// Point the main window at `url` (errors are non-fatal).
@@ -540,23 +552,17 @@ mod tests {
     }
 
     #[test]
-    fn task_item_text_running_enabled_disabled() {
-        let running = Task {
+    fn task_item_text_enabled_disabled() {
+        let enabled = Task {
             name: "daily".into(),
             enabled: true,
-            running: true,
+            ..Default::default()
         };
-        assert_eq!(task_item_text(&running), "daily — running");
-        let enabled = Task {
-            name: "campaign".into(),
-            enabled: true,
-            running: false,
-        };
-        assert_eq!(task_item_text(&enabled), "campaign — enabled");
+        assert_eq!(task_item_text(&enabled), "daily — enabled");
         let disabled = Task {
             name: "mail".into(),
             enabled: false,
-            running: false,
+            ..Default::default()
         };
         assert_eq!(task_item_text(&disabled), "mail — disabled");
     }
@@ -564,15 +570,18 @@ mod tests {
     #[test]
     fn menu_diff_unchanged_is_empty() {
         let old = vec![Task {
-            name: "daily".into(),
+            name: "每日任务".into(),
+            command: "Daily".into(),
             enabled: true,
-            running: false,
+            ..Default::default()
         }];
-        // Same name set (running flag flipped) -> no structural change.
+        // Same command set (status changed) -> no structural change.
         let new = vec![Task {
-            name: "daily".into(),
+            name: "每日任务".into(),
+            command: "Daily".into(),
             enabled: true,
-            running: true,
+            status: alas_tasks::TaskStatus::Waiting,
+            next_time: Some("2026-08-11 00:00:00".into()),
         }];
         assert_eq!(menu_diff(&old, &new), (vec![], vec![]));
         assert_eq!(menu_diff(&[], &[]), (vec![], vec![]));
@@ -583,49 +592,55 @@ mod tests {
         let old: Vec<Task> = vec![];
         let new = vec![
             Task {
-                name: "daily".into(),
+                name: "每日任务".into(),
+                command: "Daily".into(),
                 enabled: true,
-                running: false,
+                ..Default::default()
             },
             Task {
-                name: "campaign".into(),
+                name: "困难图".into(),
+                command: "Hard".into(),
                 enabled: false,
-                running: false,
+                ..Default::default()
             },
         ];
         let (to_remove, to_add) = menu_diff(&old, &new);
         assert!(to_remove.is_empty());
         assert_eq!(to_add.len(), 2);
-        assert_eq!(to_add[0].name, "daily");
-        assert_eq!(to_add[1].name, "campaign");
+        assert_eq!(to_add[0].command, "Daily");
+        assert_eq!(to_add[1].command, "Hard");
     }
 
     #[test]
     fn menu_diff_remove_scenario() {
         let old = vec![
             Task {
-                name: "daily".into(),
+                name: "每日任务".into(),
+                command: "Daily".into(),
                 enabled: true,
-                running: false,
+                ..Default::default()
             },
             Task {
-                name: "campaign".into(),
-                enabled: false,
-                running: false,
+                name: "战术学院".into(),
+                command: "Tactical".into(),
+                enabled: true,
+                ..Default::default()
             },
             Task {
-                name: "mail".into(),
-                enabled: false,
-                running: false,
+                name: "大舰队".into(),
+                command: "Guild".into(),
+                enabled: true,
+                ..Default::default()
             },
         ];
         let new = vec![Task {
-            name: "campaign".into(),
-            enabled: false,
-            running: false,
+            name: "战术学院".into(),
+            command: "Tactical".into(),
+            enabled: true,
+            ..Default::default()
         }];
         let (to_remove, to_add) = menu_diff(&old, &new);
-        // Positional ids in the OLD list: daily=0, mail=2.
+        // Positional ids in the OLD list: Daily=0, Guild=2.
         assert_eq!(
             to_remove,
             vec!["task-0".to_string(), "task-2".to_string()]
@@ -634,11 +649,31 @@ mod tests {
     }
 
     #[test]
+    fn menu_diff_same_commands_different_names_no_change() {
+        // i18n display names may change (e.g. webui language switch) while
+        // commands stay stable — identity must be the command.
+        let old = vec![Task {
+            name: "主线图".into(),
+            command: "Main".into(),
+            enabled: true,
+            ..Default::default()
+        }];
+        let new = vec![Task {
+            name: "Main".into(), // i18n gone -> name falls back to command
+            command: "Main".into(),
+            enabled: true,
+            ..Default::default()
+        }];
+        assert_eq!(menu_diff(&old, &new), (vec![], vec![]));
+    }
+
+    #[test]
     fn task_section_matrix() {
         let one = vec![Task {
-            name: "daily".into(),
+            name: "每日任务".into(),
+            command: "Daily".into(),
             enabled: true,
-            running: false,
+            ..Default::default()
         }];
         assert_eq!(
             task_section(BackendStatus::Running, Ok(one.clone())),
