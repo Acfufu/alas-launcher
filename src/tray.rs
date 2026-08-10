@@ -22,7 +22,7 @@ use tracing::warn;
 
 use crate::{
     alas_tasks::{self, Task},
-    backend::{BackendState, BackendStatus, ManagedBackend},
+    backend::{BackendLifecycle, BackendStateSnapshot, BackendStatus},
 };
 
 /// Poll cadence for the task section; also bounds each idle wait of the poll
@@ -51,7 +51,7 @@ pub(crate) enum TaskSection {
 /// channel (manual Refresh menu item).
 #[derive(Clone)]
 struct TrayShared {
-    backend: Arc<Mutex<BackendState>>,
+    backend: Arc<BackendLifecycle>,
     tasks: Arc<Mutex<Vec<Task>>>,
     stop: Arc<AtomicBool>,
     refresh: mpsc::Sender<()>,
@@ -59,14 +59,14 @@ struct TrayShared {
 
 /// Build the macOS menu-bar tray icon with its native menu.
 ///
-/// `backend` is the shared three-state lifecycle object (also owned by
-/// main.rs); `port` is the ALAS webui port used for the main-page URL and the
-/// task fetch; `stop` is the shared poll-thread stop flag (also owned by
-/// main.rs, set in ExitRequested). A returned `Err` is warn-and-continue at
-/// the call site — a tray failure must never abort app startup.
+/// `backend` is the shared lifecycle object (also owned by main.rs); `port`
+/// is the ALAS webui port used for the main-page URL and the task fetch;
+/// `stop` is the shared poll-thread stop flag (also owned by main.rs, set in
+/// ExitRequested). A returned `Err` is warn-and-continue at the call site — a
+/// tray failure must never abort app startup.
 pub fn build_tray(
     app: &tauri::App,
-    backend: Arc<Mutex<BackendState>>,
+    backend: Arc<BackendLifecycle>,
     port: u16,
     stop: Arc<AtomicBool>,
 ) -> tauri::Result<tauri::tray::TrayIcon> {
@@ -78,7 +78,15 @@ pub fn build_tray(
         refresh: refresh_tx,
     };
 
-    let menu = build_menu(app, &BackendState::default(), &[], TaskSection::Empty)?;
+    let menu = build_menu(
+        app,
+        &BackendStateSnapshot {
+            status: BackendStatus::Stopped,
+            start_failed: false,
+        },
+        &[],
+        TaskSection::Empty,
+    )?;
 
     let thread_shared = shared.clone();
     let tray = TrayIconBuilder::with_id("main-tray")
@@ -137,16 +145,16 @@ pub fn build_tray(
 /// `group-running|queued|waiting`, task rows id `task-{i}`.
 fn build_menu(
     app: &impl tauri::Manager<tauri::Wry>,
-    state: &BackendState,
+    snapshot: &BackendStateSnapshot,
     tasks: &[Task],
     section: TaskSection,
 ) -> tauri::Result<Menu<tauri::Wry>> {
-    let status = MenuItem::with_id(app, "tray-status", status_text(state), false, None::<&str>)?;
+    let status = MenuItem::with_id(app, "tray-status", status_text(snapshot), false, None::<&str>)?;
     let toggle = MenuItem::with_id(
         app,
         "tray-toggle",
-        toggle_label(state.status),
-        toggle_enabled(state.status),
+        toggle_label(snapshot.status),
+        toggle_enabled(snapshot.status),
         None::<&str>,
     )?;
     let separator_after_toggle = PredefinedMenuItem::separator(app)?;
@@ -263,11 +271,11 @@ pub(crate) fn task_section_items(tasks: &[Task]) -> Vec<TaskMenuItem> {
     items
 }
 
-fn status_text(state: &BackendState) -> String {
-    if state.start_failed {
+fn status_text(snapshot: &BackendStateSnapshot) -> String {
+    if snapshot.start_failed {
         "Backend: start failed".to_string()
     } else {
-        label_for(state.status).to_string()
+        label_for(snapshot.status).to_string()
     }
 }
 
@@ -293,7 +301,7 @@ pub(crate) fn toggle_enabled(status: BackendStatus) -> bool {
 /// Where the main window should point for a given backend status.
 pub(crate) fn main_page_url(status: BackendStatus, port: u16) -> Url {
     match status {
-        BackendStatus::Running => Url::parse(&format!("http://127.0.0.1:{}/", port)).unwrap(),
+        BackendStatus::Running => Url::parse(&crate::backend::webui_url(port)).unwrap(),
         BackendStatus::Stopped | BackendStatus::Initializing => stopped_page_url(),
     }
 }
@@ -313,8 +321,8 @@ pub(crate) enum ToggleAction {
     Start,
 }
 
-pub(crate) fn toggle_decision(state: &BackendState) -> ToggleAction {
-    match state.status {
+pub(crate) fn toggle_decision(snapshot: &BackendStateSnapshot) -> ToggleAction {
+    match snapshot.status {
         BackendStatus::Initializing => ToggleAction::NoOp,
         BackendStatus::Running => ToggleAction::Stop,
         BackendStatus::Stopped => ToggleAction::Start,
@@ -323,67 +331,33 @@ pub(crate) fn toggle_decision(state: &BackendState) -> ToggleAction {
 
 /// Full Start/Stop toggle for the backend.
 ///
-/// ORDERING CONTRACT (Metis BLOCKER-2): the old backend MUST be fully
-/// terminated AND dropped BEFORE a new gui.py is spawned. ManagedBackend's
-/// Drop scans every process for ALAS_LAUNCHER_PID and kills matches; if the
-/// old backend were dropped after a new spawn, that scan would kill the
-/// freshly spawned gui.py. Both paths below therefore order: take() out of
-/// the shared state -> drop the Option (running the kill-all scan) -> only
-/// then spawn.
+/// The ordering contract (Metis BLOCKER-2: the old backend MUST be fully
+/// terminated AND dropped before a new gui.py spawns) lives inside
+/// [`BackendLifecycle::start`]; the toggle only snapshots, decides and
+/// delegates. Navigation decisions go through [`main_page_url`] exactly as
+/// before.
 fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
     // Snapshot the state and decide. Initializing -> NoOp (the item is
     // disabled anyway; this also makes a second click during a 60s start
     // window a no-op — BLOCKER-3: never two backends).
-    let action = toggle_decision(&shared.backend.lock().unwrap());
+    let action = toggle_decision(&shared.backend.snapshot());
     match action {
         ToggleAction::NoOp => return,
         ToggleAction::Stop => {
-            // ORDERING CONTRACT, stop path: take() -> status Stopped -> drop
-            // the lock guard -> terminate() -> drop(old). terminate() kills
-            // gui.py BEFORE the Option is dropped, so the Drop kill-all scan
-            // runs with gui.py already dead.
-            let mut old = {
-                let mut state = shared.backend.lock().unwrap();
-                state.status = BackendStatus::Stopped;
-                state.start_failed = false;
-                state.backend.take()
-            };
-            if let Some(mut b) = old.take() {
-                let _ = b.terminate();
-            }
-            drop(old);
+            shared.backend.stop();
             navigate_main(app, main_page_url(BackendStatus::Stopped, port));
         }
         ToggleAction::Start => {
-            // ORDERING CONTRACT, start path: take + drop any lingering old
-            // backend BEFORE ManagedBackend::new spawns the new gui.py.
-            let old = {
-                let mut state = shared.backend.lock().unwrap();
-                state.backend.take()
-            };
-            drop(old);
-            {
-                let mut state = shared.backend.lock().unwrap();
-                state.status = BackendStatus::Initializing;
-                state.start_failed = false;
-            }
-            match ManagedBackend::new(port) {
-                Ok(b) => {
-                    {
-                        let mut state = shared.backend.lock().unwrap();
-                        state.backend = Some(b);
-                        state.status = BackendStatus::Running;
-                        state.start_failed = false;
-                    }
-                    navigate_main(app, main_page_url(BackendStatus::Running, port));
-                }
+            // Show "initializing…" (and make re-entry a no-op) for the whole
+            // spawn window, which may take up to 60s.
+            shared.backend.begin_start();
+            match shared.backend.start(port) {
+                Ok(()) => navigate_main(app, main_page_url(BackendStatus::Running, port)),
                 Err(e) => {
                     warn!("Failed to start backend: {e}");
-                    {
-                        let mut state = shared.backend.lock().unwrap();
-                        state.status = BackendStatus::Stopped;
-                        state.start_failed = true;
-                    }
+                    // Status is now Stopped + start_failed (set inside the
+                    // module); the window stays on the stopped page and the
+                    // next menu rebuild shows "Backend: start failed".
                 }
             }
         }
@@ -392,33 +366,22 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
     rebuild_menu(app, shared, section_from_state(shared));
 }
 
-/// Snapshot of the backend state needed for menu rendering (no lock held
-/// afterwards; `backend` handle is not needed to render the menu).
-fn snapshot_state(shared: &TrayShared) -> BackendState {
-    let state = shared.backend.lock().unwrap();
-    BackendState {
-        status: state.status,
-        backend: None,
-        start_failed: state.start_failed,
-    }
-}
-
 /// Build the current menu (state + task cache + section) if possible.
 fn current_menu(
     app: &impl tauri::Manager<tauri::Wry>,
     shared: &TrayShared,
     section: TaskSection,
 ) -> Option<Menu<tauri::Wry>> {
-    let state = snapshot_state(shared);
+    let snapshot = shared.backend.snapshot();
     let tasks = shared.tasks.lock().unwrap().clone();
-    build_menu(app, &state, &tasks, section).ok()
+    build_menu(app, &snapshot, &tasks, section).ok()
 }
 
 /// The task-section rendering implied by the current status + task cache
 /// (used by the toggle handler; the poll thread computes its own via
 /// [`task_section`] because it knows the fetch result).
 fn section_from_state(shared: &TrayShared) -> TaskSection {
-    let status = snapshot_state(shared).status;
+    let status = shared.backend.snapshot().status;
     let tasks = shared.tasks.lock().unwrap().clone();
     task_section(status, Ok(tasks))
 }
@@ -469,8 +432,9 @@ fn poll_once(
     shared: &TrayShared,
     last_section: &mut TaskSection,
 ) {
-    // (a) status snapshot — no I/O under the backend lock.
-    let status = shared.backend.lock().unwrap().status;
+    // (a) status snapshot — no I/O under the backend lock (the lock is
+    // internal to BackendLifecycle; status() takes it briefly).
+    let status = shared.backend.status();
 
     // (b/c) Running -> fetch outside any lock; anything else -> degraded.
     // Tasks are read from the payload files (config/alas.json + i18n — the
@@ -566,21 +530,18 @@ mod tests {
 
     #[test]
     fn status_text_prefers_start_failed() {
-        let stopped_failed = BackendState {
+        let stopped_failed = BackendStateSnapshot {
             status: BackendStatus::Stopped,
-            backend: None,
             start_failed: true,
         };
         assert_eq!(status_text(&stopped_failed), "Backend: start failed");
-        let stopped_clean = BackendState {
+        let stopped_clean = BackendStateSnapshot {
             status: BackendStatus::Stopped,
-            backend: None,
             start_failed: false,
         };
         assert_eq!(status_text(&stopped_clean), "Backend: stopped");
-        let running_clean = BackendState {
+        let running_clean = BackendStateSnapshot {
             status: BackendStatus::Running,
-            backend: None,
             start_failed: false,
         };
         assert_eq!(status_text(&running_clean), "Backend: running");
@@ -588,16 +549,19 @@ mod tests {
 
     #[test]
     fn toggle_decision_matrix() {
-        let stopped = BackendState::default();
+        let stopped = BackendStateSnapshot {
+            status: BackendStatus::Stopped,
+            start_failed: false,
+        };
         assert_eq!(toggle_decision(&stopped), ToggleAction::Start);
-        let running = BackendState {
+        let running = BackendStateSnapshot {
             status: BackendStatus::Running,
-            ..BackendState::default()
+            start_failed: false,
         };
         assert_eq!(toggle_decision(&running), ToggleAction::Stop);
-        let initializing = BackendState {
+        let initializing = BackendStateSnapshot {
             status: BackendStatus::Initializing,
-            ..BackendState::default()
+            start_failed: false,
         };
         assert_eq!(toggle_decision(&initializing), ToggleAction::NoOp);
     }

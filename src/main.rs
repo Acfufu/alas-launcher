@@ -15,7 +15,7 @@ use std::{
     fs,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     thread::{self},
 };
@@ -30,7 +30,7 @@ use tauri_plugin_dialog::{DialogExt, FilePath};
 use tracing::{error, info, warn};
 
 use crate::{
-    backend::{BackendState, BackendStatus, ManagedBackend},
+    backend::BackendLifecycle,
     setup::{get_deploy_config, setup_alas_repo, setup_environment},
 };
 
@@ -56,7 +56,7 @@ fn main() -> Result<()> {
     }
     let port = port.unwrap_or(22267) as u16;
 
-    let backend = Arc::new(Mutex::new(BackendState::default()));
+    let backend = Arc::new(BackendLifecycle::default());
     let setup_backend = backend.clone();
     // Stop flag for the tray poll thread; set in ExitRequested so the thread
     // never calls set_menu on a disposed tray (Metis MAJOR-4).
@@ -102,10 +102,7 @@ fn main() -> Result<()> {
                     let app_handle = app_handle.clone();
                     let backend = backend.clone();
                     thread::spawn(move || {
-                        {
-                            let mut state = backend.lock().unwrap();
-                            state.status = BackendStatus::Initializing;
-                        }
+                        backend.begin_start();
                         let splash = app_handle.get_webview_window("splash").unwrap();
                         let status_updater = |text: &str| {
                             let content = format!("Loading ALAS, please wait..\n\n{}", text);
@@ -119,36 +116,28 @@ fn main() -> Result<()> {
                             let url = Url::parse(&text_to_splash(&content)).unwrap();
                             splash.navigate(url).unwrap();
                             // Init failure must not leave the state machine stuck in
-                            // Initializing (toggle disabled forever): fall back to
-                            // Stopped so the menu enables "Start Backend" and the
-                            // user can retry from the menu bar.
-                            backend.lock().unwrap().status = BackendStatus::Stopped;
+                            // Initializing (toggle disabled forever): mark plain
+                            // Stopped. This is a setup failure, not a
+                            // backend-start failure — start_failed stays false.
+                            backend.mark_stopped();
                             return;
                         }
-                        info!("Starting gui.py on http://127.0.0.1:{}/", port);
+                        info!("Starting gui.py on {}", crate::backend::webui_url(port));
                         status_updater("Starting GUI");
-                        match ManagedBackend::new(port) {
-                            Ok(b) => {
-                                {
-                                    let mut state = backend.lock().unwrap();
-                                    state.backend = Some(b);
-                                    state.status = BackendStatus::Running;
-                                }
-                                splash.destroy().unwrap();
-                                info!("Webview is ready");
-                                let window = app_handle.get_webview_window("main").unwrap();
-                                window
-                                    .navigate(Url::parse(&format!("http://127.0.0.1:{}/", port)).unwrap())
-                                    .unwrap();
-                                window.show().unwrap();
-                            }
-                            Err(e) => {
-                                error!("Failed to start backend: {e}");
-                                {
-                                    let mut state = backend.lock().unwrap();
-                                    state.status = BackendStatus::Stopped;
-                                }
-                            }
+                        if let Err(e) = backend.start(port) {
+                            // Same as today: the splash stays on the "Starting GUI"
+                            // page, main window stays hidden. The module set
+                            // Stopped + start_failed so the tray shows
+                            // "Backend: start failed".
+                            error!("Failed to start backend: {e}");
+                        } else {
+                            splash.destroy().unwrap();
+                            info!("Webview is ready");
+                            let window = app_handle.get_webview_window("main").unwrap();
+                            window
+                                .navigate(Url::parse(&crate::backend::webui_url(port)).unwrap())
+                                .unwrap();
+                            window.show().unwrap();
                         }
                     });
                 }
@@ -157,12 +146,7 @@ fn main() -> Result<()> {
                     // Stop the tray poll thread BEFORE terminating the backend:
                     // it must never set_menu on a disposed tray (Metis MAJOR-4).
                     tray_stop.store(true, Ordering::Relaxed);
-                    let mut state = backend.lock().unwrap();
-                    if let Some(ref mut b) = state.backend {
-                        if let Err(e) = b.terminate() {
-                            warn!("Failed to terminate backend process: {:?}", e);
-                        }
-                    }
+                    backend.stop();
                 }
                 tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::CloseRequested { .. }, .. } => {
                     info!("Window {} closed", label);
