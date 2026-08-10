@@ -128,7 +128,8 @@ pub fn build_tray(
 /// (Re)build the whole menu from the current backend state, task cache and
 /// task-section rendering. The status item is always disabled; the toggle
 /// item's text/enabled follow the state machine (Initializing disables it
-/// entirely). Task items are read-only (disabled) and id `task-{i}`.
+/// entirely). Task items are read-only (disabled): group headers id
+/// `group-running|queued|waiting`, task rows id `task-{i}`.
 fn build_menu(
     app: &impl tauri::Manager<tauri::Wry>,
     state: &BackendState,
@@ -162,14 +163,15 @@ fn build_menu(
             None::<&str>,
         )?),
         TaskSection::Tasks => {
-            for (i, task) in tasks.iter().enumerate() {
-                section_items.push(MenuItem::with_id(
-                    app,
-                    format!("task-{i}"),
-                    task_item_text(task),
-                    false,
-                    None::<&str>,
-                )?);
+            for item in task_section_items(tasks) {
+                match item {
+                    TaskMenuItem::GroupHeader { id, text } => {
+                        section_items.push(MenuItem::with_id(app, id, text, false, None::<&str>)?);
+                    }
+                    TaskMenuItem::TaskItem { id, text } => {
+                        section_items.push(MenuItem::with_id(app, id, text, false, None::<&str>)?);
+                    }
+                }
             }
         }
     }
@@ -189,13 +191,49 @@ fn build_menu(
     Menu::with_items(app, &items)
 }
 
-/// Read-only text for one task menu item.
-pub(crate) fn task_item_text(t: &Task) -> String {
-    if t.enabled {
-        format!("{} — enabled", t.name)
-    } else {
-        format!("{} — disabled", t.name)
+/// One renderable row of the tray's task section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TaskMenuItem {
+    /// Non-empty status-group header (disabled; 运行中/队列中/等待中).
+    GroupHeader { id: String, text: &'static str },
+    /// One task row (disabled; `task-{i}`, text `"{name} — {time}"`).
+    TaskItem { id: String, text: String },
+}
+
+/// Render the enabled-task list as grouped rows, mirroring the webui
+/// overview scopes (module/webui/app.py `alas_update_overview_task`):
+/// 运行中 → 队列中 → 等待中, each non-empty group led by a header. Empty
+/// groups render NO header. Empty input → empty output (the caller renders
+/// the "No tasks" empty state instead).
+pub(crate) fn task_section_items(tasks: &[Task]) -> Vec<TaskMenuItem> {
+    let mut items = Vec::new();
+    let mut index = 0usize;
+    for (status, id, text) in [
+        (alas_tasks::TaskStatus::Running, "group-running", "运行中"),
+        (alas_tasks::TaskStatus::Queued, "group-queued", "队列中"),
+        (alas_tasks::TaskStatus::Waiting, "group-waiting", "等待中"),
+    ] {
+        let group: Vec<&Task> = tasks.iter().filter(|t| t.status == status).collect();
+        if group.is_empty() {
+            continue;
+        }
+        items.push(TaskMenuItem::GroupHeader {
+            id: id.to_string(),
+            text,
+        });
+        for task in group {
+            // Full NextRun string: the webui renders `str(func.next_run)`
+            // verbatim, so keeping the whole "YYYY-MM-DD HH:MM:SS" matches the
+            // reference exactly (no truncation). Empty when the payload lacks
+            // a NextRun (real payloads always carry one).
+            items.push(TaskMenuItem::TaskItem {
+                id: format!("task-{index}"),
+                text: format!("{} — {}", task.name, task.next_time.as_deref().unwrap_or_default()),
+            });
+            index += 1;
+        }
     }
+    items
 }
 
 fn status_text(state: &BackendState) -> String {
@@ -552,19 +590,151 @@ mod tests {
     }
 
     #[test]
-    fn task_item_text_enabled_disabled() {
-        let enabled = Task {
-            name: "daily".into(),
-            enabled: true,
-            ..Default::default()
-        };
-        assert_eq!(task_item_text(&enabled), "daily — enabled");
-        let disabled = Task {
-            name: "mail".into(),
-            enabled: false,
-            ..Default::default()
-        };
-        assert_eq!(task_item_text(&disabled), "mail — disabled");
+    fn task_section_items_all_three_groups() {
+        let tasks = vec![
+            Task {
+                name: "战术学院".into(),
+                command: "Tactical".into(),
+                enabled: true,
+                status: alas_tasks::TaskStatus::Running,
+                next_time: Some("2026-08-10 20:14:24".into()),
+            },
+            Task {
+                name: "大舰队".into(),
+                command: "Guild".into(),
+                enabled: true,
+                status: alas_tasks::TaskStatus::Queued,
+                next_time: Some("2026-08-10 21:00:00".into()),
+            },
+            Task {
+                name: "演习".into(),
+                command: "Exercise".into(),
+                enabled: true,
+                status: alas_tasks::TaskStatus::Waiting,
+                next_time: Some("2026-08-11 00:00:00".into()),
+            },
+        ];
+        let items = task_section_items(&tasks);
+        assert_eq!(
+            items,
+            vec![
+                TaskMenuItem::GroupHeader { id: "group-running".into(), text: "运行中" },
+                TaskMenuItem::TaskItem {
+                    id: "task-0".into(),
+                    text: "战术学院 — 2026-08-10 20:14:24".into(),
+                },
+                TaskMenuItem::GroupHeader { id: "group-queued".into(), text: "队列中" },
+                TaskMenuItem::TaskItem {
+                    id: "task-1".into(),
+                    text: "大舰队 — 2026-08-10 21:00:00".into(),
+                },
+                TaskMenuItem::GroupHeader { id: "group-waiting".into(), text: "等待中" },
+                TaskMenuItem::TaskItem {
+                    id: "task-2".into(),
+                    text: "演习 — 2026-08-11 00:00:00".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn task_section_items_only_waiting_renders_one_header() {
+        let tasks = vec![
+            Task {
+                name: "演习".into(),
+                command: "Exercise".into(),
+                enabled: true,
+                status: alas_tasks::TaskStatus::Waiting,
+                next_time: Some("2026-08-11 00:00:00".into()),
+            },
+            Task {
+                name: "主线图-2".into(),
+                command: "Main2".into(),
+                enabled: true,
+                status: alas_tasks::TaskStatus::Waiting,
+                next_time: Some("2026-08-11 06:00:00".into()),
+            },
+        ];
+        let items = task_section_items(&tasks);
+        assert_eq!(
+            items,
+            vec![
+                TaskMenuItem::GroupHeader { id: "group-waiting".into(), text: "等待中" },
+                TaskMenuItem::TaskItem {
+                    id: "task-0".into(),
+                    text: "演习 — 2026-08-11 00:00:00".into(),
+                },
+                TaskMenuItem::TaskItem {
+                    id: "task-1".into(),
+                    text: "主线图-2 — 2026-08-11 06:00:00".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn task_section_items_empty_is_empty_vec() {
+        assert_eq!(task_section_items(&[]), vec![]);
+    }
+
+    #[test]
+    fn task_section_items_ids_sequential_across_groups() {
+        let tasks = vec![
+            Task {
+                name: "战术学院".into(),
+                command: "Tactical".into(),
+                enabled: true,
+                status: alas_tasks::TaskStatus::Running,
+                next_time: Some("2026-08-10 20:14:24".into()),
+            },
+            Task {
+                name: "大舰队".into(),
+                command: "Guild".into(),
+                enabled: true,
+                status: alas_tasks::TaskStatus::Queued,
+                next_time: Some("2026-08-10 21:00:00".into()),
+            },
+            Task {
+                name: "演习".into(),
+                command: "Exercise".into(),
+                enabled: true,
+                status: alas_tasks::TaskStatus::Waiting,
+                next_time: Some("2026-08-11 00:00:00".into()),
+            },
+        ];
+        let items = task_section_items(&tasks);
+        let ids: Vec<&str> = items
+            .iter()
+            .filter_map(|item| match item {
+                TaskMenuItem::TaskItem { id, .. } => Some(id.as_str()),
+                TaskMenuItem::GroupHeader { .. } => None,
+            })
+            .collect();
+        assert_eq!(ids, vec!["task-0", "task-1", "task-2"]);
+    }
+
+    /// Manual-QA channel against the REAL installed ALAS payload (read-only).
+    /// Prints the grouped task rows exactly as the tray renders them.
+    /// Ignored by default; run with
+    /// `cargo test real_payload_group_preview -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn real_payload_group_preview() {
+        let payload = std::path::Path::new(
+            "/Applications/AzurLaneAutoScript.app/Contents/AzurLaneAutoScript",
+        );
+        if !payload.join("config").join("alas.json").exists() {
+            eprintln!("real ALAS payload not present; skipping");
+            return;
+        }
+        let tasks =
+            alas_tasks::fetch_tasks(payload, &alas_tasks::now_str(), "zh-CN").unwrap();
+        for item in task_section_items(&tasks) {
+            match item {
+                TaskMenuItem::GroupHeader { id, text } => println!("[{id}] {text}"),
+                TaskMenuItem::TaskItem { id, text } => println!("[{id}] {text}"),
+            }
+        }
     }
 
     #[test]
