@@ -6,14 +6,14 @@ ALAS Launcher is a Tauri 2 (Rust) desktop launcher that starts [AzurLaneAutoScri
 
 At launch it prepares the runtime environment (Python toolkit, Git, Adb), updates the ALAS repository, starts `gui.py` on a local port, and then opens the local Web UI through the Tauri WebView. The default port is `22267`; it can be changed via `Deploy.Webui.WebuiPort` in `config/deploy.yaml`.
 
-On macOS it also adds a menu bar icon: check the ALAS task list or start/stop the backend without opening a window. Start with the [menu bar quick view](#menu-bar-quick-view-macos), compare it against the [launch flow animation](#launch-flow) and the [real interface screenshots](#interface-screenshots), then choose your [download platform](#download-and-platforms).
+On macOS it also adds a menu bar icon: check the ALAS task list or start/stop the scheduler without opening a window. Start with the [menu bar quick view](#menu-bar-quick-view-macos), compare it against the [launch flow animation](#launch-flow) and the [real interface screenshots](#interface-screenshots), then choose your [download platform](#download-and-platforms).
 
 ## Menu Bar Quick View (macOS)
 
-![ALAS menu bar animation: clicking the ship menu-bar icon opens a native menu showing the backend status and a Stop/Start toggle; then the Web UI scheduler shows the real ALAS task list grouped by Running / Queued / Waiting with next-run times, and the main window](assets/readme/tray.gif)
+![ALAS menu bar animation: clicking the ship menu-bar icon opens a native menu showing the scheduler status and a Start/Stop toggle, with the Web UI kept alive; then the Web UI scheduler shows the real ALAS task list grouped by Running / Queued / Waiting with next-run times, and the main window](assets/readme/tray.gif)
 
 - **Task list at a glance**: mirrors the Web UI scheduler — real ALAS tasks grouped by `Running / Queued / Waiting` with next-run times (at most 3 tasks per group to keep the menu compact; auto-refreshes every 10 seconds, or refresh manually).
-- **One-click backend toggle**: stop or restart `gui.py` without quitting the app; the window switches to a "Backend stopped" notice or back to the Web UI accordingly.
+- **One-click scheduler toggle**: the toggle controls the ALAS scheduler instead of the backend process — the Web UI stays alive when the scheduler stops; when the backend is not running, the toggle starts the backend first, then the scheduler.
 - **macOS only**: the menu bar icon is enabled on macOS only; Windows and Linux builds are unaffected.
 
 If the animation does not play, see the [static screenshot](screenshots/mac-en.webp) or the [static launch-flow diagram](assets/readme/hero.svg).
@@ -61,7 +61,7 @@ The Web UI listens on port `22267` by default. At startup the launcher reads `co
 Compared with the official ALAS launcher, this version has these user-visible differences:
 
 1. **Cross-platform**: the same codebase runs natively on Windows, macOS, and Linux.
-2. **macOS menu bar quick view**: the menu bar icon shows the ALAS task list (Running/Queued/Waiting groups, next-run times) and toggles the backend without quitting the app.
+2. **macOS menu bar quick view**: the menu bar icon shows the ALAS task list (Running/Queued/Waiting groups, next-run times) and toggles the scheduler without quitting the app (the Web UI stays alive when the scheduler stops).
 3. **Only updates the repo at launch**: it no longer kills existing processes, updates pip, updates Electron resources, or restarts adb.
 4. **Single instance**: launching again does not open a second window; it refocuses the existing window.
 5. **Automatic pip updates are disabled**: Python package versions differ slightly from the official build, but this does not affect usage; if upstream adds a requirements file, pip updates can be implemented again.
@@ -143,7 +143,7 @@ The launcher adds the following environment variables:
 
 - The launcher shell does not include the ALAS payload; it must be assembled manually (see [Building and Assembling the Full Payload](#building-and-assembling-the-full-payload)).
 - The macOS app is unsigned; the first launch requires manually removing quarantine.
-- The menu bar quick view (task list / backend toggle) is enabled on macOS only.
+- The menu bar quick view (task list / scheduler toggle) is enabled on macOS only.
 - Linux depends on `libwebkit2gtk-4.1` and a recent `glibc`.
 - adb restart/replacement is not implemented, and automatic pip updates are disabled.
 - The remote Release is a draft and has not been declared a stable public installer.
