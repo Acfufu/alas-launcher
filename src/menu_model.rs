@@ -187,18 +187,39 @@ pub fn toggle_enabled(status: BackendStatus) -> bool {
 
 /// Status line for the (disabled) status menu item, composed as
 /// `{scheduler}{sep}{word}` ("调度器：运行中"); "start failed" outranks the
-/// plain status word.
-pub fn status_text(snapshot: &BackendStateSnapshot, labels: &ControlLabels) -> String {
+/// plain status word. While the backend is Running the word reflects the
+/// SCHEDULER: `scheduler_alive` is the process-tree discriminator result
+/// (Some), or None when no process handle / scan result exists — conservative
+/// stopped (evidence task-3: unknown must never claim running).
+pub fn status_line_for(
+    snapshot: &BackendStateSnapshot,
+    scheduler_alive: Option<bool>,
+    labels: &ControlLabels,
+) -> String {
     let word = if snapshot.start_failed {
         &labels.failed
     } else {
         match snapshot.status {
             BackendStatus::Initializing => &labels.initializing,
-            BackendStatus::Running => &labels.running,
             BackendStatus::Stopped => &labels.stopped,
+            BackendStatus::Running => {
+                if scheduler_alive == Some(true) {
+                    &labels.running
+                } else {
+                    &labels.stopped
+                }
+            }
         }
     };
     format!("{}{}{}", labels.scheduler, labels.sep, word)
+}
+
+/// Whether the ALAS scheduler is running, per the pinned process-tree
+/// discriminator (evidence task-3): the uvicorn process's alive, non-zombie,
+/// non-resource-tracker child count. The multiprocessing.Manager is the
+/// permanent baseline child (+1); the scheduler adds a second one.
+pub fn scheduler_alive(alive_child_count: usize) -> bool {
+    alive_child_count > 1
 }
 
 /// Localized labels for the tray's scheduler-control rows (status line +
@@ -331,28 +352,67 @@ mod tests {
     }
 
     #[test]
-    fn status_text_prefers_start_failed() {
+    fn status_line_for_prefers_start_failed() {
         let labels = expected_labels("zh-CN");
         let stopped_failed = BackendStateSnapshot {
             status: BackendStatus::Stopped,
             start_failed: true,
         };
-        assert_eq!(status_text(&stopped_failed, &labels), "调度器：启动失败");
+        assert_eq!(status_line_for(&stopped_failed, None, &labels), "调度器：启动失败");
         let stopped_clean = BackendStateSnapshot {
             status: BackendStatus::Stopped,
             start_failed: false,
         };
-        assert_eq!(status_text(&stopped_clean, &labels), "调度器：已停止");
-        let running_clean = BackendStateSnapshot {
-            status: BackendStatus::Running,
-            start_failed: false,
-        };
-        assert_eq!(status_text(&running_clean, &labels), "调度器：运行中");
+        assert_eq!(status_line_for(&stopped_clean, Some(true), &labels), "调度器：已停止");
         let initializing_clean = BackendStateSnapshot {
             status: BackendStatus::Initializing,
             start_failed: false,
         };
-        assert_eq!(status_text(&initializing_clean, &labels), "调度器：启动中…");
+        assert_eq!(
+            status_line_for(&initializing_clean, None, &labels),
+            "调度器：启动中…"
+        );
+    }
+
+    #[test]
+    fn status_line_for_running_follows_scheduler_discriminator() {
+        let labels = expected_labels("zh-CN");
+        let running = BackendStateSnapshot {
+            status: BackendStatus::Running,
+            start_failed: false,
+        };
+        // Scheduler confirmed alive -> running; confirmed dead OR scan
+        // unknown (None) -> conservative stopped.
+        assert_eq!(status_line_for(&running, Some(true), &labels), "调度器：运行中");
+        assert_eq!(status_line_for(&running, Some(false), &labels), "调度器：已停止");
+        assert_eq!(status_line_for(&running, None, &labels), "调度器：已停止");
+        // Non-Running statuses ignore the discriminator entirely.
+        assert_eq!(status_line_for(&stopped_snapshot(), Some(true), &labels), "调度器：已停止");
+        let initializing = BackendStateSnapshot {
+            status: BackendStatus::Initializing,
+            start_failed: false,
+        };
+        assert_eq!(
+            status_line_for(&initializing, Some(false), &labels),
+            "调度器：启动中…"
+        );
+    }
+
+    #[test]
+    fn scheduler_alive_count_boundaries() {
+        // Pinned rule (evidence task-3): Manager baseline = 1 -> not alive;
+        // a second alive child (the scheduler) crosses the threshold.
+        assert!(!scheduler_alive(0), "no children");
+        assert!(!scheduler_alive(1), "Manager baseline only");
+        assert!(scheduler_alive(2), "Manager + scheduler");
+        assert!(scheduler_alive(3), "any extra child counts alive");
+    }
+
+    fn stopped_snapshot() -> BackendStateSnapshot {
+        BackendStateSnapshot {
+            status: BackendStatus::Stopped,
+            start_failed: false,
+        }
     }
 
     // ---- control_labels -------------------------------------------------------

@@ -10,6 +10,7 @@
 // participates in win/linux builds.
 
 use std::{
+    net::TcpStream,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Mutex,
@@ -29,8 +30,8 @@ use crate::{
     alas_tasks::{self, Task},
     backend::{toggle_decision, BackendLifecycle, BackendStateSnapshot, BackendStatus, ToggleAction},
     menu_model::{
-        control_labels, poll_decision, status_text, task_section, task_section_items,
-        toggle_enabled, toggle_label, ControlLabels, TaskMenuItem, TaskSection,
+        control_labels, poll_decision, scheduler_alive, status_line_for, task_section,
+        task_section_items, toggle_enabled, toggle_label, ControlLabels, TaskMenuItem, TaskSection,
     },
 };
 
@@ -79,15 +80,20 @@ pub fn build_tray(
     };
 
     let labels = load_control_labels();
+    let initial = BackendStateSnapshot {
+        status: BackendStatus::Stopped,
+        start_failed: false,
+    };
     let menu = build_menu(
         app.handle(),
-        &BackendStateSnapshot {
-            status: BackendStatus::Stopped,
-            start_failed: false,
-        },
+        &initial,
         &[],
         TaskSection::Empty,
         &labels,
+        // No scheduler scan at startup: a fresh Stopped snapshot renders the
+        // stopped label regardless (status_line_for ignores the discriminator
+        // outside Running).
+        &status_line_for(&initial, None, &labels),
     )?;
 
     let thread_shared = shared.clone();
@@ -127,12 +133,26 @@ pub fn build_tray(
     let _thread_tray = tray.clone();
     std::thread::spawn(move || {
         let mut last_section = TaskSection::Empty;
+        // Last rendered scheduler-liveness (None = unknown / backend not
+        // running); a flip forces a status-line rebuild even when the task
+        // section is unchanged (manual webui stop/start must reflect).
+        let mut last_scheduler_alive: Option<bool> = None;
         while !thread_shared.stop.load(Ordering::Relaxed) {
             match refresh_rx.recv_timeout(TRAY_POLL_INTERVAL_SECS) {
-                Ok(()) => poll_once(&app_handle, &thread_shared, &mut last_section),
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    poll_once(&app_handle, &thread_shared, &mut last_section)
-                }
+                Ok(()) => poll_once(
+                    &app_handle,
+                    &thread_shared,
+                    port,
+                    &mut last_section,
+                    &mut last_scheduler_alive,
+                ),
+                Err(mpsc::RecvTimeoutError::Timeout) => poll_once(
+                    &app_handle,
+                    &thread_shared,
+                    port,
+                    &mut last_section,
+                    &mut last_scheduler_alive,
+                ),
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
@@ -152,8 +172,9 @@ fn build_menu(
     tasks: &[Task],
     section: TaskSection,
     labels: &ControlLabels,
+    status_line: &str,
 ) -> tauri::Result<Menu<tauri::Wry>> {
-    let status = MenuItem::with_id(app, "tray-status", status_text(snapshot, labels), false, None::<&str>)?;
+    let status = MenuItem::with_id(app, "tray-status", status_line, false, None::<&str>)?;
     let toggle = MenuItem::with_id(
         app,
         "tray-toggle",
@@ -283,18 +304,27 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
     // Rebuild must include the task section so a toggle never wipes it. The
     // section derives from the POST-action state (fresh snapshot + cached
     // tasks): a Stop shows the degraded section, a Start shows the cache.
+    // Scheduler liveness is unknown here (no process scan on the UI thread);
+    // None renders the conservative stopped word — the poll thread corrects
+    // within one cycle.
     let tasks = shared.tasks.lock().unwrap().clone();
-    rebuild_menu(app, shared, task_section(shared.backend.snapshot().status, Ok(tasks)));
+    rebuild_menu(
+        app,
+        shared,
+        task_section(shared.backend.snapshot().status, Ok(tasks)),
+        None,
+    );
 }
 
 /// Rebuild the menu from the current state + task cache and re-attach it to
 /// the tray. The single set_menu site: the toggle handler and the poll thread
 /// both route through here (never build-then-set inline).
-fn rebuild_menu(app: &AppHandle, shared: &TrayShared, section: TaskSection) {
+fn rebuild_menu(app: &AppHandle, shared: &TrayShared, section: TaskSection, scheduler_alive: Option<bool>) {
     let snapshot = shared.backend.snapshot();
     let tasks = shared.tasks.lock().unwrap().clone();
     let labels = load_control_labels();
-    let Ok(menu) = build_menu(app, &snapshot, &tasks, section, &labels) else {
+    let status_line = status_line_for(&snapshot, scheduler_alive, &labels);
+    let Ok(menu) = build_menu(app, &snapshot, &tasks, section, &labels, &status_line) else {
         return;
     };
     if let Some(tray) = app.tray_by_id("main-tray") {
@@ -305,11 +335,28 @@ fn rebuild_menu(app: &AppHandle, shared: &TrayShared, section: TaskSection) {
 /// One poll cycle: snapshot the status (no network under the lock), fetch
 /// outside any lock when Running, then let the pure decision in
 /// [`poll_decision`] pick the section / rebuild / cache replacement.
-/// `last_section` tracks what the menu currently renders.
-fn poll_once(app: &AppHandle, shared: &TrayShared, last_section: &mut TaskSection) {
+/// `last_section` tracks what the menu currently renders; `last_scheduler`
+/// tracks the last rendered scheduler liveness so a flip rebuilds the status
+/// line even when the task section is unchanged.
+fn poll_once(
+    app: &AppHandle,
+    shared: &TrayShared,
+    port: u16,
+    last_section: &mut TaskSection,
+    last_scheduler: &mut Option<bool>,
+) {
     // (a) status snapshot — no I/O under the backend lock (the lock is
     // internal to BackendLifecycle; status() takes it briefly).
-    let status = shared.backend.status();
+    let mut status = shared.backend.status();
+
+    // (a2) Backend-liveness re-check: Running but the webui port is dead
+    // (the backend crashed or was killed outside the launcher) -> plain
+    // Stopped via mark_stopped(), so the toggle recovers to StartBackend
+    // instead of showing a stuck Running state. The probe is lock-free.
+    if status == BackendStatus::Running && !backend_port_alive(port) {
+        shared.backend.mark_stopped();
+        status = BackendStatus::Stopped;
+    }
 
     // (b/c) Running -> fetch outside any lock; anything else -> degraded.
     // A failed clock (now_str Err) also degrades — never a silent
@@ -328,14 +375,27 @@ fn poll_once(app: &AppHandle, shared: &TrayShared, last_section: &mut TaskSectio
         Err(())
     };
 
+    // (d) Scheduler liveness for the status line: process-tree scan rooted at
+    // the backend pid (lock-free; sysinfo reads the OS process table). No
+    // handle / no scan result -> None -> conservative stopped.
+    let scheduler = if status == BackendStatus::Running {
+        shared.backend.backend_pid().map(|pid| {
+            scheduler_alive(uvicorn_alive_child_count(pid, deploy_enable_reload()))
+        })
+    } else {
+        None
+    };
+
     // Decision is pure (menu_model::poll_decision): the clock string and the
     // fetch result are injected, so this call site carries no decision logic.
     let outcome = poll_decision(status, fetched, *last_section, &shared.tasks.lock().unwrap());
     if let Some(tasks) = outcome.replace_cache {
         *shared.tasks.lock().unwrap() = tasks;
     }
-    if outcome.changed {
-        rebuild_menu(app, shared, outcome.section);
+    let status_line_changed = scheduler != *last_scheduler;
+    *last_scheduler = scheduler;
+    if outcome.changed || status_line_changed {
+        rebuild_menu(app, shared, outcome.section, scheduler);
         *last_section = outcome.section;
     }
 }
@@ -349,6 +409,62 @@ fn deploy_language() -> Option<String> {
         .get("Language")?
         .as_str()
         .map(String::from)
+}
+
+/// `Deploy.Update.EnableReload` from config/deploy.yaml (true when missing —
+/// the ALAS default, deploy.yaml:86): decides WHICH process is the uvicorn
+/// (reload wrapper vs the backend process itself) per the pinned rule.
+fn deploy_enable_reload() -> bool {
+    crate::setup::get_deploy_config()
+        .and_then(|c| c["Deploy"]["Update"]["EnableReload"].as_bool())
+        .unwrap_or(true)
+}
+
+/// Whether the webui port answers within 100ms — the backend-liveness probe.
+/// Lock-free: a plain connect_timeout, no backend lock held. Used by poll now
+/// (dead port -> mark_stopped) and by the toggle decision later (todo 6).
+fn backend_port_alive(port: u16) -> bool {
+    let address = format!("127.0.0.1:{port}").parse().unwrap();
+    TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok()
+}
+
+/// The multiprocessing resource_tracker child of the gui.py wrapper; excluded
+/// from the scheduler count (it is present in BOTH tree shapes and would make
+/// the reload=false baseline look like 2 children).
+fn is_resource_tracker(p: &sysinfo::Process) -> bool {
+    p.cmd()
+        .iter()
+        .any(|c| c.to_string_lossy().contains("multiprocessing.resource_tracker"))
+}
+
+/// Count of the uvicorn process's alive, non-zombie, non-resource-tracker
+/// children — the pinned scheduler discriminator (evidence task-3). The
+/// uvicorn is `backend_pid` itself when EnableReload=false (func runs
+/// in-process), or its reload-wrapper child (the `spawn_main` process) when
+/// EnableReload=true. Lock-free: reads only sysinfo; no backend lock held.
+/// A missing/dead process yields 0 (conservative — scheduler shown stopped).
+fn uvicorn_alive_child_count(backend_pid: u32, enable_reload: bool) -> usize {
+    let mut sys = sysinfo::System::new_all();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    let uvicorn_pid = if enable_reload {
+        sys.processes()
+            .values()
+            .find(|p| {
+                p.parent().map(|q| q.as_u32()) == Some(backend_pid) && !is_resource_tracker(p)
+            })
+            .map(|p| p.pid())
+    } else {
+        Some(sysinfo::Pid::from_u32(backend_pid))
+    };
+    let Some(uvicorn_pid) = uvicorn_pid else {
+        return 0;
+    };
+    sys.processes()
+        .values()
+        .filter(|p| p.parent() == Some(uvicorn_pid))
+        .filter(|p| p.status() != sysinfo::ProcessStatus::Zombie)
+        .filter(|p| !is_resource_tracker(p))
+        .count()
 }
 
 /// Tray control labels resolved from deploy.yaml language + the ALAS i18n
@@ -372,6 +488,7 @@ fn navigate_main(app: &AppHandle, url: Url) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::{Child, Command};
 
     /// zh-CN builtin labels (no payload present) for the URL tests.
     fn zh_labels() -> ControlLabels {
@@ -427,5 +544,132 @@ mod tests {
         // Live call must not panic regardless of ambient cwd.
         let live = load_control_labels();
         assert!(!live.scheduler.is_empty());
+    }
+
+    // ---- backend_port_alive --------------------------------------------------
+
+    #[test]
+    fn backend_port_alive_refuses_a_closed_port() {
+        assert!(!backend_port_alive(1), "port 1 is never listening");
+    }
+
+    #[test]
+    fn backend_port_alive_accepts_a_listening_port() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(backend_port_alive(port));
+    }
+
+    // ---- uvicorn_alive_child_count (real processes, pinned rule) -------------
+    //
+    // Fake-backend isolation: every scenario owns a dedicated root process
+    // (plain `sleep` or a `sh -c` script whose backgrounded sleeps ARE its
+    // children), so parallel tests never see each other's processes. sysinfo
+    // may lag a spawn by a few ms, so expected counts are polled with a
+    // retry loop. Leftover orphans die by themselves (sleep 30).
+
+    fn spawn_sleep() -> Child {
+        Command::new("sleep").arg("30").spawn().expect("spawn sleep")
+    }
+
+    fn spawn_sh(script: &str) -> Child {
+        Command::new("sh").arg("-c").arg(script).spawn().expect("spawn sh")
+    }
+
+    fn kill_all(children: &mut [Child]) {
+        for c in children.iter_mut() {
+            let _ = c.kill();
+        }
+        for c in children.iter_mut() {
+            let _ = c.wait();
+        }
+    }
+
+    fn child_pids(pid: u32) -> Vec<u32> {
+        let mut sys = sysinfo::System::new_all();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        sys.processes()
+            .values()
+            .filter(|p| p.parent().map(|q| q.as_u32()) == Some(pid))
+            .map(|p| p.pid().as_u32())
+            .collect()
+    }
+
+    fn wait_count(fake_backend: u32, enable_reload: bool, want: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let got = uvicorn_alive_child_count(fake_backend, enable_reload);
+            if got == want || std::time::Instant::now() > deadline {
+                assert_eq!(got, want, "count for backend {fake_backend}");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn uvicorn_count_reload_off_baseline_and_scheduler() {
+        let empty = spawn_sleep();
+        wait_count(empty.id(), false, 0);
+        kill_all(&mut [empty]);
+        // Manager baseline: 1 child -> scheduler NOT alive (rule: >1).
+        let baseline = spawn_sh("sleep 30 & wait");
+        wait_count(baseline.id(), false, 1);
+        kill_all(&mut [baseline]);
+        // Scheduler joins: 2 children -> alive.
+        let running = spawn_sh("sleep 30 & sleep 30 & wait");
+        wait_count(running.id(), false, 2);
+        kill_all(&mut [running]);
+    }
+
+    #[test]
+    fn uvicorn_count_reload_off_excludes_tracker_and_unreaped_children() {
+        // resource_tracker lookalike child: 2 children, one is the tracker
+        // -> count 1 (would be 2 without the exclusion).
+        let tracked = spawn_sh(
+            "python3 -c 'from multiprocessing.resource_tracker import main; import time; time.sleep(60)' & sleep 30 & wait",
+        );
+        wait_count(tracked.id(), false, 1);
+        kill_all(&mut [tracked]);
+        // Killed child (SIGKILLed, never reaped: sh only waits the foreground
+        // sleep) must not count: 3 children -> 2.
+        let with_dead = spawn_sh("sleep 30 & sleep 30 & sleep 30");
+        let backend = with_dead.id();
+        wait_count(backend, false, 3);
+        let victim = child_pids(backend).into_iter().min().unwrap();
+        Command::new("kill")
+            .arg("-9")
+            .arg(victim.to_string())
+            .status()
+            .unwrap();
+        wait_count(backend, false, 2);
+        kill_all(&mut [with_dead]);
+    }
+
+    #[test]
+    fn uvicorn_count_reload_on_uses_wrapper_child() {
+        // No wrapper child -> no uvicorn -> 0.
+        let empty = spawn_sleep();
+        wait_count(empty.id(), true, 0);
+        kill_all(&mut [empty]);
+        // Wrapper (the reload P1) with its Manager baseline: 1 -> not alive.
+        let baseline = spawn_sh("sh -c 'sleep 30 & wait' & wait");
+        wait_count(baseline.id(), true, 1);
+        kill_all(&mut [baseline]);
+        // Wrapper with Manager + scheduler: 2 -> alive.
+        let running = spawn_sh("sh -c 'sleep 30 & sleep 30 & wait' & wait");
+        wait_count(running.id(), true, 2);
+        kill_all(&mut [running]);
+    }
+
+    #[test]
+    fn uvicorn_count_reload_on_ignores_tracker_sibling_of_wrapper() {
+        // P0 children = [python3 tracker, inner-sh wrapper]; the wrapper must
+        // be selected as uvicorn (count 1 — picking the tracker would give 0).
+        let root = spawn_sh(
+            "python3 -c 'from multiprocessing.resource_tracker import main; import time; time.sleep(60)' & sh -c 'sleep 30 & wait' & wait",
+        );
+        wait_count(root.id(), true, 1);
+        kill_all(&mut [root]);
     }
 }

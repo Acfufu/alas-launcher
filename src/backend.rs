@@ -122,6 +122,13 @@ impl ManagedBackend {
     pub(crate) fn from_child(child: GroupChild) -> Self {
         Self { child: Some(child) }
     }
+
+    /// Pid of the spawned gui.py wrapper (the process-group leader), None
+    /// while no child is held. Process-tree scans (scheduler detection)
+    /// start from this pid.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(|c| c.id())
+    }
 }
 
 impl Drop for ManagedBackend {
@@ -265,6 +272,17 @@ impl BackendLifecycle {
         let mut state = self.state.lock().unwrap();
         state.status = BackendStatus::Stopped;
     }
+
+    /// Pid of the live backend process, if any — the root of the process-tree
+    /// scheduler probe. Brief lock, no handle out.
+    pub fn backend_pid(&self) -> Option<u32> {
+        self.state
+            .lock()
+            .unwrap()
+            .backend
+            .as_ref()
+            .and_then(|b| b.pid())
+    }
 }
 
 /// ORDERING CONTRACT, shared by `start()` and `stop()`: the old backend is
@@ -396,6 +414,26 @@ mod tests {
         let s = lc.snapshot();
         assert_eq!(s.status, BackendStatus::Stopped);
         assert!(!s.start_failed);
+    }
+
+    #[test]
+    fn backend_pid_tracks_the_live_child() {
+        let lc = BackendLifecycle::new_with_spawner(ok_spawner());
+        assert_eq!(lc.backend_pid(), None, "no backend before start");
+        lc.start(22267).unwrap();
+        let pid = lc.backend_pid().expect("backend pid after start");
+        assert!(process_is_alive(pid), "recorded pid is the live child");
+        lc.stop();
+        assert_eq!(lc.backend_pid(), None, "no handle after stop");
+    }
+
+    #[test]
+    fn backend_pid_uses_the_recording_spawner_child() {
+        let pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let lc = BackendLifecycle::new_with_spawner(recording_spawner(pids.clone()));
+        lc.start(22267).unwrap();
+        let spawned = pids.lock().unwrap()[0];
+        assert_eq!(lc.backend_pid(), Some(spawned));
     }
 
     /// ORDERING CONTRACT (Metis BLOCKER-2): a second start() must fully
