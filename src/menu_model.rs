@@ -195,10 +195,11 @@ pub fn toggle_label(
     }
 }
 
-/// Whether the toggle item is clickable for the given status (disabled while
-/// initializing so a 60s spawn window can never get a second toggle).
-pub fn toggle_enabled(status: BackendStatus) -> bool {
-    matches!(status, BackendStatus::Running | BackendStatus::Stopped)
+/// Whether the toggle item is clickable for the given status: disabled while
+/// initializing (a 60s spawn window can never get a second toggle) or while a
+/// scheduler-control click is in flight (the 处理中… state).
+pub fn toggle_enabled(status: BackendStatus, processing: bool) -> bool {
+    !processing && matches!(status, BackendStatus::Running | BackendStatus::Stopped)
 }
 
 /// Status line for the (disabled) status menu item, composed as
@@ -253,13 +254,14 @@ pub struct ControlLabels {
     pub failed: String,
     pub start: String,
     pub stop: String,
+    pub processing: String,
     pub sep: String,
 }
 
 /// Built-in label table, keyed by webui language; any unknown or empty
 /// language falls back to zh-CN.
 fn builtin_labels(lang: &str) -> ControlLabels {
-    let (scheduler, running, stopped, initializing, failed, start, stop, sep) = match lang {
+    let (scheduler, running, stopped, initializing, failed, start, stop, processing, sep) = match lang {
         "zh-TW" => (
             "調度器",
             "執行中",
@@ -268,6 +270,7 @@ fn builtin_labels(lang: &str) -> ControlLabels {
             "啟動失敗",
             "啟動",
             "停止",
+            "處理中…",
             "：",
         ),
         "en-US" => (
@@ -278,6 +281,7 @@ fn builtin_labels(lang: &str) -> ControlLabels {
             "start failed",
             "Start",
             "Stop",
+            "Processing…",
             ": ",
         ),
         "ja-JP" => (
@@ -288,6 +292,7 @@ fn builtin_labels(lang: &str) -> ControlLabels {
             "起動失敗",
             "実行",
             "中止",
+            "処理中…",
             // Half-width ": " (en template), NOT the full-width "：".
             ": ",
         ),
@@ -300,6 +305,7 @@ fn builtin_labels(lang: &str) -> ControlLabels {
             "启动失败",
             "启动",
             "停止",
+            "处理中…",
             "：",
         ),
     };
@@ -311,6 +317,7 @@ fn builtin_labels(lang: &str) -> ControlLabels {
         failed: failed.into(),
         start: start.into(),
         stop: stop.into(),
+        processing: processing.into(),
         sep: sep.into(),
     }
 }
@@ -382,9 +389,13 @@ mod tests {
 
     #[test]
     fn toggle_enabled_matrix() {
-        assert!(toggle_enabled(BackendStatus::Running));
-        assert!(toggle_enabled(BackendStatus::Stopped));
-        assert!(!toggle_enabled(BackendStatus::Initializing));
+        // Disabled while initializing (60s spawn window) or while a scheduler
+        // click is in flight (处理中…); every other combination is clickable.
+        for processing in [false, true] {
+            assert_eq!(toggle_enabled(BackendStatus::Running, processing), !processing);
+            assert_eq!(toggle_enabled(BackendStatus::Stopped, processing), !processing);
+            assert!(!toggle_enabled(BackendStatus::Initializing, processing));
+        }
     }
 
     #[test]
@@ -466,12 +477,13 @@ mod tests {
     /// Expected full label set per language, from the REAL ALAS payload
     /// cross-check (evidence task-1: zero delta vs the built-in table).
     fn expected_labels(lang: &str) -> ControlLabels {
-        let (scheduler, running, stopped, initializing, failed, start, stop, sep) = match lang {
-            "zh-TW" => ("調度器", "執行中", "已停止", "啟動中…", "啟動失敗", "啟動", "停止", "："),
-            "en-US" => ("Scheduler", "Running", "stopped", "initializing…", "start failed", "Start", "Stop", ": "),
-            "ja-JP" => ("スケジューラー", "実行中", "停止済み", "起動中…", "起動失敗", "実行", "中止", ": "),
-            _ => ("调度器", "运行中", "已停止", "启动中…", "启动失败", "启动", "停止", "："),
-        };
+        let (scheduler, running, stopped, initializing, failed, start, stop, processing, sep) =
+            match lang {
+                "zh-TW" => ("調度器", "執行中", "已停止", "啟動中…", "啟動失敗", "啟動", "停止", "處理中…", "："),
+                "en-US" => ("Scheduler", "Running", "stopped", "initializing…", "start failed", "Start", "Stop", "Processing…", ": "),
+                "ja-JP" => ("スケジューラー", "実行中", "停止済み", "起動中…", "起動失敗", "実行", "中止", "処理中…", ": "),
+                _ => ("调度器", "运行中", "已停止", "启动中…", "启动失败", "启动", "停止", "处理中…", "："),
+            };
         ControlLabels {
             scheduler: scheduler.into(),
             running: running.into(),
@@ -480,6 +492,7 @@ mod tests {
             failed: failed.into(),
             start: start.into(),
             stop: stop.into(),
+            processing: processing.into(),
             sep: sep.into(),
         }
     }
@@ -489,14 +502,15 @@ mod tests {
         // Payload values (verified in evidence) drive the i18n-sourced
         // fields; every field of every language asserted exactly.
         let cases = [
-            ("zh-CN", "调度器", "运行中", "启动", "停止"),
-            ("zh-TW", "調度器", "執行中", "啟動", "停止"),
-            ("en-US", "Scheduler", "Running", "Start", "Stop"),
-            ("ja-JP", "スケジューラー", "実行中", "実行", "中止"),
+            ("zh-CN", "调度器", "运行中", "启动", "停止", "处理中…"),
+            ("zh-TW", "調度器", "執行中", "啟動", "停止", "處理中…"),
+            ("en-US", "Scheduler", "Running", "Start", "Stop", "Processing…"),
+            ("ja-JP", "スケジューラー", "実行中", "実行", "中止", "処理中…"),
         ];
-        for (lang, scheduler, running, start, stop) in cases {
+        for (lang, scheduler, running, start, stop, processing) in cases {
             let labels = control_labels(lang, &i18n_value(scheduler, running, start, stop));
             assert_eq!(labels, expected_labels(lang), "lang {lang}");
+            assert_eq!(labels.processing, processing, "lang {lang} processing");
         }
     }
 
