@@ -6,6 +6,11 @@
 #[cfg(target_os = "macos")]
 mod alas_tasks;
 mod backend;
+// Pure tray menu model (no tauri). Gated to macOS only because its sole
+// macOS-bound dependency, alas_tasks (above), is gated too — a plain
+// declaration would break win/linux builds.
+#[cfg(target_os = "macos")]
+mod menu_model;
 #[cfg(target_os = "macos")]
 mod tray;
 mod setup;

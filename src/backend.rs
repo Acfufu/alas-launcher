@@ -285,6 +285,27 @@ pub fn webui_url(port: u16) -> String {
     format!("http://127.0.0.1:{}/", port)
 }
 
+/// Decision a Start/Stop toggle makes from the current snapshot.
+///
+/// Lives here (not in the menu model) because it is a backend-lifecycle
+/// decision, not menu rendering: Initializing is a no-op (the tray item is
+/// disabled anyway; this also makes a second click during a 60s start window
+/// a no-op — BLOCKER-3: never two backends).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToggleAction {
+    NoOp,
+    Stop,
+    Start,
+}
+
+pub(crate) fn toggle_decision(snapshot: &BackendStateSnapshot) -> ToggleAction {
+    match snapshot.status {
+        BackendStatus::Initializing => ToggleAction::NoOp,
+        BackendStatus::Running => ToggleAction::Stop,
+        BackendStatus::Stopped => ToggleAction::Start,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,5 +420,24 @@ mod tests {
     #[test]
     fn webui_url_format() {
         assert_eq!(webui_url(22267), "http://127.0.0.1:22267/");
+    }
+
+    #[test]
+    fn toggle_decision_matrix() {
+        let stopped = BackendStateSnapshot {
+            status: BackendStatus::Stopped,
+            start_failed: false,
+        };
+        assert_eq!(toggle_decision(&stopped), ToggleAction::Start);
+        let running = BackendStateSnapshot {
+            status: BackendStatus::Running,
+            start_failed: false,
+        };
+        assert_eq!(toggle_decision(&running), ToggleAction::Stop);
+        let initializing = BackendStateSnapshot {
+            status: BackendStatus::Initializing,
+            start_failed: false,
+        };
+        assert_eq!(toggle_decision(&initializing), ToggleAction::NoOp);
     }
 }
