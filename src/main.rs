@@ -2,6 +2,8 @@
 #![windows_subsystem = "windows"]
 
 mod backend;
+#[cfg(target_os = "macos")]
+mod tray;
 mod setup;
 mod window_util;
 
