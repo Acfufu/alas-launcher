@@ -23,7 +23,7 @@ use tauri_plugin_dialog::{DialogExt, FilePath};
 use tracing::{error, info, warn};
 
 use crate::{
-    backend::ManagedBackend,
+    backend::{BackendState, BackendStatus, ManagedBackend},
     setup::{get_deploy_config, setup_alas_repo, setup_environment},
 };
 
@@ -49,7 +49,7 @@ fn main() -> Result<()> {
     }
     let port = port.unwrap_or(22267) as u16;
 
-    let backend = Arc::new(Mutex::new(None));
+    let backend = Arc::new(Mutex::new(BackendState::default()));
     let setup_backend = backend.clone();
 
     info!("Starting Webview...");
@@ -91,6 +91,10 @@ fn main() -> Result<()> {
                     let app_handle = app_handle.clone();
                     let backend = backend.clone();
                     thread::spawn(move || {
+                        {
+                            let mut state = backend.lock().unwrap();
+                            state.status = BackendStatus::Initializing;
+                        }
                         let splash = app_handle.get_webview_window("splash").unwrap();
                         let status_updater = |text: &str| {
                             let content = format!("Loading ALAS, please wait..\n\n{}", text);
@@ -107,20 +111,35 @@ fn main() -> Result<()> {
                         }
                         info!("Starting gui.py on http://127.0.0.1:{}/", port);
                         status_updater("Starting GUI");
-                        let b = ManagedBackend::new(port).unwrap();
-                        *backend.lock().unwrap() = Some(b);
-                        splash.destroy().unwrap();
-                        info!("Webview is ready");
-                        let window = app_handle.get_webview_window("main").unwrap();
-                        window
-                            .navigate(Url::parse(&format!("http://127.0.0.1:{}/", port)).unwrap())
-                            .unwrap();
-                        window.show().unwrap();
+                        match ManagedBackend::new(port) {
+                            Ok(b) => {
+                                {
+                                    let mut state = backend.lock().unwrap();
+                                    state.backend = Some(b);
+                                    state.status = BackendStatus::Running;
+                                }
+                                splash.destroy().unwrap();
+                                info!("Webview is ready");
+                                let window = app_handle.get_webview_window("main").unwrap();
+                                window
+                                    .navigate(Url::parse(&format!("http://127.0.0.1:{}/", port)).unwrap())
+                                    .unwrap();
+                                window.show().unwrap();
+                            }
+                            Err(e) => {
+                                error!("Failed to start backend: {e}");
+                                {
+                                    let mut state = backend.lock().unwrap();
+                                    state.status = BackendStatus::Stopped;
+                                }
+                            }
+                        }
                     });
                 }
                 tauri::RunEvent::ExitRequested { .. } => {
                     info!("Webview closed, shutting down backend...");
-                    if let Some(ref mut b) = *backend.lock().unwrap() {
+                    let mut state = backend.lock().unwrap();
+                    if let Some(ref mut b) = state.backend {
                         if let Err(e) = b.terminate() {
                             warn!("Failed to terminate backend process: {:?}", e);
                         }
