@@ -1,0 +1,68 @@
+{
+  "width": 1200,
+  "fps": 30,
+  "duration": 5.0,
+  "colors": 256,
+  "dither": "none",
+  "clip_to_base_alpha": true,
+  "max_size_mb": 2.0,
+  "reveals": [
+    {
+      "id": "track",
+      "axis": "x",
+      "start": 0.0,
+      "end": 0.8,
+      "exit": { "start": 4.0, "end": 4.9 }
+    },
+    {
+      "id": "state-initialize",
+      "axis": "x",
+      "start": 0.3,
+      "end": 1.1,
+      "exit": { "start": 4.0, "end": 4.9 }
+    },
+    {
+      "id": "state-update",
+      "axis": "x",
+      "start": 0.6,
+      "end": 1.4,
+      "exit": { "start": 4.0, "end": 4.9 }
+    },
+    {
+      "id": "state-gui",
+      "axis": "x",
+      "start": 0.9,
+      "end": 1.7,
+      "exit": { "start": 4.0, "end": 4.9 }
+    },
+    {
+      "id": "state-ready",
+      "axis": "x",
+      "start": 1.2,
+      "end": 2.0,
+      "exit": { "start": 4.0, "end": 4.9 }
+    },
+    {
+      "id": "label-endpoint",
+      "axis": "x",
+      "start": 1.4,
+      "end": 2.2,
+      "exit": { "start": 4.0, "end": 4.9 }
+    }
+  ],
+  "layers": [
+    {
+      "id": "label-gui-py",
+      "enter": {
+        "start": 0.9,
+        "end": 1.7,
+        "from": [0, -16]
+      },
+      "exit": {
+        "start": 4.0,
+        "end": 4.9,
+        "to": [0, -16]
+      }
+    }
+  ]
+}

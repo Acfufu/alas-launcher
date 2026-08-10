@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 400" width="1200" height="400" role="img" data-readme-language="zh-Hans">
+  <title>ALAS 启动器 — 启动流程</title>
+  <desc>ALAS 启动器是 AzurLaneAutoScript 的原生跨平台启动器，基于 Tauri 和 Rust 构建。图中展示启动流程：初始化、更新仓库、启动 GUI（gui.py）、就绪于 127.0.0.1:22267（默认端口）。支持 Windows、macOS 和 Linux。</desc>
+
+  <defs>
+    <linearGradient id="bg-grad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0D1117"/>
+      <stop offset="100%" stop-color="#13111C"/>
+    </linearGradient>
+    <linearGradient id="rail-grad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#5B21B6"/>
+      <stop offset="50%" stop-color="#7C3AED"/>
+      <stop offset="100%" stop-color="#A78BFA"/>
+    </linearGradient>
+    <linearGradient id="node-grad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1A1A2E"/>
+      <stop offset="100%" stop-color="#0D1117"/>
+    </linearGradient>
+    <pattern id="dot-pattern" x="0" y="0" width="40" height="40" patternUnits="userSpaceOnUse">
+      <circle cx="20" cy="20" r="1" fill="#1F2937" opacity="0.4"/>
+    </pattern>
+  </defs>
+
+  <style>
+    .sans { font-family: ui-sans-serif, system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; }
+    .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  </style>
+
+  <!-- Background -->
+  <rect width="1200" height="400" fill="url(#bg-grad)"/>
+  <rect width="1200" height="400" fill="url(#dot-pattern)"/>
+  <rect x="0.5" y="0.5" width="1199" height="399" fill="none" stroke="#1F2937" stroke-width="1"/>
+
+  <!-- Project icon -->
+  <g id="project-icon" role="img" aria-label="ALAS Launcher icon">
+    <circle cx="152" cy="62" r="32" fill="url(#node-grad)" stroke="#7C3AED" stroke-width="2.5"/>
+    <circle cx="152" cy="50" r="16" fill="#F2C14E"/>
+    <circle cx="152" cy="62" r="11" fill="#FCE8D6"/>
+    <circle cx="147.5" cy="60.5" r="1.6" fill="#7C3AED"/>
+    <circle cx="156.5" cy="60.5" r="1.6" fill="#7C3AED"/>
+    <path d="M 147.5 66.5 Q 152 69.5 156.5 66.5" fill="none" stroke="#D98E73" stroke-width="1.2" stroke-linecap="round"/>
+  </g>
+
+  <!-- Version badge -->
+  <text class="sans" x="1150" y="35" font-size="12" fill="#6B7280" text-anchor="end">v0.1.0</text>
+
+  <!-- Title -->
+  <text class="sans" x="600" y="50" font-size="30" font-weight="bold" fill="#F3F4F6" text-anchor="middle">ALAS 启动器</text>
+  <text class="sans" x="600" y="78" font-size="14" fill="#A78BFA" text-anchor="middle">AzurLaneAutoScript 原生跨平台启动器</text>
+  <line x1="480" y1="92" x2="720" y2="92" stroke="url(#rail-grad)" stroke-width="1" opacity="0.4"/>
+
+  <!-- Rail glow -->
+  <rect x="196" y="193" width="828" height="20" rx="10" fill="#7C3AED" opacity="0.12"/>
+
+  <!-- Startup rail (track) -->
+  <rect id="track" x="200" y="197" width="820" height="12" rx="6" fill="url(#rail-grad)"/>
+
+  <!-- Progress dots on rail -->
+  <circle cx="350" cy="203" r="2" fill="#C4B5FD" opacity="0.6"/>
+  <circle cx="610" cy="203" r="2" fill="#C4B5FD" opacity="0.6"/>
+  <circle cx="870" cy="203" r="2" fill="#C4B5FD" opacity="0.6"/>
+
+  <!-- State: Initialize -->
+  <g id="state-initialize">
+    <circle cx="220" cy="203" r="18" fill="url(#node-grad)" stroke="#7C3AED" stroke-width="2.5"/>
+    <text class="sans" x="220" y="203" font-size="14" font-weight="bold" fill="#A78BFA" text-anchor="middle" dominant-baseline="central">1</text>
+    <text class="sans" x="220" y="250" font-size="14" fill="#D1D5DB" text-anchor="middle">初始化</text>
+  </g>
+
+  <!-- State: Update Repo -->
+  <g id="state-update">
+    <circle cx="480" cy="203" r="18" fill="url(#node-grad)" stroke="#7C3AED" stroke-width="2.5"/>
+    <text class="sans" x="480" y="203" font-size="14" font-weight="bold" fill="#A78BFA" text-anchor="middle" dominant-baseline="central">2</text>
+    <text class="sans" x="480" y="250" font-size="14" fill="#D1D5DB" text-anchor="middle">更新仓库</text>
+  </g>
+
+  <!-- gui.py label -->
+  <g id="label-gui-py">
+    <rect x="708" y="158" width="64" height="22" rx="4" fill="#1A1A2E" stroke="#7C3AED" stroke-width="1"/>
+    <text class="mono" x="740" y="173" font-size="12" fill="#A78BFA" text-anchor="middle">gui.py</text>
+    <line x1="740" y1="180" x2="740" y2="185" stroke="#7C3AED" stroke-width="1" opacity="0.5"/>
+  </g>
+
+  <!-- State: Starting GUI -->
+  <g id="state-gui">
+    <circle cx="740" cy="203" r="18" fill="url(#node-grad)" stroke="#7C3AED" stroke-width="2.5"/>
+    <text class="sans" x="740" y="203" font-size="14" font-weight="bold" fill="#A78BFA" text-anchor="middle" dominant-baseline="central">3</text>
+    <text class="sans" x="740" y="250" font-size="14" fill="#D1D5DB" text-anchor="middle">启动 GUI</text>
+  </g>
+
+  <!-- State: Ready -->
+  <g id="state-ready">
+    <circle cx="1000" cy="203" r="18" fill="url(#node-grad)" stroke="#7C3AED" stroke-width="2.5"/>
+    <text class="sans" x="1000" y="203" font-size="14" font-weight="bold" fill="#A78BFA" text-anchor="middle" dominant-baseline="central">4</text>
+    <text class="sans" x="1000" y="250" font-size="14" fill="#D1D5DB" text-anchor="middle">就绪</text>
+  </g>
+
+  <!-- Endpoint label -->
+  <text id="label-endpoint" class="sans" x="1000" y="275" font-size="11" fill="#8B8FA3" text-anchor="middle">127.0.0.1:22267 (默认)</text>
+
+  <!-- Platform labels -->
+  <text class="sans" x="600" y="355" font-size="13" fill="#8B8FA3" text-anchor="middle">Windows  ·  macOS  ·  Linux</text>
+
+  <!-- Built with -->
+  <text class="sans" x="600" y="380" font-size="11" fill="#4B5563" text-anchor="middle">基于 Tauri · Rust 构建</text>
+</svg>

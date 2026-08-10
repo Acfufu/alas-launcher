@@ -1,0 +1,126 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 560" width="1200" height="560" role="img">
+  <title>ALAS 启动器 — 启动流程</title>
+  <desc>ALAS 启动器的启动流程图。流程展示：启动器启动、环境配置（PATH 和 LD_LIBRARY_PATH）、读取 deploy.yaml 获取 WebuiPort（默认 22267）、启动画面、仓库初始化（配置清理和 Git 更新）、在本地端口启动 gui.py、导航至本地 Web UI、Tauri WebView 就绪。两个标注分别说明更新失败的启动画面和窗口关闭时的后端终止流程。</desc>
+
+  <defs>
+    <linearGradient id="bg-grad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0D1117"/>
+      <stop offset="100%" stop-color="#13111C"/>
+    </linearGradient>
+    <linearGradient id="node-grad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1A1A2E"/>
+      <stop offset="100%" stop-color="#0D1117"/>
+    </linearGradient>
+    <linearGradient id="rail-grad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#5B21B6"/>
+      <stop offset="50%" stop-color="#7C3AED"/>
+      <stop offset="100%" stop-color="#A78BFA"/>
+    </linearGradient>
+    <linearGradient id="callout-grad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#15131F"/>
+      <stop offset="100%" stop-color="#0D1117"/>
+    </linearGradient>
+    <pattern id="dot-pattern" x="0" y="0" width="40" height="40" patternUnits="userSpaceOnUse">
+      <circle cx="20" cy="20" r="1" fill="#1F2937" opacity="0.4"/>
+    </pattern>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#7C3AED"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1200" height="560" fill="url(#bg-grad)"/>
+  <rect width="1200" height="560" fill="url(#dot-pattern)"/>
+  <rect x="0.5" y="0.5" width="1199" height="559" fill="none" stroke="#1F2937" stroke-width="1"/>
+
+  <!-- Title -->
+  <text font-family='system-ui, -apple-system, "PingFang SC", sans-serif' x="600" y="32" font-size="20" font-weight="bold" fill="#F3F4F6" text-anchor="middle">ALAS 启动器 — 启动流程</text>
+  <line x1="450" y1="44" x2="750" y2="44" stroke="url(#rail-grad)" stroke-width="1" opacity="0.4"/>
+
+  <!-- ============ Main flow (vertical, centered at x=300) ============ -->
+
+  <!-- Node 1: Launcher starts -->
+  <g id="wf-launcher">
+    <rect x="160" y="62" width="280" height="30" rx="8" fill="url(#node-grad)" stroke="#7C3AED" stroke-width="1.5"/>
+    <text font-family='system-ui, -apple-system, "PingFang SC", sans-serif' x="300" y="82" font-size="13" fill="#F3F4F6" text-anchor="middle">启动器启动</text>
+  </g>
+  <line x1="300" y1="92" x2="300" y2="106" stroke="#7C3AED" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Node 2: Setup environment -->
+  <g id="wf-env">
+    <rect x="160" y="106" width="280" height="40" rx="8" fill="url(#node-grad)" stroke="#7C3AED" stroke-width="1.5"/>
+    <text font-family='system-ui, -apple-system, "PingFang SC", sans-serif' x="300" y="123" font-size="13" fill="#F3F4F6" text-anchor="middle">配置环境</text>
+    <text font-family='ui-monospace, Menlo, monospace' x="300" y="139" font-size="10" fill="#8B8FA3" text-anchor="middle">PATH + LD_LIBRARY_PATH</text>
+  </g>
+  <line x1="300" y1="146" x2="300" y2="160" stroke="#7C3AED" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Node 3: Read deploy.yaml -->
+  <g id="wf-config">
+    <rect x="160" y="160" width="280" height="40" rx="8" fill="url(#node-grad)" stroke="#7C3AED" stroke-width="1.5"/>
+    <text font-family='system-ui, -apple-system, "PingFang SC", sans-serif' x="300" y="177" font-size="13" fill="#F3F4F6" text-anchor="middle">读取 deploy.yaml</text>
+    <text font-family='system-ui, -apple-system, "PingFang SC", sans-serif' x="300" y="193" font-size="10" fill="#8B8FA3" text-anchor="middle">WebuiPort（默认 22267）</text>
+  </g>
+  <line x1="300" y1="200" x2="300" y2="214" stroke="#7C3AED" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Node 4: Splash window -->
+  <g id="wf-splash">
+    <rect x="160" y="214" width="280" height="40" rx="8" fill="url(#node-grad)" stroke="#7C3AED" stroke-width="1.5"/>
+    <text font-family='system-ui, -apple-system, "PingFang SC", sans-serif' x="300" y="231" font-size="13" fill="#F3F4F6" text-anchor="middle">启动画面</text>
+    <text font-family='system-ui, -apple-system, "PingFang SC", sans-serif' x="300" y="247" font-size="10" fill="#8B8FA3" text-anchor="middle">正在加载 ALAS，请稍候..</text>
+  </g>
+  <line x1="300" y1="254" x2="300" y2="268" stroke="#7C3AED" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Node 5: Initialize ALAS -->
+  <g id="wf-init">
+    <rect x="160" y="268" width="280" height="40" rx="8" fill="url(#node-grad)" stroke="#7C3AED" stroke-width="1.5"/>
+    <text font-family='system-ui, -apple-system, "PingFang SC", sans-serif' x="300" y="285" font-size="13" fill="#F3F4F6" text-anchor="middle">初始化 ALAS</text>
+    <text font-family='system-ui, -apple-system, "PingFang SC", sans-serif' x="300" y="301" font-size="10" fill="#8B8FA3" text-anchor="middle">清理配置 + Git 更新</text>
+  </g>
+  <line x1="300" y1="308" x2="300" y2="322" stroke="#7C3AED" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Node 6: Starting GUI -->
+  <g id="wf-gui">
+    <rect x="160" y="322" width="280" height="40" rx="8" fill="url(#node-grad)" stroke="#7C3AED" stroke-width="1.5"/>
+    <text font-family='system-ui, -apple-system, "PingFang SC", sans-serif' x="300" y="339" font-size="13" fill="#F3F4F6" text-anchor="middle">启动 GUI</text>
+    <text font-family='ui-monospace, Menlo, monospace' x="300" y="355" font-size="10" fill="#8B8FA3" text-anchor="middle">python gui.py --host 127.0.0.1 --port {port}</text>
+  </g>
+  <line x1="300" y1="362" x2="300" y2="376" stroke="#7C3AED" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Node 7: Navigate to local web UI -->
+  <g id="wf-navigate">
+    <rect x="160" y="376" width="280" height="40" rx="8" fill="url(#node-grad)" stroke="#7C3AED" stroke-width="1.5"/>
+    <text font-family='system-ui, -apple-system, "PingFang SC", sans-serif' x="300" y="393" font-size="13" fill="#F3F4F6" text-anchor="middle">导航至 127.0.0.1:{port}</text>
+    <text font-family='system-ui, -apple-system, "PingFang SC", sans-serif' x="300" y="409" font-size="10" fill="#8B8FA3" text-anchor="middle">启动画面销毁，显示 WebView</text>
+  </g>
+  <line x1="300" y1="416" x2="300" y2="430" stroke="#7C3AED" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Node 8: Tauri WebView ready -->
+  <g id="wf-ready">
+    <rect x="160" y="430" width="280" height="30" rx="8" fill="url(#node-grad)" stroke="#7C3AED" stroke-width="1.5"/>
+    <text font-family='system-ui, -apple-system, "PingFang SC", sans-serif' x="300" y="450" font-size="13" fill="#F3F4F6" text-anchor="middle">Tauri WebView 就绪</text>
+  </g>
+
+  <!-- ============ Callout 1: Update failure (from Node 5) ============ -->
+  <line x1="440" y1="288" x2="578" y2="288" stroke="#7C3AED" stroke-width="1" stroke-dasharray="4,3" opacity="0.6"/>
+  <g id="callout-failure">
+    <rect x="580" y="250" width="400" height="80" rx="8" fill="url(#callout-grad)" stroke="#7C3AED" stroke-width="1" stroke-dasharray="4,3"/>
+    <text font-family='system-ui, -apple-system, "PingFang SC", sans-serif' x="600" y="270" font-size="12" font-weight="bold" fill="#A78BFA">更新失败</text>
+    <text font-family='system-ui, -apple-system, "PingFang SC", sans-serif' x="600" y="290" font-size="11" fill="#D1D5DB">启动画面：加载 ALAS 失败，原因：{e}</text>
+    <text font-family='system-ui, -apple-system, "PingFang SC", sans-serif' x="600" y="308" font-size="11" fill="#8B8FA3">请从终端运行 alas-launcher 以查看详细日志</text>
+    <text font-family='system-ui, -apple-system, "PingFang SC", sans-serif' x="600" y="322" font-size="10" fill="#4B5563" font-style="italic">启动画面保持显示，主窗口不会打开</text>
+  </g>
+
+  <!-- ============ Callout 2: Backend termination (from Node 8) ============ -->
+  <line x1="440" y1="445" x2="578" y2="445" stroke="#7C3AED" stroke-width="1" stroke-dasharray="4,3" opacity="0.6"/>
+  <g id="callout-termination">
+    <rect x="580" y="408" width="400" height="80" rx="8" fill="url(#callout-grad)" stroke="#7C3AED" stroke-width="1" stroke-dasharray="4,3"/>
+    <text font-family='system-ui, -apple-system, "PingFang SC", sans-serif' x="600" y="428" font-size="12" font-weight="bold" fill="#A78BFA">窗口关闭</text>
+    <text font-family='ui-monospace, Menlo, monospace' x="600" y="448" font-size="11" fill="#D1D5DB">backend.terminate(): SIGTERM (500ms) → kill</text>
+    <text font-family='system-ui, -apple-system, "PingFang SC", sans-serif' x="600" y="466" font-size="11" fill="#8B8FA3">清理泄漏进程 (ALAS_LAUNCHER_PID)</text>
+    <text font-family='system-ui, -apple-system, "PingFang SC", sans-serif' x="600" y="480" font-size="10" fill="#4B5563" font-style="italic">Unix：SIGTERM 后 kill；Drop：kill + 环境变量标记的子进程</text>
+  </g>
+
+  <!-- Footer -->
+  <text font-family='system-ui, -apple-system, "PingFang SC", sans-serif' x="600" y="525" font-size="12" fill="#8B8FA3" text-anchor="middle">Windows  ·  macOS  ·  Linux</text>
+  <text font-family='system-ui, -apple-system, "PingFang SC", sans-serif' x="600" y="545" font-size="10" fill="#4B5563" text-anchor="middle">基于 Tauri · Rust 构建</text>
+</svg>
