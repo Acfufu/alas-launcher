@@ -12,7 +12,7 @@ On macOS it also adds a menu bar icon: check the ALAS task list or start/stop th
 
 ![ALAS menu bar animation: clicking the ship menu-bar icon opens a native menu showing the scheduler status and a Start/Stop toggle, with the Web UI kept alive; then the Web UI scheduler shows the real ALAS task list grouped by Running / Queued / Waiting with next-run times, and the main window](assets/readme/tray.gif)
 
-- **Task list at a glance**: mirrors the Web UI scheduler — real ALAS tasks grouped by `Running / Queued / Waiting` with next-run times (at most 3 tasks per group to keep the menu compact; auto-refreshes every 10 seconds, or refresh manually).
+- **Task list at a glance**: mirrors the Web UI scheduler — real ALAS tasks grouped by `Running / Queued / Waiting` with next-run times (at most 3 tasks per group to keep the menu compact; auto-refreshes every 3 seconds, or refresh manually).
 - **One-click scheduler toggle**: the toggle controls the ALAS scheduler instead of the backend process — the Web UI stays alive when the scheduler stops; when the backend is not running, the toggle starts the backend first, then the scheduler.
 - **macOS only**: the menu bar icon is enabled on macOS only; Windows and Linux builds are unaffected.
 
