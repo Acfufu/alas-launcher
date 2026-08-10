@@ -33,18 +33,24 @@ use crate::{
         control_labels, poll_decision, scheduler_alive, status_line_for, task_section,
         task_section_items, toggle_enabled, toggle_label, ControlLabels, TaskMenuItem, TaskSection,
     },
+    pywebio::{check_pywebio_version, click_scheduler, pywebio_version, SchedulerAction},
 };
 
 /// Poll cadence for the task section; also bounds each idle wait of the poll
 /// thread (a refresh signal wakes it early, never later than this).
 const TRAY_POLL_INTERVAL_SECS: Duration = Duration::from_secs(10);
 
+/// Upper bound of one scheduler WS click session (the ~6s home quiesce
+/// dominates the budget; plan todo 5 default).
+const SCHEDULER_CLICK_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Everything the tray menu needs beyond the AppHandle: the backend state
 /// (shared with main.rs), the cached task list, the resolved webui language
 /// (read ONCE from deploy.yaml at build time — it selects the i18n file for
 /// task display names), the stop flag (shared with main.rs so ExitRequested
-/// can halt the poll thread) and the refresh signal channel (manual Refresh
-/// menu item).
+/// can halt the poll thread), the refresh signal channel (manual Refresh
+/// menu item) and the WS in-flight flag (dedups concurrent toggles — only
+/// one scheduler click session at a time).
 #[derive(Clone)]
 struct TrayShared {
     backend: Arc<BackendLifecycle>,
@@ -52,6 +58,7 @@ struct TrayShared {
     language: String,
     stop: Arc<AtomicBool>,
     refresh: mpsc::Sender<()>,
+    in_flight: Arc<AtomicBool>,
 }
 
 /// Build the macOS menu-bar tray icon with its native menu.
@@ -77,6 +84,7 @@ pub fn build_tray(
         language,
         stop,
         refresh: refresh_tx,
+        in_flight: Arc::new(AtomicBool::new(false)),
     };
 
     let labels = load_control_labels();
@@ -267,31 +275,81 @@ fn stopped_page_url(labels: &ControlLabels) -> Url {
     Url::parse(&format!("data:text/html;charset=utf-8;base64,{}", b64)).unwrap()
 }
 
-/// Full Start/Stop toggle for the backend.
+/// Full Start/Stop toggle.
 ///
-/// The ordering contract (Metis BLOCKER-2: the old backend MUST be fully
-/// terminated AND dropped before a new gui.py spawns) lives inside
-/// [`BackendLifecycle::start`]; the toggle only snapshots, decides (via
-/// [`toggle_decision`]) and delegates. Navigation decisions go through
-/// [`main_page_url`] exactly as before.
+/// Since todo 6 the toggle controls the ALAS SCHEDULER through the webui
+/// WebSocket (a short worker-thread session, never a long-lived connection):
+/// - `StartScheduler` / `StopScheduler`: scheduler-only click, NO window
+///   navigation — the webui stays alive.
+/// - `StartBackend`: backend down — bring the whole backend up (existing
+///   ordering contract inside [`BackendLifecycle::start`]), navigate to the
+///   webui, then click Start over WS from a worker thread.
+/// - `StopBackend` (degraded: webui password/SSL configured): legacy
+///   process-level stop.
+///
+/// All WS I/O happens on a worker thread, outside every lock; the decision
+/// inputs (`scheduler_alive`, `ws_available`) are computed lock-free here.
 fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
-    // Snapshot the state and decide. Initializing -> NoOp (the item is
-    // disabled anyway; this also makes a second click during a 60s start
-    // window a no-op — BLOCKER-3: never two backends).
-    let action = toggle_decision(&shared.backend.snapshot());
+    // In-flight dedup (plan todo 6f): one scheduler session at a time. The
+    // guard is created IMMEDIATELY after the successful compare_exchange and
+    // moved into the worker closure below, so the flag clears on every exit
+    // path (worker finish, spawn failure, early return, panic).
+    let Some(guard) = try_acquire_in_flight(&shared.in_flight) else {
+        warn!("Toggle ignored: a previous toggle is still in flight");
+        return;
+    };
+
+    // Password/SSL degradation guard (plan todo 6b): with a webui password or
+    // TLS configured the plain ws:// client cannot drive the scheduler, so
+    // the toggle falls back to process-level control.
+    let ws_available = ws_available();
+    if !ws_available {
+        warn!("WebSocket scheduler control unavailable (webui password/SSL configured); falling back to process-level toggle");
+    }
+    warn_on_pywebio_mismatch();
+
+    // Click-time scheduler liveness — a lock-free re-scan (never the poll
+    // cache), plus a 100ms port probe: a dead port while the snapshot still
+    // says Running means the backend itself is gone (todo 3d), so fold to
+    // Stopped and let the decision take the StartBackend path.
+    let mut snapshot = shared.backend.snapshot();
+    let scheduler_alive = if snapshot.status == BackendStatus::Running && backend_port_alive(port) {
+        shared
+            .backend
+            .backend_pid()
+            .map(|pid| scheduler_alive(uvicorn_alive_child_count(pid, deploy_enable_reload())))
+            .unwrap_or(false)
+    } else if snapshot.status == BackendStatus::Running {
+        shared.backend.mark_stopped();
+        snapshot = shared.backend.snapshot();
+        false
+    } else {
+        false
+    };
+
+    let action = toggle_decision(&snapshot, scheduler_alive, ws_available);
     let labels = load_control_labels();
     match action {
+        // Initializing -> NoOp (the item is disabled anyway; this also makes
+        // a second click during a 60s start window a no-op — BLOCKER-3:
+        // never two backends).
         ToggleAction::NoOp => return,
-        ToggleAction::Stop => {
+        ToggleAction::StopBackend => {
+            // Degraded fallback: legacy process-level stop.
             shared.backend.stop();
             navigate_main(app, main_page_url(BackendStatus::Stopped, port, &labels));
         }
-        ToggleAction::Start => {
+        ToggleAction::StartBackend => {
             // Show "initializing…" (and make re-entry a no-op) for the whole
             // spawn window, which may take up to 60s.
             shared.backend.begin_start();
             match shared.backend.start(port) {
-                Ok(()) => navigate_main(app, main_page_url(BackendStatus::Running, port, &labels)),
+                Ok(()) => {
+                    navigate_main(app, main_page_url(BackendStatus::Running, port, &labels));
+                    if ws_available {
+                        spawn_scheduler_click(port, SchedulerAction::Start, labels.clone(), guard);
+                    }
+                }
                 Err(e) => {
                     warn!("Failed to start backend: {e}");
                     // Status is now Stopped + start_failed (set inside the
@@ -299,6 +357,17 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
                     // next menu rebuild shows the localized failed label.
                 }
             }
+        }
+        ToggleAction::StopScheduler | ToggleAction::StartScheduler => {
+            // Scheduler-only control: the click is delivered from a worker
+            // thread and the window is deliberately NOT navigated. A failed
+            // click only warns — the poll thread self-heals the status line
+            // and the toggle stays retryable.
+            let scheduler_action = match action {
+                ToggleAction::StopScheduler => SchedulerAction::Stop,
+                _ => SchedulerAction::Start,
+            };
+            spawn_scheduler_click(port, scheduler_action, labels.clone(), guard);
         }
     }
     // Rebuild must include the task section so a toggle never wipes it. The
@@ -314,6 +383,51 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
         task_section(shared.backend.snapshot().status, Ok(tasks)),
         None,
     );
+}
+
+/// RAII in-flight guard: clears the shared flag on drop, so the flag can
+/// never stick even when the worker thread fails to spawn or panics (the
+/// closure — and with it the guard — is dropped in both cases).
+struct InFlightGuard(Arc<AtomicBool>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Try to mark the in-flight flag; `Some(guard)` on success (the guard owns a
+/// clone of the flag and clears it when dropped), `None` when a toggle is
+/// already in flight. `compare_exchange(false, true, Acquire, Relaxed)` is
+/// atomic — a fast double-click cannot race two workers in (TOCTOU-free).
+fn try_acquire_in_flight(flag: &Arc<AtomicBool>) -> Option<InFlightGuard> {
+    flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .ok()
+        .map(|_| InFlightGuard(flag.clone()))
+}
+
+/// Spawn the scheduler click on a dedicated worker thread. All WS I/O runs
+/// there — off the UI (menu event) thread and outside every lock; the worker
+/// never touches `TrayShared` or tauri, only the pure
+/// [`click_scheduler`] channel. The in-flight guard moves into the closure.
+/// A click failure only warns (the poll thread self-heals the status line).
+fn spawn_scheduler_click(
+    port: u16,
+    action: SchedulerAction,
+    labels: ControlLabels,
+    guard: InFlightGuard,
+) {
+    if let Err(e) = std::thread::Builder::new()
+        .name("scheduler-click".into())
+        .spawn(move || {
+            let _guard = guard;
+            if let Err(e) = click_scheduler(port, action, &labels, SCHEDULER_CLICK_TIMEOUT) {
+                warn!("Scheduler control via WebSocket failed: {e:#}");
+            }
+        })
+    {
+        warn!("Failed to spawn scheduler-click worker: {e}");
+    }
 }
 
 /// Rebuild the menu from the current state + task cache and re-attach it to
@@ -418,6 +532,51 @@ fn deploy_enable_reload() -> bool {
     crate::setup::get_deploy_config()
         .and_then(|c| c["Deploy"]["Update"]["EnableReload"].as_bool())
         .unwrap_or(true)
+}
+
+/// Pure degradation check: WS scheduler control is unusable when the webui
+/// has a password or TLS configured. Reads the REAL payload paths
+/// (`Deploy.Webui.Password` / `WebuiSSLKey` / `WebuiSSLCert` — verified
+/// against the live deploy.yaml and app.py:1008 / gui.py:59-60; the plan's
+/// "Gui.Password" is stale). A non-empty string counts as configured; null,
+/// missing and empty all mean "no credential" (ALAS skips login for an empty
+/// password).
+fn ws_control_available(config: &serde_json::Value) -> bool {
+    let configured = |path: &[&str]| -> bool {
+        let mut cur = config;
+        for key in path {
+            cur = match cur.get(key) {
+                Some(v) => v,
+                None => return false,
+            };
+        }
+        cur.as_str().map(|s| !s.is_empty()).unwrap_or(false)
+    };
+    !(configured(&["Deploy", "Webui", "Password"])
+        || configured(&["Deploy", "Webui", "WebuiSSLKey"])
+        || configured(&["Deploy", "Webui", "WebuiSSLCert"]))
+}
+
+/// WS availability from the live deploy.yaml; true when it is missing (no
+/// credentials can be configured without a file).
+fn ws_available() -> bool {
+    crate::setup::get_deploy_config()
+        .as_ref()
+        .map(ws_control_available)
+        .unwrap_or(true)
+}
+
+/// Runtime pywebio version guard: warn once per toggle when the payload pins
+/// a pywebio version other than the one this WS protocol was captured
+/// against (1.6.2). File-level best-effort — an unreadable or absent
+/// requirements.txt is silent.
+fn warn_on_pywebio_mismatch() {
+    let Ok(requirements) = std::fs::read_to_string("requirements.txt") else {
+        return;
+    };
+    if !check_pywebio_version(pywebio_version(&requirements).as_deref()) {
+        warn!("Payload pywebio version may drift from the WS protocol this launcher speaks (expected 1.6.2); scheduler control could fail");
+    }
 }
 
 /// Whether the webui port answers within 100ms — the backend-liveness probe.
@@ -544,6 +703,53 @@ mod tests {
         // Live call must not panic regardless of ambient cwd.
         let live = load_control_labels();
         assert!(!live.scheduler.is_empty());
+    }
+
+    // ---- in-flight dedup -----------------------------------------------------
+
+    #[test]
+    fn in_flight_acquire_rejects_second_toggle_until_released() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let g1 = try_acquire_in_flight(&flag).expect("first toggle acquires");
+        assert!(try_acquire_in_flight(&flag).is_none(), "second toggle ignored");
+        assert!(flag.load(Ordering::Relaxed), "flag set while held");
+        drop(g1);
+        assert!(!flag.load(Ordering::Relaxed), "drop clears the flag");
+        let g2 = try_acquire_in_flight(&flag).expect("re-acquire after release");
+        drop(g2);
+    }
+
+    // ---- ws_control_available (password/SSL degradation) ---------------------
+
+    #[test]
+    fn ws_control_available_degrades_on_password() {
+        let cfg = serde_json::json!({"Deploy": {"Webui": {"Password": "secret"}}});
+        assert!(!ws_control_available(&cfg), "password configured -> degraded");
+    }
+
+    #[test]
+    fn ws_control_available_degrades_on_ssl() {
+        let key = serde_json::json!({"Deploy": {"Webui": {"WebuiSSLKey": "/tmp/k.pem"}}});
+        assert!(!ws_control_available(&key), "ssl key -> degraded");
+        let cert = serde_json::json!({"Deploy": {"Webui": {"WebuiSSLCert": "/tmp/c.pem"}}});
+        assert!(!ws_control_available(&cert), "ssl cert -> degraded");
+    }
+
+    #[test]
+    fn ws_control_available_null_missing_and_empty_are_available() {
+        // Real payload shape: Password/SSL all null (live deploy.yaml).
+        let nulls = serde_json::json!({"Deploy": {"Webui": {
+            "Password": serde_json::Value::Null,
+            "WebuiSSLKey": serde_json::Value::Null,
+            "WebuiSSLCert": serde_json::Value::Null,
+        }}});
+        assert!(ws_control_available(&nulls), "nulls -> available");
+        // Empty string = no password in ALAS semantics.
+        let empty = serde_json::json!({"Deploy": {"Webui": {"Password": ""}}});
+        assert!(ws_control_available(&empty), "empty password -> available");
+        // Missing sections entirely.
+        assert!(ws_control_available(&serde_json::json!({})));
+        assert!(ws_control_available(&serde_json::json!({"Deploy": {}})));
     }
 
     // ---- backend_port_alive --------------------------------------------------

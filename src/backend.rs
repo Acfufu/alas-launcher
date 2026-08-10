@@ -309,18 +309,61 @@ pub fn webui_url(port: u16) -> String {
 /// decision, not menu rendering: Initializing is a no-op (the tray item is
 /// disabled anyway; this also makes a second click during a 60s start window
 /// a no-op — BLOCKER-3: never two backends).
+///
+/// Since todo 6 the toggle drives the ALAS SCHEDULER through the webui
+/// WebSocket when it can, and falls back to process-level control when it
+/// cannot:
+/// - `StopScheduler` / `StartScheduler`: scheduler-only control (the webui
+///   stays alive; no window navigation).
+/// - `StartBackend`: the backend is down (or Stopped) — bring the whole
+///   backend up, then optionally start the scheduler over WS (the caller
+///   decides that tail based on `ws_available`).
+/// - `StopBackend`: DEGRADED mode only (webui password/SSL configured, so WS
+///   control is impossible) — the legacy semantics, Running → stop the
+///   backend process. Kept as an explicit variant (plan option A) instead of
+///   mapping `StopScheduler`→`StopBackend` in the caller: the variant makes
+///   the degraded behavior a first-class, testable decision cell rather than
+///   a hidden rewrite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToggleAction {
     NoOp,
-    Stop,
-    Start,
+    StartBackend,
+    /// Degraded mode (no WS available): process-level stop, legacy semantics.
+    StopBackend,
+    StopScheduler,
+    StartScheduler,
 }
 
-pub(crate) fn toggle_decision(snapshot: &BackendStateSnapshot) -> ToggleAction {
+/// Pure toggle decision (todo 6 matrix):
+///
+/// | status      | scheduler_alive | ws_available | action         |
+/// |-------------|-----------------|--------------|----------------|
+/// | Initializing| any             | any          | NoOp           |
+/// | Stopped     | any             | any          | StartBackend   |
+/// | Running     | any             | false        | StopBackend    |
+/// | Running     | true            | true         | StopScheduler  |
+/// | Running     | false           | true         | StartScheduler |
+///
+/// `scheduler_alive` is the click-time process-tree liveness (re-scanned by
+/// the caller outside any lock, never the poll cache); `ws_available` is the
+/// password/SSL degradation flag.
+pub(crate) fn toggle_decision(
+    snapshot: &BackendStateSnapshot,
+    scheduler_alive: bool,
+    ws_available: bool,
+) -> ToggleAction {
     match snapshot.status {
         BackendStatus::Initializing => ToggleAction::NoOp,
-        BackendStatus::Running => ToggleAction::Stop,
-        BackendStatus::Stopped => ToggleAction::Start,
+        BackendStatus::Stopped => ToggleAction::StartBackend,
+        BackendStatus::Running => {
+            if !ws_available {
+                ToggleAction::StopBackend
+            } else if scheduler_alive {
+                ToggleAction::StopScheduler
+            } else {
+                ToggleAction::StartScheduler
+            }
+        }
     }
 }
 
@@ -462,20 +505,33 @@ mod tests {
 
     #[test]
     fn toggle_decision_matrix() {
-        let stopped = BackendStateSnapshot {
-            status: BackendStatus::Stopped,
+        let snapshot = |status| BackendStateSnapshot {
+            status,
             start_failed: false,
         };
-        assert_eq!(toggle_decision(&stopped), ToggleAction::Start);
-        let running = BackendStateSnapshot {
-            status: BackendStatus::Running,
-            start_failed: false,
-        };
-        assert_eq!(toggle_decision(&running), ToggleAction::Stop);
-        let initializing = BackendStateSnapshot {
-            status: BackendStatus::Initializing,
-            start_failed: false,
-        };
-        assert_eq!(toggle_decision(&initializing), ToggleAction::NoOp);
+        let stopped = snapshot(BackendStatus::Stopped);
+        let running = snapshot(BackendStatus::Running);
+        let initializing = snapshot(BackendStatus::Initializing);
+
+        // Initializing: NoOp regardless of scheduler liveness or ws state.
+        for alive in [false, true] {
+            for ws in [false, true] {
+                assert_eq!(
+                    toggle_decision(&initializing, alive, ws),
+                    ToggleAction::NoOp
+                );
+            }
+        }
+        // Stopped: StartBackend regardless of ws availability (the ws tail,
+        // if any, is the caller's concern).
+        assert_eq!(toggle_decision(&stopped, false, true), ToggleAction::StartBackend);
+        assert_eq!(toggle_decision(&stopped, true, true), ToggleAction::StartBackend);
+        assert_eq!(toggle_decision(&stopped, false, false), ToggleAction::StartBackend);
+        // Running + ws available: the scheduler state decides.
+        assert_eq!(toggle_decision(&running, true, true), ToggleAction::StopScheduler);
+        assert_eq!(toggle_decision(&running, false, true), ToggleAction::StartScheduler);
+        // Running + degraded (password/SSL): legacy process-level stop.
+        assert_eq!(toggle_decision(&running, true, false), ToggleAction::StopBackend);
+        assert_eq!(toggle_decision(&running, false, false), ToggleAction::StopBackend);
     }
 }
