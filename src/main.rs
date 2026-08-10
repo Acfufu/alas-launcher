@@ -1,6 +1,7 @@
 // No default console window createion on Windows
 #![windows_subsystem = "windows"]
 
+mod alas_tasks;
 mod backend;
 #[cfg(target_os = "macos")]
 mod tray;
