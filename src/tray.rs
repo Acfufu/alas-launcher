@@ -29,6 +29,11 @@ use crate::{
 /// thread (a refresh signal wakes it early, never later than this).
 const TRAY_POLL_INTERVAL_SECS: Duration = Duration::from_secs(10);
 
+/// Menu compactness: each status group shows at most the 3 soonest tasks.
+/// The task slice is sorted by `next_time` ascending (see fetch_tasks), so the
+/// first items of a group are the soonest — the top of the queue.
+const TASK_GROUP_MAX: usize = 3;
+
 /// Which rendering the task section of the menu should use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TaskSection {
@@ -146,30 +151,37 @@ fn build_menu(
     )?;
     let separator_after_toggle = PredefinedMenuItem::separator(app)?;
 
-    let mut section_items: Vec<MenuItem<tauri::Wry>> = Vec::new();
+    let mut section_items: Vec<Box<dyn IsMenuItem<tauri::Wry>>> = Vec::new();
     match section {
-        TaskSection::Degraded => section_items.push(MenuItem::with_id(
+        TaskSection::Degraded => section_items.push(Box::new(MenuItem::with_id(
             app,
             "tasks-degraded",
             "Tasks: unavailable",
             false,
             None::<&str>,
-        )?),
-        TaskSection::Empty => section_items.push(MenuItem::with_id(
+        )?)),
+        TaskSection::Empty => section_items.push(Box::new(MenuItem::with_id(
             app,
             "tasks-empty",
             "No tasks",
             false,
             None::<&str>,
-        )?),
+        )?)),
         TaskSection::Tasks => {
             for item in task_section_items(tasks) {
                 match item {
                     TaskMenuItem::GroupHeader { id, text } => {
-                        section_items.push(MenuItem::with_id(app, id, text, false, None::<&str>)?);
+                        section_items.push(Box::new(MenuItem::with_id(
+                            app, id, text, false, None::<&str>,
+                        )?));
                     }
                     TaskMenuItem::TaskItem { id, text } => {
-                        section_items.push(MenuItem::with_id(app, id, text, false, None::<&str>)?);
+                        section_items.push(Box::new(MenuItem::with_id(
+                            app, id, text, false, None::<&str>,
+                        )?));
+                    }
+                    TaskMenuItem::Separator => {
+                        section_items.push(Box::new(PredefinedMenuItem::separator(app)?));
                     }
                 }
             }
@@ -182,7 +194,11 @@ fn build_menu(
     let quit = MenuItem::with_id(app, "tray-quit", "Quit", true, None::<&str>)?;
 
     let mut items: Vec<&dyn IsMenuItem<tauri::Wry>> = vec![&status, &toggle, &separator_after_toggle];
-    items.extend(section_items.iter().map(|i| i as &dyn IsMenuItem<tauri::Wry>));
+    items.extend(
+        section_items
+            .iter()
+            .map(|i| i.as_ref() as &dyn IsMenuItem<tauri::Wry>),
+    );
     items.push(&refresh);
     items.push(&separator_after_refresh);
     items.push(&show);
@@ -198,16 +214,23 @@ pub(crate) enum TaskMenuItem {
     GroupHeader { id: String, text: &'static str },
     /// One task row (disabled; `task-{i}`, text `"{name} — {time}"`).
     TaskItem { id: String, text: String },
+    /// Native separator line between two non-empty groups.
+    Separator,
 }
 
 /// Render the enabled-task list as grouped rows, mirroring the webui
 /// overview scopes (module/webui/app.py `alas_update_overview_task`):
-/// 运行中 → 队列中 → 等待中, each non-empty group led by a header. Empty
-/// groups render NO header. Empty input → empty output (the caller renders
-/// the "No tasks" empty state instead).
+/// 运行中 → 队列中 → 等待中, each non-empty group led by a header and
+/// separated from the next non-empty group by a `Separator` (never before the
+/// first group, never after the last). Each group caps at [`TASK_GROUP_MAX`]
+/// tasks — the input slice is sorted by `next_time` ascending, so the first
+/// items of a group are the soonest. Empty groups render NO header. Empty
+/// input → empty output (the caller renders the "No tasks" empty state
+/// instead).
 pub(crate) fn task_section_items(tasks: &[Task]) -> Vec<TaskMenuItem> {
     let mut items = Vec::new();
     let mut index = 0usize;
+    let mut emitted_group = false;
     for (status, id, text) in [
         (alas_tasks::TaskStatus::Running, "group-running", "运行中"),
         (alas_tasks::TaskStatus::Queued, "group-queued", "队列中"),
@@ -217,11 +240,15 @@ pub(crate) fn task_section_items(tasks: &[Task]) -> Vec<TaskMenuItem> {
         if group.is_empty() {
             continue;
         }
+        if emitted_group {
+            items.push(TaskMenuItem::Separator);
+        }
+        emitted_group = true;
         items.push(TaskMenuItem::GroupHeader {
             id: id.to_string(),
             text,
         });
-        for task in group {
+        for task in group.into_iter().take(TASK_GROUP_MAX) {
             // Full NextRun string: the webui renders `str(func.next_run)`
             // verbatim, so keeping the whole "YYYY-MM-DD HH:MM:SS" matches the
             // reference exactly (no truncation). Empty when the payload lacks
@@ -623,11 +650,13 @@ mod tests {
                     id: "task-0".into(),
                     text: "战术学院 — 2026-08-10 20:14:24".into(),
                 },
+                TaskMenuItem::Separator,
                 TaskMenuItem::GroupHeader { id: "group-queued".into(), text: "队列中" },
                 TaskMenuItem::TaskItem {
                     id: "task-1".into(),
                     text: "大舰队 — 2026-08-10 21:00:00".into(),
                 },
+                TaskMenuItem::Separator,
                 TaskMenuItem::GroupHeader { id: "group-waiting".into(), text: "等待中" },
                 TaskMenuItem::TaskItem {
                     id: "task-2".into(),
@@ -707,10 +736,111 @@ mod tests {
             .iter()
             .filter_map(|item| match item {
                 TaskMenuItem::TaskItem { id, .. } => Some(id.as_str()),
-                TaskMenuItem::GroupHeader { .. } => None,
+                TaskMenuItem::GroupHeader { .. } | TaskMenuItem::Separator => None,
             })
             .collect();
         assert_eq!(ids, vec!["task-0", "task-1", "task-2"]);
+    }
+
+    #[test]
+    fn task_section_items_caps_group_at_three() {
+        // Five waiting tasks (soonest first, as fetch_tasks sorts) -> only the
+        // top 3 are rendered, ids task-0..task-2.
+        let tasks: Vec<Task> = (0..5)
+            .map(|i| Task {
+                name: format!("任务-{i}"),
+                command: format!("Task{i}"),
+                enabled: true,
+                status: alas_tasks::TaskStatus::Waiting,
+                next_time: Some(format!("2026-08-11 0{i}:00:00")),
+            })
+            .collect();
+        let items = task_section_items(&tasks);
+        assert_eq!(items.len(), 1 + TASK_GROUP_MAX); // one header + 3 tasks
+        assert_eq!(
+            items[0],
+            TaskMenuItem::GroupHeader { id: "group-waiting".into(), text: "等待中" }
+        );
+        let ids: Vec<&str> = items
+            .iter()
+            .filter_map(|item| match item {
+                TaskMenuItem::TaskItem { id, .. } => Some(id.as_str()),
+                TaskMenuItem::GroupHeader { .. } | TaskMenuItem::Separator => None,
+            })
+            .collect();
+        assert_eq!(ids, vec!["task-0", "task-1", "task-2"]);
+    }
+
+    #[test]
+    fn task_section_items_separator_only_between_groups() {
+        // Running(1) + Waiting(1): exactly one separator, no leading/trailing.
+        let tasks = vec![
+            Task {
+                name: "战术学院".into(),
+                command: "Tactical".into(),
+                enabled: true,
+                status: alas_tasks::TaskStatus::Running,
+                next_time: Some("2026-08-10 20:14:24".into()),
+            },
+            Task {
+                name: "演习".into(),
+                command: "Exercise".into(),
+                enabled: true,
+                status: alas_tasks::TaskStatus::Waiting,
+                next_time: Some("2026-08-11 00:00:00".into()),
+            },
+        ];
+        let items = task_section_items(&tasks);
+        assert_eq!(
+            items,
+            vec![
+                TaskMenuItem::GroupHeader { id: "group-running".into(), text: "运行中" },
+                TaskMenuItem::TaskItem {
+                    id: "task-0".into(),
+                    text: "战术学院 — 2026-08-10 20:14:24".into(),
+                },
+                TaskMenuItem::Separator,
+                TaskMenuItem::GroupHeader { id: "group-waiting".into(), text: "等待中" },
+                TaskMenuItem::TaskItem {
+                    id: "task-1".into(),
+                    text: "演习 — 2026-08-11 00:00:00".into(),
+                },
+            ]
+        );
+
+        // Three groups, one task each -> exactly two separators, none at the
+        // ends.
+        let tasks = vec![
+            Task {
+                name: "战术学院".into(),
+                command: "Tactical".into(),
+                enabled: true,
+                status: alas_tasks::TaskStatus::Running,
+                next_time: Some("2026-08-10 20:14:24".into()),
+            },
+            Task {
+                name: "大舰队".into(),
+                command: "Guild".into(),
+                enabled: true,
+                status: alas_tasks::TaskStatus::Queued,
+                next_time: Some("2026-08-10 21:00:00".into()),
+            },
+            Task {
+                name: "演习".into(),
+                command: "Exercise".into(),
+                enabled: true,
+                status: alas_tasks::TaskStatus::Waiting,
+                next_time: Some("2026-08-11 00:00:00".into()),
+            },
+        ];
+        let items = task_section_items(&tasks);
+        let separator_count = items
+            .iter()
+            .filter(|i| **i == TaskMenuItem::Separator)
+            .count();
+        assert_eq!(separator_count, 2);
+        assert_ne!(items.first(), Some(&TaskMenuItem::Separator));
+        assert_ne!(items.last(), Some(&TaskMenuItem::Separator));
     }
 
     /// Manual-QA channel against the REAL installed ALAS payload (read-only).
@@ -733,6 +863,7 @@ mod tests {
             match item {
                 TaskMenuItem::GroupHeader { id, text } => println!("[{id}] {text}"),
                 TaskMenuItem::TaskItem { id, text } => println!("[{id}] {text}"),
+                TaskMenuItem::Separator => println!("[separator]"),
             }
         }
     }
