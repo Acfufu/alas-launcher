@@ -30,8 +30,9 @@ use crate::{
     alas_tasks::{self, Task},
     backend::{toggle_decision, BackendLifecycle, BackendStateSnapshot, BackendStatus, ToggleAction},
     menu_model::{
-        control_labels, poll_decision, scheduler_alive, status_line_for, task_section,
-        task_section_items, toggle_enabled, toggle_label, ControlLabels, TaskMenuItem, TaskSection,
+        control_labels, poll_decision, poll_needs_rebuild, scheduler_alive, status_line_for,
+        task_section, task_section_items, toggle_enabled, toggle_label, ControlLabels,
+        TaskMenuItem, TaskSection,
     },
     pywebio::{check_pywebio_version, click_scheduler, pywebio_version, SchedulerAction},
 };
@@ -116,8 +117,9 @@ pub fn build_tray(
         .on_menu_event(move |app, event| match event.id().as_ref() {
             "tray-toggle" => handle_toggle(app, &shared, port),
             "tray-refresh" => {
-                // Wake the poll thread; it diffs before rebuilding, so a
-                // manual refresh can never cause a needless rebuild/flicker.
+                // Wake the poll thread; a woken poll ALWAYS rebuilds (manual
+                // refresh = explicit user intent to see current state), unlike
+                // a timed poll which only rebuilds on detected change.
                 let _ = shared.refresh.send(());
             }
             "tray-show" => {
@@ -150,19 +152,29 @@ pub fn build_tray(
         let mut last_scheduler_alive: Option<bool> = None;
         while !thread_shared.stop.load(Ordering::Relaxed) {
             match refresh_rx.recv_timeout(TRAY_POLL_INTERVAL_SECS) {
+                // Woken (manual Refresh, or the worker-complete wake after an
+                // in-flight toggle): ALWAYS rebuild so the 处理中… toggle from
+                // the tail rebuild is replaced by the real state — the
+                // scheduler-liveness edge detector may have already consumed
+                // its flip while processing was still true, and a dead scan
+                // would otherwise skip the gate forever.
                 Ok(()) => poll_once(
                     &app_handle,
                     &thread_shared,
                     port,
                     &mut last_section,
                     &mut last_scheduler_alive,
+                    true,
                 ),
+                // Timed poll: keep the diff-based gate (rebuild only on
+                // detected change) to avoid needless menu flicker.
                 Err(mpsc::RecvTimeoutError::Timeout) => poll_once(
                     &app_handle,
                     &thread_shared,
                     port,
                     &mut last_section,
                     &mut last_scheduler_alive,
+                    false,
                 ),
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
@@ -499,12 +511,19 @@ fn rebuild_menu(app: &AppHandle, shared: &TrayShared, section: TaskSection, sche
 /// `last_section` tracks what the menu currently renders; `last_scheduler`
 /// tracks the last rendered scheduler liveness so a flip rebuilds the status
 /// line even when the task section is unchanged.
+///
+/// `force_rebuild` (a channel-woken poll) skips the diff gate: the worker
+/// completes, refresh.send wakes this poll, and the 处理中… toggle rendered by
+/// the tail rebuild must be replaced by the real state even when scheduler
+/// liveness did not change since the previous poll (see
+/// [`menu_model::poll_needs_rebuild`] for the full rationale).
 fn poll_once(
     app: &AppHandle,
     shared: &TrayShared,
     port: u16,
     last_section: &mut TaskSection,
     last_scheduler: &mut Option<bool>,
+    force_rebuild: bool,
 ) {
     // (a) status snapshot — no I/O under the backend lock (the lock is
     // internal to BackendLifecycle; status() takes it briefly).
@@ -555,7 +574,7 @@ fn poll_once(
     }
     let status_line_changed = scheduler != *last_scheduler;
     *last_scheduler = scheduler;
-    if outcome.changed || status_line_changed {
+    if poll_needs_rebuild(force_rebuild, outcome.changed, status_line_changed) {
         rebuild_menu(app, shared, outcome.section, scheduler);
         *last_section = outcome.section;
     }

@@ -171,6 +171,19 @@ pub fn poll_decision(
     }
 }
 
+/// Whether a poll cycle must rebuild the menu.
+///
+/// A channel-woken poll (`force_rebuild` — manual Refresh, or the
+/// worker-complete wake after an in-flight scheduler-control click) ALWAYS
+/// rebuilds: the 处理中… toggle rendered by the tail rebuild must be replaced
+/// by the real state even when the scheduler-liveness edge detector consumed
+/// its flip while `processing` was still true (see the stuck-processing bug:
+/// the worker finishes, the wake lands, but scan liveness is unchanged, so
+/// without force the gate skips and the menu stays 处理中… forever).
+pub fn poll_needs_rebuild(force_rebuild: bool, changed: bool, status_line_changed: bool) -> bool {
+    force_rebuild || changed || status_line_changed
+}
+
 /// Text of the Start/Stop toggle item.
 ///
 /// "停止" (labels.stop) only while the backend is Running AND the scheduler
@@ -916,6 +929,34 @@ mod tests {
             name: cmd.to_string(),
             command: cmd.to_string(),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn poll_needs_rebuild_matrix() {
+        // force_rebuild | changed | status_line_changed | expected
+        let cases: [(bool, bool, bool, bool); 8] = [
+            (false, false, false, false),
+            (false, false, true, true),
+            (false, true, false, true),
+            (false, true, true, true),
+            (true, false, false, true),
+            (true, false, true, true),
+            (true, true, false, true),
+            (true, true, true, true),
+        ];
+        for (force, changed, status_line_changed, expected) in cases {
+            assert_eq!(
+                poll_needs_rebuild(force, changed, status_line_changed),
+                expected,
+                "force_rebuild={force}, changed={changed}, status_line_changed={status_line_changed}",
+            );
+        }
+        // force=true always wins, regardless of the edge detectors.
+        for changed in [false, true] {
+            for status_line_changed in [false, true] {
+                assert!(poll_needs_rebuild(true, changed, status_line_changed));
+            }
         }
     }
 
