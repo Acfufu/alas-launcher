@@ -222,7 +222,7 @@ impl BackendLifecycle {
     ///
     /// No lock is held across the spawn either: the port-readiness wait inside
     /// `ManagedBackend::new` can take up to 60s, and status readers (the tray
-    /// poll thread reads the status every 10s) must never block on it.
+    /// poll thread reads the status every 3s) must never block on it.
     pub fn start(&self, port: u16) -> Result<()> {
         let old = {
             let mut state = self.state.lock().unwrap();

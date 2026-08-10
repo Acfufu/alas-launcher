@@ -38,7 +38,7 @@ use crate::{
 
 /// Poll cadence for the task section; also bounds each idle wait of the poll
 /// thread (a refresh signal wakes it early, never later than this).
-const TRAY_POLL_INTERVAL_SECS: Duration = Duration::from_secs(10);
+const TRAY_POLL_INTERVAL_SECS: Duration = Duration::from_secs(3);
 
 /// Upper bound of one scheduler WS click session (the ~6s home quiesce
 /// dominates the budget; plan todo 5 default).
@@ -133,7 +133,7 @@ pub fn build_tray(
         })
         .build(app)?;
 
-    // Poll thread: 10s cadence (or on-demand via refresh), diff-based rebuild
+    // Poll thread: 3s cadence (or on-demand via refresh), diff-based rebuild
     // of the task section, degraded fallback while the backend is down or the
     // fetch fails. TrayIcon is Send + Sync, so set_menu from here is safe;
     // the thread owns a clone so the tray stays alive for its whole lifetime
