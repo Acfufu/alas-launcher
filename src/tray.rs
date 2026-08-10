@@ -1,10 +1,15 @@
 // macOS system tray: template icon + native menu with a three-state backend
 // lifecycle toggle (BackendState shared with main.rs).
+//
+// This file is the tauri ADAPTER: it is the ONLY place `tauri::menu::*`
+// types appear. All menu CONTENT (grouping, labels, section classification,
+// change detection) lives in the pure `menu_model` module; this file only
+// turns its rows into native items and orchestrates (build_tray, handle_toggle,
+// poll_once, rebuild_menu, navigation).
 // Module is cfg-gated to macOS by `mod tray;` in main.rs, so this file never
 // participates in win/linux builds.
 
 use std::{
-    collections::HashSet,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Mutex,
@@ -22,28 +27,16 @@ use tracing::warn;
 
 use crate::{
     alas_tasks::{self, Task},
-    backend::{BackendLifecycle, BackendStateSnapshot, BackendStatus},
+    backend::{toggle_decision, BackendLifecycle, BackendStateSnapshot, BackendStatus, ToggleAction},
+    menu_model::{
+        menu_diff_changed, status_text, task_section, task_section_items, toggle_enabled,
+        toggle_label, TaskMenuItem, TaskSection,
+    },
 };
 
 /// Poll cadence for the task section; also bounds each idle wait of the poll
 /// thread (a refresh signal wakes it early, never later than this).
 const TRAY_POLL_INTERVAL_SECS: Duration = Duration::from_secs(10);
-
-/// Menu compactness: each status group shows at most the 3 soonest tasks.
-/// The task slice is sorted by `next_time` ascending (see fetch_tasks), so the
-/// first items of a group are the soonest — the top of the queue.
-const TASK_GROUP_MAX: usize = 3;
-
-/// Which rendering the task section of the menu should use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TaskSection {
-    /// Backend not running, or the task fetch failed — "Tasks: unavailable".
-    Degraded,
-    /// Backend running, zero tasks known — "No tasks".
-    Empty,
-    /// Backend running with a real task list.
-    Tasks,
-}
 
 /// Everything the tray menu needs beyond the AppHandle: the backend state
 /// (shared with main.rs), the cached task list, the stop flag (shared with
@@ -79,7 +72,7 @@ pub fn build_tray(
     };
 
     let menu = build_menu(
-        app,
+        app.handle(),
         &BackendStateSnapshot {
             status: BackendStatus::Stopped,
             start_failed: false,
@@ -119,16 +112,17 @@ pub fn build_tray(
     // Poll thread: 10s cadence (or on-demand via refresh), diff-based rebuild
     // of the task section, degraded fallback while the backend is down or the
     // fetch fails. TrayIcon is Send + Sync, so set_menu from here is safe;
-    // the thread owns a clone so the tray stays alive for its whole lifetime.
+    // the thread owns a clone so the tray stays alive for its whole lifetime
+    // (rebuild_menu reaches it through the app handle).
     let app_handle = app.handle().clone();
-    let thread_tray = tray.clone();
+    let _thread_tray = tray.clone();
     std::thread::spawn(move || {
         let mut last_section = TaskSection::Empty;
         while !thread_shared.stop.load(Ordering::Relaxed) {
             match refresh_rx.recv_timeout(TRAY_POLL_INTERVAL_SECS) {
-                Ok(()) => poll_once(&app_handle, &thread_tray, &thread_shared, &mut last_section),
+                Ok(()) => poll_once(&app_handle, &thread_shared, &mut last_section),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    poll_once(&app_handle, &thread_tray, &thread_shared, &mut last_section)
+                    poll_once(&app_handle, &thread_shared, &mut last_section)
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
@@ -144,7 +138,7 @@ pub fn build_tray(
 /// entirely). Task items are read-only (disabled): group headers id
 /// `group-running|queued|waiting`, task rows id `task-{i}`.
 fn build_menu(
-    app: &impl tauri::Manager<tauri::Wry>,
+    app: &AppHandle,
     snapshot: &BackendStateSnapshot,
     tasks: &[Task],
     section: TaskSection,
@@ -161,32 +155,18 @@ fn build_menu(
 
     let mut section_items: Vec<Box<dyn IsMenuItem<tauri::Wry>>> = Vec::new();
     match section {
-        TaskSection::Degraded => section_items.push(Box::new(MenuItem::with_id(
-            app,
-            "tasks-degraded",
-            "Tasks: unavailable",
-            false,
-            None::<&str>,
-        )?)),
-        TaskSection::Empty => section_items.push(Box::new(MenuItem::with_id(
-            app,
-            "tasks-empty",
-            "No tasks",
-            false,
-            None::<&str>,
-        )?)),
+        TaskSection::Degraded => {
+            push_row(app, &mut section_items, "tasks-degraded".into(), "Tasks: unavailable")?
+        }
+        TaskSection::Empty => push_row(app, &mut section_items, "tasks-empty".into(), "No tasks")?,
         TaskSection::Tasks => {
             for item in task_section_items(tasks) {
                 match item {
                     TaskMenuItem::GroupHeader { id, text } => {
-                        section_items.push(Box::new(MenuItem::with_id(
-                            app, id, text, false, None::<&str>,
-                        )?));
+                        push_row(app, &mut section_items, id, text)?
                     }
                     TaskMenuItem::TaskItem { id, text } => {
-                        section_items.push(Box::new(MenuItem::with_id(
-                            app, id, text, false, None::<&str>,
-                        )?));
+                        push_row(app, &mut section_items, id, &text)?
                     }
                     TaskMenuItem::Separator => {
                         section_items.push(Box::new(PredefinedMenuItem::separator(app)?));
@@ -215,87 +195,18 @@ fn build_menu(
     Menu::with_items(app, &items)
 }
 
-/// One renderable row of the tray's task section.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum TaskMenuItem {
-    /// Non-empty status-group header (disabled; 运行中/队列中/等待中).
-    GroupHeader { id: String, text: &'static str },
-    /// One task row (disabled; `task-{i}`, text `"{name} — {time}"`).
-    TaskItem { id: String, text: String },
-    /// Native separator line between two non-empty groups.
-    Separator,
-}
-
-/// Render the enabled-task list as grouped rows, mirroring the webui
-/// overview scopes (module/webui/app.py `alas_update_overview_task`):
-/// 运行中 → 队列中 → 等待中, each non-empty group led by a header and
-/// separated from the next non-empty group by a `Separator` (never before the
-/// first group, never after the last). Each group caps at [`TASK_GROUP_MAX`]
-/// tasks — the input slice is sorted by `next_time` ascending, so the first
-/// items of a group are the soonest. Empty groups render NO header. Empty
-/// input → empty output (the caller renders the "No tasks" empty state
-/// instead).
-pub(crate) fn task_section_items(tasks: &[Task]) -> Vec<TaskMenuItem> {
-    let mut items = Vec::new();
-    let mut index = 0usize;
-    let mut emitted_group = false;
-    for (status, id, text) in [
-        (alas_tasks::TaskStatus::Running, "group-running", "运行中"),
-        (alas_tasks::TaskStatus::Queued, "group-queued", "队列中"),
-        (alas_tasks::TaskStatus::Waiting, "group-waiting", "等待中"),
-    ] {
-        let group: Vec<&Task> = tasks.iter().filter(|t| t.status == status).collect();
-        if group.is_empty() {
-            continue;
-        }
-        if emitted_group {
-            items.push(TaskMenuItem::Separator);
-        }
-        emitted_group = true;
-        items.push(TaskMenuItem::GroupHeader {
-            id: id.to_string(),
-            text,
-        });
-        for task in group.into_iter().take(TASK_GROUP_MAX) {
-            // Full NextRun string: the webui renders `str(func.next_run)`
-            // verbatim, so keeping the whole "YYYY-MM-DD HH:MM:SS" matches the
-            // reference exactly (no truncation). Empty when the payload lacks
-            // a NextRun (real payloads always carry one).
-            items.push(TaskMenuItem::TaskItem {
-                id: format!("task-{index}"),
-                text: format!("{} — {}", task.name, task.next_time.as_deref().unwrap_or_default()),
-            });
-            index += 1;
-        }
-    }
-    items
-}
-
-fn status_text(snapshot: &BackendStateSnapshot) -> String {
-    if snapshot.start_failed {
-        "Backend: start failed".to_string()
-    } else {
-        label_for(snapshot.status).to_string()
-    }
-}
-
-pub(crate) fn label_for(status: BackendStatus) -> &'static str {
-    match status {
-        BackendStatus::Initializing => "Backend: initializing…",
-        BackendStatus::Running => "Backend: running",
-        BackendStatus::Stopped => "Backend: stopped",
-    }
-}
-
-pub(crate) fn toggle_label(status: BackendStatus) -> &'static str {
-    match status {
-        BackendStatus::Running => "Stop Backend",
-        BackendStatus::Stopped | BackendStatus::Initializing => "Start Backend",
-    }
-}
-
-pub(crate) fn toggle_enabled(status: BackendStatus) -> bool {
-    matches!(status, BackendStatus::Running | BackendStatus::Stopped)
+/// Push one disabled text row. Group headers, task rows and the degraded /
+/// empty rows all render identically (disabled `MenuItem::with_id`) — the
+/// only difference is the text's type (`&'static str` vs `String`), so every
+/// text row routes through this single construction site.
+fn push_row(
+    app: &AppHandle,
+    items: &mut Vec<Box<dyn IsMenuItem<tauri::Wry>>>,
+    id: String,
+    text: &str,
+) -> tauri::Result<()> {
+    items.push(Box::new(MenuItem::with_id(app, id, text, false, None::<&str>)?));
+    Ok(())
 }
 
 /// Where the main window should point for a given backend status.
@@ -313,29 +224,13 @@ fn stopped_page_url() -> Url {
     Url::parse(&format!("data:text/html;charset=utf-8;base64,{}", b64)).unwrap()
 }
 
-/// Decision the toggle handler makes from the current state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ToggleAction {
-    NoOp,
-    Stop,
-    Start,
-}
-
-pub(crate) fn toggle_decision(snapshot: &BackendStateSnapshot) -> ToggleAction {
-    match snapshot.status {
-        BackendStatus::Initializing => ToggleAction::NoOp,
-        BackendStatus::Running => ToggleAction::Stop,
-        BackendStatus::Stopped => ToggleAction::Start,
-    }
-}
-
 /// Full Start/Stop toggle for the backend.
 ///
 /// The ordering contract (Metis BLOCKER-2: the old backend MUST be fully
 /// terminated AND dropped before a new gui.py spawns) lives inside
-/// [`BackendLifecycle::start`]; the toggle only snapshots, decides and
-/// delegates. Navigation decisions go through [`main_page_url`] exactly as
-/// before.
+/// [`BackendLifecycle::start`]; the toggle only snapshots, decides (via
+/// [`toggle_decision`]) and delegates. Navigation decisions go through
+/// [`main_page_url`] exactly as before.
 fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
     // Snapshot the state and decide. Initializing -> NoOp (the item is
     // disabled anyway; this also makes a second click during a 60s start
@@ -362,33 +257,20 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
             }
         }
     }
-    // Rebuild must include the task section so a toggle never wipes it.
-    rebuild_menu(app, shared, section_from_state(shared));
+    // Rebuild must include the task section so a toggle never wipes it. The
+    // section derives from the POST-action state (fresh snapshot + cached
+    // tasks): a Stop shows the degraded section, a Start shows the cache.
+    let tasks = shared.tasks.lock().unwrap().clone();
+    rebuild_menu(app, shared, task_section(shared.backend.snapshot().status, Ok(tasks)));
 }
 
-/// Build the current menu (state + task cache + section) if possible.
-fn current_menu(
-    app: &impl tauri::Manager<tauri::Wry>,
-    shared: &TrayShared,
-    section: TaskSection,
-) -> Option<Menu<tauri::Wry>> {
+/// Rebuild the menu from the current state + task cache and re-attach it to
+/// the tray. The single set_menu site: the toggle handler and the poll thread
+/// both route through here (never build-then-set inline).
+fn rebuild_menu(app: &AppHandle, shared: &TrayShared, section: TaskSection) {
     let snapshot = shared.backend.snapshot();
     let tasks = shared.tasks.lock().unwrap().clone();
-    build_menu(app, &snapshot, &tasks, section).ok()
-}
-
-/// The task-section rendering implied by the current status + task cache
-/// (used by the toggle handler; the poll thread computes its own via
-/// [`task_section`] because it knows the fetch result).
-fn section_from_state(shared: &TrayShared) -> TaskSection {
-    let status = shared.backend.snapshot().status;
-    let tasks = shared.tasks.lock().unwrap().clone();
-    task_section(status, Ok(tasks))
-}
-
-/// Rebuild the menu from the current state and re-attach it to the tray.
-fn rebuild_menu(app: &AppHandle, shared: &TrayShared, section: TaskSection) {
-    let Some(menu) = current_menu(app, shared, section) else {
+    let Ok(menu) = build_menu(app, &snapshot, &tasks, section) else {
         return;
     };
     if let Some(tray) = app.tray_by_id("main-tray") {
@@ -396,42 +278,11 @@ fn rebuild_menu(app: &AppHandle, shared: &TrayShared, section: TaskSection) {
     }
 }
 
-/// The task-section rendering implied by backend status + fetch result.
-pub(crate) fn task_section(status: BackendStatus, fetch: Result<Vec<Task>, ()>) -> TaskSection {
-    if status != BackendStatus::Running {
-        return TaskSection::Degraded;
-    }
-    match fetch {
-        Err(()) => TaskSection::Degraded,
-        Ok(tasks) if tasks.is_empty() => TaskSection::Empty,
-        Ok(_) => TaskSection::Tasks,
-    }
-}
-
-/// Whether the command-name set differs between the old and new task lists,
-/// used to decide whether a rebuild is needed. True iff any command in OLD is
-/// missing from NEW, or any command in NEW is missing from OLD.
-///
-/// Identity is the `command` key, NOT the display `name`: names come from the
-/// i18n file (`Task.<command>.name`) and can change with the webui language,
-/// while the command equals the stable alas.json top-level key.
-pub(crate) fn menu_diff_changed(old: &[Task], new: &[Task]) -> bool {
-    let new_commands: HashSet<&str> = new.iter().map(|t| t.command.as_str()).collect();
-    let old_commands: HashSet<&str> = old.iter().map(|t| t.command.as_str()).collect();
-    old.iter().any(|t| !new_commands.contains(t.command.as_str()))
-        || new.iter().any(|t| !old_commands.contains(t.command.as_str()))
-}
-
 /// One poll cycle: snapshot the status (no network under the lock), fetch
 /// outside any lock when Running, then rebuild only when the rendered section
 /// kind or the task command set changed (anti-flicker). `last_section` tracks
 /// what the menu currently renders.
-fn poll_once(
-    app: &AppHandle,
-    tray: &tauri::tray::TrayIcon,
-    shared: &TrayShared,
-    last_section: &mut TaskSection,
-) {
+fn poll_once(app: &AppHandle, shared: &TrayShared, last_section: &mut TaskSection) {
     // (a) status snapshot — no I/O under the backend lock (the lock is
     // internal to BackendLifecycle; status() takes it briefly).
     let status = shared.backend.status();
@@ -460,9 +311,7 @@ fn poll_once(
         if let Ok(tasks) = fetched {
             *shared.tasks.lock().unwrap() = tasks;
         }
-        if let Some(menu) = current_menu(app, shared, section) {
-            let _ = tray.set_menu(Some(menu));
-        }
+        rebuild_menu(app, shared, section);
         *last_section = section;
     }
 }
@@ -492,27 +341,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn label_for_matrix() {
-        assert_eq!(label_for(BackendStatus::Initializing), "Backend: initializing…");
-        assert_eq!(label_for(BackendStatus::Running), "Backend: running");
-        assert_eq!(label_for(BackendStatus::Stopped), "Backend: stopped");
-    }
-
-    #[test]
-    fn toggle_label_matrix() {
-        assert_eq!(toggle_label(BackendStatus::Running), "Stop Backend");
-        assert_eq!(toggle_label(BackendStatus::Stopped), "Start Backend");
-        assert_eq!(toggle_label(BackendStatus::Initializing), "Start Backend");
-    }
-
-    #[test]
-    fn toggle_enabled_matrix() {
-        assert!(toggle_enabled(BackendStatus::Running));
-        assert!(toggle_enabled(BackendStatus::Stopped));
-        assert!(!toggle_enabled(BackendStatus::Initializing));
-    }
-
-    #[test]
     fn main_page_url_running_is_webui() {
         assert_eq!(
             main_page_url(BackendStatus::Running, 22267),
@@ -526,390 +354,5 @@ mod tests {
         assert!(stopped.as_str().starts_with("data:text/html"));
         let initializing = main_page_url(BackendStatus::Initializing, 22267);
         assert!(initializing.as_str().starts_with("data:text/html"));
-    }
-
-    #[test]
-    fn status_text_prefers_start_failed() {
-        let stopped_failed = BackendStateSnapshot {
-            status: BackendStatus::Stopped,
-            start_failed: true,
-        };
-        assert_eq!(status_text(&stopped_failed), "Backend: start failed");
-        let stopped_clean = BackendStateSnapshot {
-            status: BackendStatus::Stopped,
-            start_failed: false,
-        };
-        assert_eq!(status_text(&stopped_clean), "Backend: stopped");
-        let running_clean = BackendStateSnapshot {
-            status: BackendStatus::Running,
-            start_failed: false,
-        };
-        assert_eq!(status_text(&running_clean), "Backend: running");
-    }
-
-    #[test]
-    fn toggle_decision_matrix() {
-        let stopped = BackendStateSnapshot {
-            status: BackendStatus::Stopped,
-            start_failed: false,
-        };
-        assert_eq!(toggle_decision(&stopped), ToggleAction::Start);
-        let running = BackendStateSnapshot {
-            status: BackendStatus::Running,
-            start_failed: false,
-        };
-        assert_eq!(toggle_decision(&running), ToggleAction::Stop);
-        let initializing = BackendStateSnapshot {
-            status: BackendStatus::Initializing,
-            start_failed: false,
-        };
-        assert_eq!(toggle_decision(&initializing), ToggleAction::NoOp);
-    }
-
-    #[test]
-    fn task_section_items_all_three_groups() {
-        let tasks = vec![
-            Task {
-                name: "战术学院".into(),
-                command: "Tactical".into(),
-                status: alas_tasks::TaskStatus::Running,
-                next_time: Some("2026-08-10 20:14:24".into()),
-            },
-            Task {
-                name: "大舰队".into(),
-                command: "Guild".into(),
-                status: alas_tasks::TaskStatus::Queued,
-                next_time: Some("2026-08-10 21:00:00".into()),
-            },
-            Task {
-                name: "演习".into(),
-                command: "Exercise".into(),
-                status: alas_tasks::TaskStatus::Waiting,
-                next_time: Some("2026-08-11 00:00:00".into()),
-            },
-        ];
-        let items = task_section_items(&tasks);
-        assert_eq!(
-            items,
-            vec![
-                TaskMenuItem::GroupHeader { id: "group-running".into(), text: "运行中" },
-                TaskMenuItem::TaskItem {
-                    id: "task-0".into(),
-                    text: "战术学院 — 2026-08-10 20:14:24".into(),
-                },
-                TaskMenuItem::Separator,
-                TaskMenuItem::GroupHeader { id: "group-queued".into(), text: "队列中" },
-                TaskMenuItem::TaskItem {
-                    id: "task-1".into(),
-                    text: "大舰队 — 2026-08-10 21:00:00".into(),
-                },
-                TaskMenuItem::Separator,
-                TaskMenuItem::GroupHeader { id: "group-waiting".into(), text: "等待中" },
-                TaskMenuItem::TaskItem {
-                    id: "task-2".into(),
-                    text: "演习 — 2026-08-11 00:00:00".into(),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn task_section_items_only_waiting_renders_one_header() {
-        let tasks = vec![
-            Task {
-                name: "演习".into(),
-                command: "Exercise".into(),
-                status: alas_tasks::TaskStatus::Waiting,
-                next_time: Some("2026-08-11 00:00:00".into()),
-            },
-            Task {
-                name: "主线图-2".into(),
-                command: "Main2".into(),
-                status: alas_tasks::TaskStatus::Waiting,
-                next_time: Some("2026-08-11 06:00:00".into()),
-            },
-        ];
-        let items = task_section_items(&tasks);
-        assert_eq!(
-            items,
-            vec![
-                TaskMenuItem::GroupHeader { id: "group-waiting".into(), text: "等待中" },
-                TaskMenuItem::TaskItem {
-                    id: "task-0".into(),
-                    text: "演习 — 2026-08-11 00:00:00".into(),
-                },
-                TaskMenuItem::TaskItem {
-                    id: "task-1".into(),
-                    text: "主线图-2 — 2026-08-11 06:00:00".into(),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn task_section_items_empty_is_empty_vec() {
-        assert_eq!(task_section_items(&[]), vec![]);
-    }
-
-    #[test]
-    fn task_section_items_ids_sequential_across_groups() {
-        let tasks = vec![
-            Task {
-                name: "战术学院".into(),
-                command: "Tactical".into(),
-                status: alas_tasks::TaskStatus::Running,
-                next_time: Some("2026-08-10 20:14:24".into()),
-            },
-            Task {
-                name: "大舰队".into(),
-                command: "Guild".into(),
-                status: alas_tasks::TaskStatus::Queued,
-                next_time: Some("2026-08-10 21:00:00".into()),
-            },
-            Task {
-                name: "演习".into(),
-                command: "Exercise".into(),
-                status: alas_tasks::TaskStatus::Waiting,
-                next_time: Some("2026-08-11 00:00:00".into()),
-            },
-        ];
-        let items = task_section_items(&tasks);
-        let ids: Vec<&str> = items
-            .iter()
-            .filter_map(|item| match item {
-                TaskMenuItem::TaskItem { id, .. } => Some(id.as_str()),
-                TaskMenuItem::GroupHeader { .. } | TaskMenuItem::Separator => None,
-            })
-            .collect();
-        assert_eq!(ids, vec!["task-0", "task-1", "task-2"]);
-    }
-
-    #[test]
-    fn task_section_items_caps_group_at_three() {
-        // Five waiting tasks (soonest first, as fetch_tasks sorts) -> only the
-        // top 3 are rendered, ids task-0..task-2.
-        let tasks: Vec<Task> = (0..5)
-            .map(|i| Task {
-                name: format!("任务-{i}"),
-                command: format!("Task{i}"),
-                status: alas_tasks::TaskStatus::Waiting,
-                next_time: Some(format!("2026-08-11 0{i}:00:00")),
-            })
-            .collect();
-        let items = task_section_items(&tasks);
-        assert_eq!(items.len(), 1 + TASK_GROUP_MAX); // one header + 3 tasks
-        assert_eq!(
-            items[0],
-            TaskMenuItem::GroupHeader { id: "group-waiting".into(), text: "等待中" }
-        );
-        let ids: Vec<&str> = items
-            .iter()
-            .filter_map(|item| match item {
-                TaskMenuItem::TaskItem { id, .. } => Some(id.as_str()),
-                TaskMenuItem::GroupHeader { .. } | TaskMenuItem::Separator => None,
-            })
-            .collect();
-        assert_eq!(ids, vec!["task-0", "task-1", "task-2"]);
-    }
-
-    #[test]
-    fn task_section_items_separator_only_between_groups() {
-        // Running(1) + Waiting(1): exactly one separator, no leading/trailing.
-        let tasks = vec![
-            Task {
-                name: "战术学院".into(),
-                command: "Tactical".into(),
-                status: alas_tasks::TaskStatus::Running,
-                next_time: Some("2026-08-10 20:14:24".into()),
-            },
-            Task {
-                name: "演习".into(),
-                command: "Exercise".into(),
-                status: alas_tasks::TaskStatus::Waiting,
-                next_time: Some("2026-08-11 00:00:00".into()),
-            },
-        ];
-        let items = task_section_items(&tasks);
-        assert_eq!(
-            items,
-            vec![
-                TaskMenuItem::GroupHeader { id: "group-running".into(), text: "运行中" },
-                TaskMenuItem::TaskItem {
-                    id: "task-0".into(),
-                    text: "战术学院 — 2026-08-10 20:14:24".into(),
-                },
-                TaskMenuItem::Separator,
-                TaskMenuItem::GroupHeader { id: "group-waiting".into(), text: "等待中" },
-                TaskMenuItem::TaskItem {
-                    id: "task-1".into(),
-                    text: "演习 — 2026-08-11 00:00:00".into(),
-                },
-            ]
-        );
-
-        // Three groups, one task each -> exactly two separators, none at the
-        // ends.
-        let tasks = vec![
-            Task {
-                name: "战术学院".into(),
-                command: "Tactical".into(),
-                status: alas_tasks::TaskStatus::Running,
-                next_time: Some("2026-08-10 20:14:24".into()),
-            },
-            Task {
-                name: "大舰队".into(),
-                command: "Guild".into(),
-                status: alas_tasks::TaskStatus::Queued,
-                next_time: Some("2026-08-10 21:00:00".into()),
-            },
-            Task {
-                name: "演习".into(),
-                command: "Exercise".into(),
-                status: alas_tasks::TaskStatus::Waiting,
-                next_time: Some("2026-08-11 00:00:00".into()),
-            },
-        ];
-        let items = task_section_items(&tasks);
-        let separator_count = items
-            .iter()
-            .filter(|i| **i == TaskMenuItem::Separator)
-            .count();
-        assert_eq!(separator_count, 2);
-        assert_ne!(items.first(), Some(&TaskMenuItem::Separator));
-        assert_ne!(items.last(), Some(&TaskMenuItem::Separator));
-    }
-
-    /// Manual-QA channel against the REAL installed ALAS payload (read-only).
-    /// Prints the grouped task rows exactly as the tray renders them.
-    /// Ignored by default; run with
-    /// `cargo test real_payload_group_preview -- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn real_payload_group_preview() {
-        let payload = std::path::Path::new(
-            "/Applications/AzurLaneAutoScript.app/Contents/AzurLaneAutoScript",
-        );
-        if !payload.join("config").join("alas.json").exists() {
-            eprintln!("real ALAS payload not present; skipping");
-            return;
-        }
-        let tasks =
-            alas_tasks::fetch_tasks(payload, &alas_tasks::now_str(), "zh-CN").unwrap();
-        for item in task_section_items(&tasks) {
-            match item {
-                TaskMenuItem::GroupHeader { id, text } => println!("[{id}] {text}"),
-                TaskMenuItem::TaskItem { id, text } => println!("[{id}] {text}"),
-                TaskMenuItem::Separator => println!("[separator]"),
-            }
-        }
-    }
-
-    #[test]
-    fn menu_diff_changed_unchanged_is_false() {
-        let old = vec![Task {
-            name: "每日任务".into(),
-            command: "Daily".into(),
-            ..Default::default()
-        }];
-        // Same command set (status changed) -> no structural change.
-        let new = vec![Task {
-            name: "每日任务".into(),
-            command: "Daily".into(),
-            status: alas_tasks::TaskStatus::Waiting,
-            next_time: Some("2026-08-11 00:00:00".into()),
-        }];
-        assert!(!menu_diff_changed(&old, &new));
-        assert!(!menu_diff_changed(&[], &[]));
-    }
-
-    #[test]
-    fn menu_diff_changed_add_scenario() {
-        let old: Vec<Task> = vec![];
-        let new = vec![
-            Task {
-                name: "每日任务".into(),
-                command: "Daily".into(),
-                ..Default::default()
-            },
-            Task {
-                name: "困难图".into(),
-                command: "Hard".into(),
-                ..Default::default()
-            },
-        ];
-        assert!(menu_diff_changed(&old, &new));
-    }
-
-    #[test]
-    fn menu_diff_changed_remove_scenario() {
-        let old = vec![
-            Task {
-                name: "每日任务".into(),
-                command: "Daily".into(),
-                ..Default::default()
-            },
-            Task {
-                name: "战术学院".into(),
-                command: "Tactical".into(),
-                ..Default::default()
-            },
-            Task {
-                name: "大舰队".into(),
-                command: "Guild".into(),
-                ..Default::default()
-            },
-        ];
-        let new = vec![Task {
-            name: "战术学院".into(),
-            command: "Tactical".into(),
-            ..Default::default()
-        }];
-        assert!(menu_diff_changed(&old, &new));
-    }
-
-    #[test]
-    fn menu_diff_changed_same_commands_different_names_no_change() {
-        // i18n display names may change (e.g. webui language switch) while
-        // commands stay stable — identity must be the command.
-        let old = vec![Task {
-            name: "主线图".into(),
-            command: "Main".into(),
-            ..Default::default()
-        }];
-        let new = vec![Task {
-            name: "Main".into(), // i18n gone -> name falls back to command
-            command: "Main".into(),
-            ..Default::default()
-        }];
-        assert!(!menu_diff_changed(&old, &new));
-    }
-
-    #[test]
-    fn task_section_matrix() {
-        let one = vec![Task {
-            name: "每日任务".into(),
-            command: "Daily".into(),
-            ..Default::default()
-        }];
-        assert_eq!(
-            task_section(BackendStatus::Running, Ok(one.clone())),
-            TaskSection::Tasks
-        );
-        assert_eq!(
-            task_section(BackendStatus::Running, Ok(vec![])),
-            TaskSection::Empty
-        );
-        assert_eq!(
-            task_section(BackendStatus::Running, Err(())),
-            TaskSection::Degraded
-        );
-        assert_eq!(
-            task_section(BackendStatus::Stopped, Ok(one.clone())),
-            TaskSection::Degraded
-        );
-        assert_eq!(
-            task_section(BackendStatus::Initializing, Err(())),
-            TaskSection::Degraded
-        );
     }
 }
