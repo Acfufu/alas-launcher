@@ -39,8 +39,8 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use tracing::debug;
-use tungstenite::client::client;
-use tungstenite::http::Request;
+use tungstenite::client::{client, IntoClientRequest};
+use tungstenite::http::HeaderValue;
 use tungstenite::Message;
 
 use crate::menu_model::ControlLabels;
@@ -287,6 +287,12 @@ pub(crate) fn js_yield_event(task_id: &str, data: &Value) -> String {
 /// (same-site; harmless — capture confirmed the ws handshake does not
 /// enforce origin). All socket operations are time-bounded: connect via
 /// `connect_timeout`, reads via `READ_POLL`, writes via `WRITE_TIMEOUT`.
+///
+/// The request is built through tungstenite's `IntoClientRequest` (from the
+/// URL string), NOT a hand-rolled `http::Request`: since tungstenite 0.30
+/// `client()` no longer synthesizes the `Sec-WebSocket-Key` header, and a
+/// request without it fails the handshake before any byte reaches the
+/// server (exposed by the todo-7 real-payload roundtrip).
 fn connect(port: u16, deadline: Instant) -> Result<tungstenite::WebSocket<TcpStream>> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
@@ -299,11 +305,11 @@ fn connect(port: u16, deadline: Instant) -> Result<tungstenite::WebSocket<TcpStr
         .set_write_timeout(Some(WRITE_TIMEOUT))
         .context("set write timeout")?;
     let url = format!("ws://127.0.0.1:{port}/?app=index");
-    let request = Request::builder()
-        .uri(url)
-        .header("Origin", format!("http://127.0.0.1:{port}"))
-        .body(())
-        .context("build ws request")?;
+    let mut request = url.into_client_request().context("build ws request")?;
+    request.headers_mut().insert(
+        "Origin",
+        HeaderValue::from_str(&format!("http://127.0.0.1:{port}")).context("build Origin header")?,
+    );
     let (ws, _response) = client(request, stream).map_err(|e| anyhow!("ws handshake failed: {e:?}"))?;
     Ok(ws)
 }
@@ -738,5 +744,386 @@ mod client_tests {
         assert_eq!(SchedulerAction::Start.label_after(&labels), "停止");
         assert_eq!(SchedulerAction::Stop.label_before(&labels), "停止");
         assert_eq!(SchedulerAction::Stop.label_after(&labels), "启动");
+    }
+}
+
+/// Real-payload integration test (todo 7): a full scheduler Start/Stop
+/// roundtrip against the REAL installed ALAS payload on an ISOLATED port.
+///
+/// - Never touches the user's live backend: every instance spawned here
+///   binds 22367 (`--port` overrides deploy.yaml `WebuiPort`, gui.py), and
+///   the guard kills the whole process tree on EVERY exit path (Drop runs
+///   on panic too: SIGTERM/SIGKILL on the process group the spawned python
+///   created via `process_group(0)`, then a pkill fallback on the exact
+///   cmdline, then it waits for the port to close).
+/// - Environment mirrors the app (src/setup.rs unix `setup_environment`,
+///   which itself cannot be called here: `alas_repo_dir()` derives from
+///   `current_exe()` and panics under `cargo test`): cwd = payload dir,
+///   toolkit PATH + LD_LIBRARY_PATH prepended, `./toolkit/bin/python`.
+/// - Scheduler detection mirrors the todo-3 discriminator (tray.rs
+///   `uvicorn_alive_child_count`) and its production predicate
+///   `menu_model::scheduler_alive`: alive, non-zombie, non-resource-tracker
+///   children of the uvicorn process (the reload wrapper's child when
+///   `Deploy.Update.EnableReload`; the backend process itself otherwise);
+///   baseline = the multiprocessing.Manager only (1), scheduler running => 2.
+///
+/// Run: `cargo test ws_roundtrip_real_payload -- --ignored --nocapture`
+#[cfg(test)]
+mod real_payload_tests {
+    use super::*;
+    use crate::menu_model::{control_labels, scheduler_alive, ControlLabels};
+    use std::io::{Read, Write};
+    use std::os::unix::process::CommandExt;
+    use std::path::Path;
+    use std::process::{Child, Command};
+
+    /// The real installed payload this QA targets.
+    const PAYLOAD: &str = "/Applications/AzurLaneAutoScript.app/Contents/AzurLaneAutoScript";
+    /// Isolated test port — NEVER 22267 (a user's live backend may be there).
+    const TEST_PORT: u16 = 22367;
+    /// The live backend port, probed read-only to prove we never touched it.
+    const LIVE_PORT: u16 = 22267;
+    /// Budget for the webui to boot after spawn.
+    const BOOT_TIMEOUT: Duration = Duration::from_secs(90);
+    /// Budget for the scheduler child to appear after Start (todo 7: <=20s).
+    const START_TIMEOUT: Duration = Duration::from_secs(20);
+    /// Budget for the scheduler child to disappear after Stop (todo 7: <=10s).
+    const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+    /// Per-click ws session budget (todo 5 default).
+    const CLICK_TIMEOUT: Duration = Duration::from_secs(15);
+
+    fn labels_zh() -> ControlLabels {
+        control_labels("zh-CN", &Value::Null)
+    }
+
+    /// Mirror of src/setup.rs `prepend_path_to_env`.
+    fn prepend_path(key: &str, path: &Path) {
+        let mut paths = vec![path.to_path_buf()];
+        if let Some(old) = std::env::var_os(key) {
+            paths.extend(std::env::split_paths(&old));
+        }
+        std::env::set_var(key, std::env::join_paths(paths).unwrap());
+    }
+
+    /// Replicate src/setup.rs:52-60 (unix `setup_environment`): cwd becomes
+    /// the payload dir and PATH/LD_LIBRARY_PATH gain the toolkit entries.
+    fn setup_payload_env(payload: &Path) {
+        std::env::set_current_dir(payload).expect("set cwd to payload");
+        prepend_path(
+            "PATH",
+            &payload.join("toolkit").join("libexec").join("git-core"),
+        );
+        prepend_path("PATH", &payload.join("toolkit").join("bin"));
+        prepend_path("LD_LIBRARY_PATH", &payload.join("toolkit").join("lib"));
+    }
+
+    /// `Deploy.Update.EnableReload` from config/deploy.yaml (true when
+    /// missing — the ALAS default): decides which process is the uvicorn.
+    fn deploy_enable_reload(payload: &Path) -> bool {
+        std::fs::read_to_string(payload.join("config").join("deploy.yaml"))
+            .ok()
+            .and_then(|s| serde_yaml::from_str::<Value>(&s).ok())
+            .and_then(|c| c["Deploy"]["Update"]["EnableReload"].as_bool())
+            .unwrap_or(true)
+    }
+
+    /// The multiprocessing resource_tracker child, excluded from the count
+    /// (present in BOTH tree shapes; tray.rs `is_resource_tracker`).
+    fn is_resource_tracker(p: &sysinfo::Process) -> bool {
+        p.cmd()
+            .iter()
+            .any(|c| c.to_string_lossy().contains("multiprocessing.resource_tracker"))
+    }
+
+    /// The todo-3 discriminator, mirrored from tray.rs
+    /// `uvicorn_alive_child_count`: alive non-zombie non-resource-tracker
+    /// children of the uvicorn process. 0 when the backend is gone
+    /// (conservative — scheduler shown stopped).
+    fn scheduler_child_count(backend_pid: u32, enable_reload: bool) -> usize {
+        let mut sys = sysinfo::System::new_all();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        let uvicorn_pid = if enable_reload {
+            sys.processes()
+                .values()
+                .find(|p| {
+                    p.parent().map(|q| q.as_u32()) == Some(backend_pid) && !is_resource_tracker(p)
+                })
+                .map(|p| p.pid())
+        } else {
+            Some(sysinfo::Pid::from_u32(backend_pid))
+        };
+        let Some(uvicorn_pid) = uvicorn_pid else {
+            return 0;
+        };
+        sys.processes()
+            .values()
+            .filter(|p| p.parent() == Some(uvicorn_pid))
+            .filter(|p| p.status() != sysinfo::ProcessStatus::Zombie)
+            .filter(|p| !is_resource_tracker(p))
+            .count()
+    }
+
+    fn port_open(port: u16) -> bool {
+        let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port);
+        TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+    }
+
+    /// HTTP status code of `GET /`; -1 when the port is not serving HTTP.
+    fn webui_status(port: u16) -> i32 {
+        let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port);
+        let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(500)) else {
+            return -1;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let _ = stream.write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        let mut buf = [0u8; 64];
+        let Ok(n) = stream.read(&mut buf) else {
+            return -1;
+        };
+        String::from_utf8_lossy(&buf[..n])
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse::<i32>().ok())
+            .unwrap_or(-1)
+    }
+
+    /// The backend process listening on `port` (reuse path only).
+    fn backend_pid_on_port(port: u16) -> Option<u32> {
+        let mut sys = sysinfo::System::new_all();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        let needle = format!("--port {port}");
+        sys.processes()
+            .values()
+            .find(|p| p.cmd().iter().any(|c| c.to_string_lossy().contains(&needle)))
+            .map(|p| p.pid().as_u32())
+    }
+
+    /// Poll `cond` every 500ms until it holds or `timeout` elapses.
+    fn wait_for(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if cond() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    /// Poll the discriminator, printing each observation, until `pred`
+    /// holds or `timeout` elapses. Returns the last observed count.
+    fn wait_scheduler_count(
+        what: &str,
+        backend_pid: u32,
+        reload: bool,
+        timeout: Duration,
+        pred: impl Fn(usize) -> bool,
+    ) -> usize {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let count = scheduler_child_count(backend_pid, reload);
+            eprintln!("  [{what}] scheduler child count = {count}");
+            if pred(count) || Instant::now() >= deadline {
+                return count;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    /// Kills every process spawned for the test on every exit path: SIGTERM
+    /// the whole process group (the spawned python created its own group via
+    /// `process_group(0)`; the live ALAS tree confirms the gui.py wrapper,
+    /// uvicorn and Manager all share the wrapper's pgid), SIGKILL
+    /// escalation, then a pkill fallback on the exact cmdline for anything
+    /// that escaped, then wait for the port to close.
+    struct BackendGuard {
+        child: Option<Child>,
+        pgid: Option<i32>,
+        port: u16,
+    }
+
+    impl Drop for BackendGuard {
+        fn drop(&mut self) {
+            if let Some(pgid) = self.pgid {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(-pgid),
+                    nix::sys::signal::Signal::SIGTERM,
+                );
+            }
+            let deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                if let Some(child) = self.child.as_mut() {
+                    if child.try_wait().ok().flatten().is_some() {
+                        self.child = None;
+                    }
+                }
+                if !port_open(self.port) {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    if let Some(pgid) = self.pgid {
+                        let _ = nix::sys::signal::kill(
+                            nix::unistd::Pid::from_raw(-pgid),
+                            nix::sys::signal::Signal::SIGKILL,
+                        );
+                    }
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            let _ = Command::new("pkill")
+                .args(["-f", "gui.py --host 127.0.0.1 --port 22367"])
+                .status();
+            let _ = Command::new("pkill")
+                .args(["-9", "-f", "gui.py --host 127.0.0.1 --port 22367"])
+                .status();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline && port_open(self.port) {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            eprintln!(
+                "cleanup: port {} open after guard drop = {}",
+                self.port,
+                port_open(self.port)
+            );
+        }
+    }
+
+    /// Spawn the ALAS backend on the isolated port; reuse an already-live
+    /// 22367 (leftover from a crashed run) without spawning a second one.
+    fn spawn_backend(payload: &Path) -> BackendGuard {
+        if port_open(TEST_PORT) {
+            eprintln!("port {TEST_PORT} already live; reusing (cleanup still applies)");
+            return BackendGuard {
+                child: None,
+                pgid: None,
+                port: TEST_PORT,
+            };
+        }
+        let mut cmd = Command::new(payload.join("toolkit").join("bin").join("python"));
+        cmd.args(["gui.py", "--host", "127.0.0.1", "--port", "22367"]);
+        cmd.current_dir(payload);
+        cmd.process_group(0);
+        let child = cmd.spawn().expect("failed to spawn the ALAS backend");
+        let pid = child.id();
+        eprintln!("spawned backend pid {pid} on port {TEST_PORT} (own process group)");
+        BackendGuard {
+            child: Some(child),
+            pgid: Some(pid as i32),
+            port: TEST_PORT,
+        }
+    }
+
+    /// End-to-end scheduler control against the real payload on an isolated
+    /// port: Start -> scheduler child appears, Stop -> back to baseline,
+    /// webui serving HTTP 200 throughout. Env mirrors the app (cwd =
+    /// payload, toolkit PATH/LD_LIBRARY_PATH, `./toolkit/bin/python`).
+    #[test]
+    #[ignore]
+    fn ws_roundtrip_real_payload() {
+        let payload = Path::new(PAYLOAD);
+        if !payload.join("gui.py").exists() {
+            eprintln!("real ALAS payload not present at {PAYLOAD}; skipping");
+            return;
+        }
+        eprintln!("=== ws_roundtrip_real_payload: real payload at {PAYLOAD}");
+        eprintln!(
+            "live backend ({LIVE_PORT}) listening before test = {}",
+            port_open(LIVE_PORT)
+        );
+
+        setup_payload_env(payload);
+        let requirements = std::fs::read_to_string(payload.join("requirements.txt")).unwrap_or_default();
+        assert!(
+            check_pywebio_version(pywebio_version(&requirements).as_deref()),
+            "payload pywebio != 1.6.2; refusing to drive an unknown protocol"
+        );
+        eprintln!("pywebio version guard: 1.6.2 confirmed");
+
+        let reload = deploy_enable_reload(payload);
+        eprintln!("Deploy.Update.EnableReload = {reload}");
+
+        let guard = spawn_backend(payload);
+        let backend_pid = match &guard.child {
+            Some(child) => child.id(),
+            None => backend_pid_on_port(TEST_PORT)
+                .expect("reused backend not findable in the process table"),
+        };
+        eprintln!("backend pid = {backend_pid}");
+
+        assert!(
+            wait_for(BOOT_TIMEOUT, || port_open(TEST_PORT)),
+            "webui did not open port {TEST_PORT} within {BOOT_TIMEOUT:?}"
+        );
+        assert_eq!(webui_status(TEST_PORT), 200, "webui not serving HTTP 200");
+        eprintln!("webui up on {TEST_PORT}: HTTP 200");
+
+        // Settle on the baseline (Manager-only) count before clicking, so a
+        // transient startup child can never satisfy the Start check.
+        assert!(
+            wait_for(Duration::from_secs(30), || {
+                scheduler_child_count(backend_pid, reload) <= 1
+            }),
+            "scheduler child count never settled to baseline"
+        );
+        let baseline = scheduler_child_count(backend_pid, reload);
+        eprintln!("baseline scheduler child count = {baseline}");
+
+        // ---- START ----
+        eprintln!("click_scheduler(Start)");
+        click_scheduler(TEST_PORT, SchedulerAction::Start, &labels_zh(), CLICK_TIMEOUT)
+            .expect("click_scheduler(Start) failed");
+        let started = wait_scheduler_count(
+            "after Start",
+            backend_pid,
+            reload,
+            START_TIMEOUT,
+            scheduler_alive,
+        );
+        assert!(
+            scheduler_alive(started),
+            "scheduler child never appeared within {START_TIMEOUT:?}"
+        );
+        assert_eq!(
+            webui_status(TEST_PORT),
+            200,
+            "webui died while scheduler running"
+        );
+        eprintln!("scheduler STARTED: child count {started}, webui still 200");
+
+        // ---- STOP ----
+        eprintln!("click_scheduler(Stop)");
+        click_scheduler(TEST_PORT, SchedulerAction::Stop, &labels_zh(), CLICK_TIMEOUT)
+            .expect("click_scheduler(Stop) failed");
+        let stopped = wait_scheduler_count(
+            "after Stop",
+            backend_pid,
+            reload,
+            STOP_TIMEOUT,
+            |count| !scheduler_alive(count),
+        );
+        assert!(
+            !scheduler_alive(stopped),
+            "scheduler child did not disappear within {STOP_TIMEOUT:?}"
+        );
+        assert_eq!(webui_status(TEST_PORT), 200, "webui died after scheduler stop");
+        eprintln!("scheduler STOPPED: child count {stopped}, webui still 200");
+        eprintln!(
+            "live backend ({LIVE_PORT}) still listening = {}",
+            port_open(LIVE_PORT)
+        );
+
+        drop(guard);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !port_open(TEST_PORT),
+            "port {TEST_PORT} still open after guard cleanup"
+        );
+        eprintln!(
+            "cleanup verified: port {TEST_PORT} closed; live {LIVE_PORT} intact = {}",
+            port_open(LIVE_PORT)
+        );
     }
 }
