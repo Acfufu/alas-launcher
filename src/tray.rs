@@ -103,6 +103,8 @@ pub fn build_tray(
         // discriminator outside Running).
         None,
         &status_line_for(&initial, None, &labels),
+        // No click in flight at startup.
+        false,
     )?;
 
     let thread_shared = shared.clone();
@@ -173,10 +175,12 @@ pub fn build_tray(
 /// (Re)build the whole menu from the current backend state, task cache and
 /// task-section rendering. The status item is always disabled; the toggle
 /// item's text/enabled follow the state machine (Initializing disables it
-/// entirely; the toggle text additionally follows the scheduler scan —
-/// `scheduler_alive` None on the initial build). Task items are read-only
-/// (disabled): group headers id `group-running|queued|waiting`, task rows id
-/// `task-{i}`.
+/// entirely; `processing` — a scheduler-control click in flight — shows the
+/// localized 处理中… label and disables the item; the toggle text otherwise
+/// follows the scheduler scan — `scheduler_alive` None on the initial build).
+/// Task items are read-only (disabled): group headers id
+/// `group-running|queued|waiting`, task rows id `task-{i}`.
+#[allow(clippy::too_many_arguments)] // 8 orthogonal render inputs; a struct would obscure the call sites
 fn build_menu(
     app: &AppHandle,
     snapshot: &BackendStateSnapshot,
@@ -185,13 +189,19 @@ fn build_menu(
     labels: &ControlLabels,
     scheduler_alive: Option<bool>,
     status_line: &str,
+    processing: bool,
 ) -> tauri::Result<Menu<tauri::Wry>> {
     let status = MenuItem::with_id(app, "tray-status", status_line, false, None::<&str>)?;
+    let toggle_text = if processing {
+        labels.processing.clone()
+    } else {
+        toggle_label(snapshot.status, scheduler_alive, labels)
+    };
     let toggle = MenuItem::with_id(
         app,
         "tray-toggle",
-        toggle_label(snapshot.status, scheduler_alive, labels),
-        toggle_enabled(snapshot.status),
+        toggle_text,
+        toggle_enabled(snapshot.status, processing),
         None::<&str>,
     )?;
     let separator_after_toggle = PredefinedMenuItem::separator(app)?;
@@ -351,7 +361,13 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
                 Ok(()) => {
                     navigate_main(app, main_page_url(BackendStatus::Running, port, &labels));
                     if ws_available {
-                        spawn_scheduler_click(port, SchedulerAction::Start, labels.clone(), guard);
+                        spawn_scheduler_click(
+                            port,
+                            SchedulerAction::Start,
+                            labels.clone(),
+                            guard,
+                            shared.refresh.clone(),
+                        );
                     }
                 }
                 Err(e) => {
@@ -371,7 +387,13 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
                 ToggleAction::StopScheduler => SchedulerAction::Stop,
                 _ => SchedulerAction::Start,
             };
-            spawn_scheduler_click(port, scheduler_action, labels.clone(), guard);
+            spawn_scheduler_click(
+                port,
+                scheduler_action,
+                labels.clone(),
+                guard,
+                shared.refresh.clone(),
+            );
         }
     }
     // Rebuild must include the task section so a toggle never wipes it. The
@@ -416,19 +438,26 @@ fn try_acquire_in_flight(flag: &Arc<AtomicBool>) -> Option<InFlightGuard> {
 /// never touches `TrayShared` or tauri, only the pure
 /// [`click_scheduler`] channel. The in-flight guard moves into the closure.
 /// A click failure only warns (the poll thread self-heals the status line).
+/// On exit (Ok or Err) the guard clears first, then `refresh` wakes the poll
+/// thread so the 处理中… toggle is replaced by the real state immediately.
 fn spawn_scheduler_click(
     port: u16,
     action: SchedulerAction,
     labels: ControlLabels,
     guard: InFlightGuard,
+    refresh: mpsc::Sender<()>,
 ) {
     if let Err(e) = std::thread::Builder::new()
         .name("scheduler-click".into())
         .spawn(move || {
-            let _guard = guard;
+            let guard = guard;
             if let Err(e) = click_scheduler(port, action, &labels, SCHEDULER_CLICK_TIMEOUT) {
                 warn!("Scheduler control via WebSocket failed: {e:#}");
             }
+            // Clear the in-flight flag BEFORE the wake, so the rebuild the
+            // poll thread runs on this signal already sees the finished state.
+            drop(guard);
+            let _ = refresh.send(());
         })
     {
         warn!("Failed to spawn scheduler-click worker: {e}");
@@ -443,7 +472,19 @@ fn rebuild_menu(app: &AppHandle, shared: &TrayShared, section: TaskSection, sche
     let tasks = shared.tasks.lock().unwrap().clone();
     let labels = load_control_labels();
     let status_line = status_line_for(&snapshot, scheduler_alive, &labels);
-    let Ok(menu) = build_menu(app, &snapshot, &tasks, section, &labels, scheduler_alive, &status_line)
+    // Processing = a scheduler-control click is in flight; rebuilds during
+    // that window render the disabled 处理中… toggle instead of the real one.
+    let processing = shared.in_flight.load(Ordering::Relaxed);
+    let Ok(menu) = build_menu(
+        app,
+        &snapshot,
+        &tasks,
+        section,
+        &labels,
+        scheduler_alive,
+        &status_line,
+        processing,
+    )
     else {
         return;
     };
