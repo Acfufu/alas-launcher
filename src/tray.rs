@@ -445,29 +445,18 @@ pub(crate) fn task_section(status: BackendStatus, fetch: Result<Vec<Task>, ()>) 
     }
 }
 
-/// Name-set difference between the old and new task lists, used to decide
-/// whether a rebuild is needed. Returned ids are positional in the OLD list
-/// (`task-{i}`); returned tasks come from NEW (command not present in OLD).
-/// Both empty => no structural change => caller skips the rebuild.
+/// Whether the command-name set differs between the old and new task lists,
+/// used to decide whether a rebuild is needed. True iff any command in OLD is
+/// missing from NEW, or any command in NEW is missing from OLD.
 ///
 /// Identity is the `command` key, NOT the display `name`: names come from the
 /// i18n file (`Task.<command>.name`) and can change with the webui language,
 /// while the command equals the stable alas.json top-level key.
-pub(crate) fn menu_diff(old: &[Task], new: &[Task]) -> (Vec<String>, Vec<Task>) {
+pub(crate) fn menu_diff_changed(old: &[Task], new: &[Task]) -> bool {
     let new_commands: HashSet<&str> = new.iter().map(|t| t.command.as_str()).collect();
-    let to_remove = old
-        .iter()
-        .enumerate()
-        .filter(|(_, t)| !new_commands.contains(t.command.as_str()))
-        .map(|(i, _)| format!("task-{i}"))
-        .collect();
     let old_commands: HashSet<&str> = old.iter().map(|t| t.command.as_str()).collect();
-    let to_add: Vec<Task> = new
-        .iter()
-        .filter(|t| !old_commands.contains(t.command.as_str()))
-        .cloned()
-        .collect();
-    (to_remove, to_add)
+    old.iter().any(|t| !new_commands.contains(t.command.as_str()))
+        || new.iter().any(|t| !old_commands.contains(t.command.as_str()))
 }
 
 /// One poll cycle: snapshot the status (no network under the lock), fetch
@@ -497,11 +486,8 @@ fn poll_once(
 
     let tasks_changed = match &fetched {
         Ok(tasks) => {
-            let (to_remove, to_add) = {
-                let cached = shared.tasks.lock().unwrap();
-                menu_diff(&cached, tasks)
-            };
-            !(to_remove.is_empty() && to_add.is_empty())
+            let cached = shared.tasks.lock().unwrap();
+            menu_diff_changed(&cached, tasks)
         }
         Err(()) => false,
     };
@@ -622,21 +608,18 @@ mod tests {
             Task {
                 name: "战术学院".into(),
                 command: "Tactical".into(),
-                enabled: true,
                 status: alas_tasks::TaskStatus::Running,
                 next_time: Some("2026-08-10 20:14:24".into()),
             },
             Task {
                 name: "大舰队".into(),
                 command: "Guild".into(),
-                enabled: true,
                 status: alas_tasks::TaskStatus::Queued,
                 next_time: Some("2026-08-10 21:00:00".into()),
             },
             Task {
                 name: "演习".into(),
                 command: "Exercise".into(),
-                enabled: true,
                 status: alas_tasks::TaskStatus::Waiting,
                 next_time: Some("2026-08-11 00:00:00".into()),
             },
@@ -672,14 +655,12 @@ mod tests {
             Task {
                 name: "演习".into(),
                 command: "Exercise".into(),
-                enabled: true,
                 status: alas_tasks::TaskStatus::Waiting,
                 next_time: Some("2026-08-11 00:00:00".into()),
             },
             Task {
                 name: "主线图-2".into(),
                 command: "Main2".into(),
-                enabled: true,
                 status: alas_tasks::TaskStatus::Waiting,
                 next_time: Some("2026-08-11 06:00:00".into()),
             },
@@ -712,21 +693,18 @@ mod tests {
             Task {
                 name: "战术学院".into(),
                 command: "Tactical".into(),
-                enabled: true,
                 status: alas_tasks::TaskStatus::Running,
                 next_time: Some("2026-08-10 20:14:24".into()),
             },
             Task {
                 name: "大舰队".into(),
                 command: "Guild".into(),
-                enabled: true,
                 status: alas_tasks::TaskStatus::Queued,
                 next_time: Some("2026-08-10 21:00:00".into()),
             },
             Task {
                 name: "演习".into(),
                 command: "Exercise".into(),
-                enabled: true,
                 status: alas_tasks::TaskStatus::Waiting,
                 next_time: Some("2026-08-11 00:00:00".into()),
             },
@@ -750,7 +728,6 @@ mod tests {
             .map(|i| Task {
                 name: format!("任务-{i}"),
                 command: format!("Task{i}"),
-                enabled: true,
                 status: alas_tasks::TaskStatus::Waiting,
                 next_time: Some(format!("2026-08-11 0{i}:00:00")),
             })
@@ -778,14 +755,12 @@ mod tests {
             Task {
                 name: "战术学院".into(),
                 command: "Tactical".into(),
-                enabled: true,
                 status: alas_tasks::TaskStatus::Running,
                 next_time: Some("2026-08-10 20:14:24".into()),
             },
             Task {
                 name: "演习".into(),
                 command: "Exercise".into(),
-                enabled: true,
                 status: alas_tasks::TaskStatus::Waiting,
                 next_time: Some("2026-08-11 00:00:00".into()),
             },
@@ -814,21 +789,18 @@ mod tests {
             Task {
                 name: "战术学院".into(),
                 command: "Tactical".into(),
-                enabled: true,
                 status: alas_tasks::TaskStatus::Running,
                 next_time: Some("2026-08-10 20:14:24".into()),
             },
             Task {
                 name: "大舰队".into(),
                 command: "Guild".into(),
-                enabled: true,
                 status: alas_tasks::TaskStatus::Queued,
                 next_time: Some("2026-08-10 21:00:00".into()),
             },
             Task {
                 name: "演习".into(),
                 command: "Exercise".into(),
-                enabled: true,
                 status: alas_tasks::TaskStatus::Waiting,
                 next_time: Some("2026-08-11 00:00:00".into()),
             },
@@ -869,103 +841,83 @@ mod tests {
     }
 
     #[test]
-    fn menu_diff_unchanged_is_empty() {
+    fn menu_diff_changed_unchanged_is_false() {
         let old = vec![Task {
             name: "每日任务".into(),
             command: "Daily".into(),
-            enabled: true,
             ..Default::default()
         }];
         // Same command set (status changed) -> no structural change.
         let new = vec![Task {
             name: "每日任务".into(),
             command: "Daily".into(),
-            enabled: true,
             status: alas_tasks::TaskStatus::Waiting,
             next_time: Some("2026-08-11 00:00:00".into()),
         }];
-        assert_eq!(menu_diff(&old, &new), (vec![], vec![]));
-        assert_eq!(menu_diff(&[], &[]), (vec![], vec![]));
+        assert!(!menu_diff_changed(&old, &new));
+        assert!(!menu_diff_changed(&[], &[]));
     }
 
     #[test]
-    fn menu_diff_add_scenario() {
+    fn menu_diff_changed_add_scenario() {
         let old: Vec<Task> = vec![];
         let new = vec![
             Task {
                 name: "每日任务".into(),
                 command: "Daily".into(),
-                enabled: true,
                 ..Default::default()
             },
             Task {
                 name: "困难图".into(),
                 command: "Hard".into(),
-                enabled: false,
                 ..Default::default()
             },
         ];
-        let (to_remove, to_add) = menu_diff(&old, &new);
-        assert!(to_remove.is_empty());
-        assert_eq!(to_add.len(), 2);
-        assert_eq!(to_add[0].command, "Daily");
-        assert_eq!(to_add[1].command, "Hard");
+        assert!(menu_diff_changed(&old, &new));
     }
 
     #[test]
-    fn menu_diff_remove_scenario() {
+    fn menu_diff_changed_remove_scenario() {
         let old = vec![
             Task {
                 name: "每日任务".into(),
                 command: "Daily".into(),
-                enabled: true,
                 ..Default::default()
             },
             Task {
                 name: "战术学院".into(),
                 command: "Tactical".into(),
-                enabled: true,
                 ..Default::default()
             },
             Task {
                 name: "大舰队".into(),
                 command: "Guild".into(),
-                enabled: true,
                 ..Default::default()
             },
         ];
         let new = vec![Task {
             name: "战术学院".into(),
             command: "Tactical".into(),
-            enabled: true,
             ..Default::default()
         }];
-        let (to_remove, to_add) = menu_diff(&old, &new);
-        // Positional ids in the OLD list: Daily=0, Guild=2.
-        assert_eq!(
-            to_remove,
-            vec!["task-0".to_string(), "task-2".to_string()]
-        );
-        assert!(to_add.is_empty());
+        assert!(menu_diff_changed(&old, &new));
     }
 
     #[test]
-    fn menu_diff_same_commands_different_names_no_change() {
+    fn menu_diff_changed_same_commands_different_names_no_change() {
         // i18n display names may change (e.g. webui language switch) while
         // commands stay stable — identity must be the command.
         let old = vec![Task {
             name: "主线图".into(),
             command: "Main".into(),
-            enabled: true,
             ..Default::default()
         }];
         let new = vec![Task {
             name: "Main".into(), // i18n gone -> name falls back to command
             command: "Main".into(),
-            enabled: true,
             ..Default::default()
         }];
-        assert_eq!(menu_diff(&old, &new), (vec![], vec![]));
+        assert!(!menu_diff_changed(&old, &new));
     }
 
     #[test]
@@ -973,7 +925,6 @@ mod tests {
         let one = vec![Task {
             name: "每日任务".into(),
             command: "Daily".into(),
-            enabled: true,
             ..Default::default()
         }];
         assert_eq!(

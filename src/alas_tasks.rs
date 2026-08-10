@@ -36,6 +36,8 @@ use anyhow::{anyhow, Result};
 use tracing::warn;
 
 /// A single ALAS scheduler task as shown (read-only) in the tray menu.
+/// Enabled-ness is implicit post-parse: [`parse_tasks_alas_json`] only yields
+/// enabled tasks (disabled ones are skipped, like the webui).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Task {
     /// Display name from i18n (`Task.<command>.name`), command key as fallback.
@@ -43,8 +45,6 @@ pub struct Task {
     /// `Scheduler.Command` — equals the top-level alas.json key. Stable
     /// identity for menu diffs (display names are i18n-dependent).
     pub command: String,
-    /// `Scheduler.Enable` (only enabled tasks are listed).
-    pub enabled: bool,
     /// Running / Queued / Waiting, per [`classify`] + fetch-time post-processing.
     pub status: TaskStatus,
     /// `Scheduler.NextRun` — `"YYYY-MM-DD HH:MM:SS"` (None when absent).
@@ -56,7 +56,6 @@ impl Default for Task {
         Task {
             name: String::new(),
             command: String::new(),
-            enabled: false,
             status: TaskStatus::Waiting,
             next_time: None,
         }
@@ -99,7 +98,7 @@ pub fn classify(next_time: Option<&str>, now_str: &str) -> TaskStatus {
 /// never take the task menu down — names fall back to command keys).
 /// Garbage content that fails to parse is an `Err` for direct callers;
 /// [`fetch_tasks`] swallows it.
-pub fn parse_i18n(content: &str) -> Result<serde_json::Value> {
+fn parse_i18n(content: &str) -> Result<serde_json::Value> {
     if content.trim().is_empty() {
         return Ok(serde_json::Value::Object(serde_json::Map::new()));
     }
@@ -153,7 +152,6 @@ pub fn parse_tasks_alas_json(
         tasks.push(Task {
             name,
             command: command.clone(),
-            enabled: true,
             status: classify(next_time.as_deref(), now_str),
             next_time,
         });
@@ -330,7 +328,6 @@ mod tests {
             &Task {
                 name: "演习".into(),
                 command: "Exercise".into(),
-                enabled: true,
                 status: TaskStatus::Waiting, // 2026-08-11 00:00:00 > now
                 next_time: Some("2026-08-11 00:00:00".into()),
             }
@@ -348,7 +345,6 @@ mod tests {
         assert_eq!(guild.status, TaskStatus::Running);
 
         // Disabled / non-scheduler entries never appear.
-        assert!(tasks.iter().all(|t| t.enabled));
         assert!(!tasks.iter().any(|t| t.command == "Main" || t.command == "GemsFarming"));
     }
 
@@ -471,8 +467,10 @@ mod tests {
 
     /// Reads the REAL installed ALAS payload when present (read-only) and
     /// prints the parsed task list — the real-surface proof that the parser
-    /// handles the live file. Skipped (with a note) when the payload is not
-    /// installed on this machine.
+    /// handles the live file. Ignored by default (passes vacuously when the
+    /// payload is not installed on this machine); run manually with
+    /// `cargo test fetch_tasks_real_payload_if_present -- --ignored --nocapture`.
+    #[ignore]
     #[test]
     fn fetch_tasks_real_payload_if_present() {
         let payload = Path::new("/Applications/AzurLaneAutoScript.app/Contents/AzurLaneAutoScript");

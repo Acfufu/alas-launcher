@@ -1,4 +1,4 @@
-// No default console window createion on Windows
+// No default console window creation on Windows
 #![windows_subsystem = "windows"]
 
 // Consumed only by the macOS tray (tray.rs); gated so win/linux builds do not
@@ -221,7 +221,6 @@ if (!window.alas_launcher_injected) {
             const reader = new FileReader();
             reader.onload = async () => {
                 const data = reader.result.split(',')[1];
-                console.log(data);
                 window.__TAURI__.core.invoke('save_as', { filename, data });
             };
             reader.readAsDataURL(blob);
