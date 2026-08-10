@@ -99,8 +99,9 @@ pub fn build_tray(
         TaskSection::Empty,
         &labels,
         // No scheduler scan at startup: a fresh Stopped snapshot renders the
-        // stopped label regardless (status_line_for ignores the discriminator
-        // outside Running).
+        // stopped label regardless (toggle_label/status_line_for ignore the
+        // discriminator outside Running).
+        None,
         &status_line_for(&initial, None, &labels),
     )?;
 
@@ -172,21 +173,24 @@ pub fn build_tray(
 /// (Re)build the whole menu from the current backend state, task cache and
 /// task-section rendering. The status item is always disabled; the toggle
 /// item's text/enabled follow the state machine (Initializing disables it
-/// entirely). Task items are read-only (disabled): group headers id
-/// `group-running|queued|waiting`, task rows id `task-{i}`.
+/// entirely; the toggle text additionally follows the scheduler scan —
+/// `scheduler_alive` None on the initial build). Task items are read-only
+/// (disabled): group headers id `group-running|queued|waiting`, task rows id
+/// `task-{i}`.
 fn build_menu(
     app: &AppHandle,
     snapshot: &BackendStateSnapshot,
     tasks: &[Task],
     section: TaskSection,
     labels: &ControlLabels,
+    scheduler_alive: Option<bool>,
     status_line: &str,
 ) -> tauri::Result<Menu<tauri::Wry>> {
     let status = MenuItem::with_id(app, "tray-status", status_line, false, None::<&str>)?;
     let toggle = MenuItem::with_id(
         app,
         "tray-toggle",
-        toggle_label(snapshot.status, labels),
+        toggle_label(snapshot.status, scheduler_alive, labels),
         toggle_enabled(snapshot.status),
         None::<&str>,
     )?;
@@ -373,15 +377,16 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
     // Rebuild must include the task section so a toggle never wipes it. The
     // section derives from the POST-action state (fresh snapshot + cached
     // tasks): a Stop shows the degraded section, a Start shows the cache.
-    // Scheduler liveness is unknown here (no process scan on the UI thread);
-    // None renders the conservative stopped word — the poll thread corrects
-    // within one cycle.
+    // The toggle label uses the click-time scheduler scan computed above:
+    // a Stop click (scheduler still alive at click time) shows 停止 until
+    // the worker's click lands, a Start shows 启动 — the poll thread
+    // corrects within one cycle.
     let tasks = shared.tasks.lock().unwrap().clone();
     rebuild_menu(
         app,
         shared,
         task_section(shared.backend.snapshot().status, Ok(tasks)),
-        None,
+        Some(scheduler_alive),
     );
 }
 
@@ -438,7 +443,8 @@ fn rebuild_menu(app: &AppHandle, shared: &TrayShared, section: TaskSection, sche
     let tasks = shared.tasks.lock().unwrap().clone();
     let labels = load_control_labels();
     let status_line = status_line_for(&snapshot, scheduler_alive, &labels);
-    let Ok(menu) = build_menu(app, &snapshot, &tasks, section, &labels, &status_line) else {
+    let Ok(menu) = build_menu(app, &snapshot, &tasks, section, &labels, scheduler_alive, &status_line)
+    else {
         return;
     };
     if let Some(tray) = app.tray_by_id("main-tray") {
