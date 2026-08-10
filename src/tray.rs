@@ -29,7 +29,7 @@ use crate::{
     alas_tasks::{self, Task},
     backend::{toggle_decision, BackendLifecycle, BackendStateSnapshot, BackendStatus, ToggleAction},
     menu_model::{
-        menu_diff_changed, status_text, task_section, task_section_items, toggle_enabled,
+        poll_decision, status_text, task_section, task_section_items, toggle_enabled,
         toggle_label, TaskMenuItem, TaskSection,
     },
 };
@@ -39,13 +39,16 @@ use crate::{
 const TRAY_POLL_INTERVAL_SECS: Duration = Duration::from_secs(10);
 
 /// Everything the tray menu needs beyond the AppHandle: the backend state
-/// (shared with main.rs), the cached task list, the stop flag (shared with
-/// main.rs so ExitRequested can halt the poll thread) and the refresh signal
-/// channel (manual Refresh menu item).
+/// (shared with main.rs), the cached task list, the resolved webui language
+/// (read ONCE from deploy.yaml at build time — it selects the i18n file for
+/// task display names), the stop flag (shared with main.rs so ExitRequested
+/// can halt the poll thread) and the refresh signal channel (manual Refresh
+/// menu item).
 #[derive(Clone)]
 struct TrayShared {
     backend: Arc<BackendLifecycle>,
     tasks: Arc<Mutex<Vec<Task>>>,
+    language: String,
     stop: Arc<AtomicBool>,
     refresh: mpsc::Sender<()>,
 }
@@ -64,9 +67,13 @@ pub fn build_tray(
     stop: Arc<AtomicBool>,
 ) -> tauri::Result<tauri::tray::TrayIcon> {
     let (refresh_tx, refresh_rx) = mpsc::channel::<()>();
+    // deploy.yaml is read once here, not per poll cycle: the language only
+    // changes on app restart anyway (Gui.Language).
+    let language = deploy_language().unwrap_or_else(|| "zh-CN".to_string());
     let shared = TrayShared {
         backend,
         tasks: Arc::new(Mutex::new(Vec::new())),
+        language,
         stop,
         refresh: refresh_tx,
     };
@@ -279,40 +286,40 @@ fn rebuild_menu(app: &AppHandle, shared: &TrayShared, section: TaskSection) {
 }
 
 /// One poll cycle: snapshot the status (no network under the lock), fetch
-/// outside any lock when Running, then rebuild only when the rendered section
-/// kind or the task command set changed (anti-flicker). `last_section` tracks
-/// what the menu currently renders.
+/// outside any lock when Running, then let the pure decision in
+/// [`poll_decision`] pick the section / rebuild / cache replacement.
+/// `last_section` tracks what the menu currently renders.
 fn poll_once(app: &AppHandle, shared: &TrayShared, last_section: &mut TaskSection) {
     // (a) status snapshot — no I/O under the backend lock (the lock is
     // internal to BackendLifecycle; status() takes it briefly).
     let status = shared.backend.status();
 
     // (b/c) Running -> fetch outside any lock; anything else -> degraded.
-    // Tasks are read from the payload files (config/alas.json + i18n — the
-    // ALAS webui has no JSON API, see alas_tasks module doc).
+    // A failed clock (now_str Err) also degrades — never a silent
+    // all-Waiting menu (the 9999-12-31 sentinel bug). Tasks are read from the
+    // payload files (config/alas.json + i18n — the ALAS webui has no JSON
+    // API, see alas_tasks module doc).
     let fetched: Result<Vec<Task>, ()> = if status == BackendStatus::Running {
         let alas_dir = std::env::current_dir().unwrap_or_default();
-        let language = deploy_language().unwrap_or_else(|| "zh-CN".to_string());
-        alas_tasks::fetch_tasks(&alas_dir, &alas_tasks::now_str(), &language).map_err(|_| ())
+        match alas_tasks::now_str() {
+            // Clock failure -> Err(()) like a fetch failure (now_str already
+            // logged the real error); poll_decision degrades the section.
+            Ok(now) => alas_tasks::fetch_tasks(&alas_dir, &now, &shared.language).map_err(|_| ()),
+            Err(_) => Err(()),
+        }
     } else {
         Err(())
     };
-    let section = task_section(status, fetched.clone());
 
-    let tasks_changed = match &fetched {
-        Ok(tasks) => {
-            let cached = shared.tasks.lock().unwrap();
-            menu_diff_changed(&cached, tasks)
-        }
-        Err(()) => false,
-    };
-
-    if *last_section != section || tasks_changed {
-        if let Ok(tasks) = fetched {
-            *shared.tasks.lock().unwrap() = tasks;
-        }
-        rebuild_menu(app, shared, section);
-        *last_section = section;
+    // Decision is pure (menu_model::poll_decision): the clock string and the
+    // fetch result are injected, so this call site carries no decision logic.
+    let outcome = poll_decision(status, fetched, *last_section, &shared.tasks.lock().unwrap());
+    if let Some(tasks) = outcome.replace_cache {
+        *shared.tasks.lock().unwrap() = tasks;
+    }
+    if outcome.changed {
+        rebuild_menu(app, shared, outcome.section);
+        *last_section = outcome.section;
     }
 }
 
