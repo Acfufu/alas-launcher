@@ -1,6 +1,9 @@
 // No default console window createion on Windows
 #![windows_subsystem = "windows"]
 
+// Consumed only by the macOS tray (tray.rs); gated so win/linux builds do not
+// compile an unused module (clippy -D warnings).
+#[cfg(target_os = "macos")]
 mod alas_tasks;
 mod backend;
 #[cfg(target_os = "macos")]
@@ -10,7 +13,10 @@ mod window_util;
 
 use std::{
     fs,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread::{self},
 };
 
@@ -52,6 +58,10 @@ fn main() -> Result<()> {
 
     let backend = Arc::new(Mutex::new(BackendState::default()));
     let setup_backend = backend.clone();
+    // Stop flag for the tray poll thread; set in ExitRequested so the thread
+    // never calls set_menu on a disposed tray (Metis MAJOR-4).
+    let tray_stop = Arc::new(AtomicBool::new(false));
+    let setup_tray_stop = tray_stop.clone();
 
     info!("Starting Webview...");
     tauri::Builder::default()
@@ -75,7 +85,7 @@ fn main() -> Result<()> {
             .on_page_load(page_load_injector)
             .build()?;
             #[cfg(target_os = "macos")]
-            if let Err(e) = crate::tray::build_tray(app, setup_backend.clone(), port) {
+            if let Err(e) = crate::tray::build_tray(app, setup_backend.clone(), port, setup_tray_stop.clone()) {
                 warn!("tray failed: {e}");
             }
             Ok(())
@@ -139,6 +149,9 @@ fn main() -> Result<()> {
                 }
                 tauri::RunEvent::ExitRequested { .. } => {
                     info!("Webview closed, shutting down backend...");
+                    // Stop the tray poll thread BEFORE terminating the backend:
+                    // it must never set_menu on a disposed tray (Metis MAJOR-4).
+                    tray_stop.store(true, Ordering::Relaxed);
                     let mut state = backend.lock().unwrap();
                     if let Some(ref mut b) = state.backend {
                         if let Err(e) = b.terminate() {

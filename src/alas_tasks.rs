@@ -19,7 +19,6 @@
 //! 组装"), so the real webui endpoint names cannot be verified here.
 //! [`CANDIDATE_PATHS`] is therefore provisional; the confirmation procedure
 //! is documented in `.omo/evidence/task-5-alas-tray-menu.md`.
-#![allow(dead_code)] // consumed by todo 6 (tray poll thread); unreferenced until then
 
 use std::{
     io::{Read, Write},
