@@ -172,9 +172,25 @@ pub fn poll_decision(
 }
 
 /// Text of the Start/Stop toggle item.
-pub fn toggle_label(status: BackendStatus, labels: &ControlLabels) -> String {
+///
+/// "停止" (labels.stop) only while the backend is Running AND the scheduler
+/// scan confirms liveness (`Some(true)`); every other combination shows
+/// "启动" (labels.start) — Running with a scan result of `Some(false)` or
+/// an unknown scan (`None`) never claims the scheduler is running
+/// (conservative, same rule as [`status_line_for`]).
+pub fn toggle_label(
+    status: BackendStatus,
+    scheduler_alive: Option<bool>,
+    labels: &ControlLabels,
+) -> String {
     match status {
-        BackendStatus::Running => labels.stop.clone(),
+        BackendStatus::Running => {
+            if scheduler_alive == Some(true) {
+                labels.stop.clone()
+            } else {
+                labels.start.clone()
+            }
+        }
         BackendStatus::Stopped | BackendStatus::Initializing => labels.start.clone(),
     }
 }
@@ -326,18 +342,38 @@ mod tests {
 
     #[test]
     fn toggle_label_matrix() {
-        // The toggle shows the labels table's stop/start words per status,
-        // for every supported language.
+        // The toggle shows the stop word only when the backend is Running AND
+        // the scheduler scan confirms liveness; every other combination shows
+        // start (Running + unknown scan is conservative: never claim running).
         for lang in ["zh-CN", "zh-TW", "en-US", "ja-JP"] {
             let labels = expected_labels(lang);
-            assert_eq!(toggle_label(BackendStatus::Running, &labels), labels.stop, "lang {lang}");
             assert_eq!(
-                toggle_label(BackendStatus::Stopped, &labels),
+                toggle_label(BackendStatus::Running, Some(true), &labels),
+                labels.stop,
+                "lang {lang}"
+            );
+            assert_eq!(
+                toggle_label(BackendStatus::Running, Some(false), &labels),
                 labels.start,
                 "lang {lang}"
             );
             assert_eq!(
-                toggle_label(BackendStatus::Initializing, &labels),
+                toggle_label(BackendStatus::Running, None, &labels),
+                labels.start,
+                "lang {lang}"
+            );
+            assert_eq!(
+                toggle_label(BackendStatus::Stopped, Some(true), &labels),
+                labels.start,
+                "lang {lang}"
+            );
+            assert_eq!(
+                toggle_label(BackendStatus::Stopped, None, &labels),
+                labels.start,
+                "lang {lang}"
+            );
+            assert_eq!(
+                toggle_label(BackendStatus::Initializing, Some(false), &labels),
                 labels.start,
                 "lang {lang}"
             );
