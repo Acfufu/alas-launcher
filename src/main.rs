@@ -6,6 +6,10 @@
 #[cfg(target_os = "macos")]
 mod alas_tasks;
 mod backend;
+// Typed reads of config/deploy.yaml (WebuiPort / Gui.Language /
+// EnableReload / ws credentials). Cross-platform — setup.rs
+// `get_deploy_config` is ungated, so this module is too.
+mod deploy_config;
 // Pure tray menu model (no tauri). Gated to macOS only because its sole
 // macOS-bound dependency, alas_tasks (above), is gated too — a plain
 // declaration would break win/linux builds.
@@ -48,7 +52,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     backend::BackendLifecycle,
-    setup::{get_deploy_config, setup_alas_repo, setup_environment},
+    setup::{setup_alas_repo, setup_environment},
 };
 
 fn main() -> Result<()> {
@@ -62,16 +66,7 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     setup_environment()?;
 
-    let port = get_deploy_config()
-        .as_ref()
-        .and_then(|config| config.get("Deploy"))
-        .and_then(|deploy| deploy.get("Webui"))
-        .and_then(|webui| webui.get("WebuiPort"))
-        .and_then(|port| port.as_u64());
-    if port.is_none() {
-        warn!("WebuiPort not found in config, using default port 22267");
-    }
-    let port = port.unwrap_or(22267) as u16;
+    let port = crate::deploy_config::webui_port();
 
     let backend = Arc::new(BackendLifecycle::default());
     let setup_backend = backend.clone();
@@ -163,7 +158,7 @@ fn main() -> Result<()> {
                     &setup_shell_settings
                         .lock()
                         .unwrap()
-                        .resolved_language(deploy_language().as_deref()),
+                        .resolved_language(crate::deploy_config::language().as_deref()),
                 );
                 let menu_handles: Option<crate::shell_menu::SettingsMenuHandles> =
                     match crate::shell_menu::build_settings_menu(
@@ -185,9 +180,10 @@ fn main() -> Result<()> {
                 // App-level menu events (settings-* ids). Independent from the
                 // tray's own on_menu_event (tray-* ids, tray.rs:119).
                 // settings-lang-* is the todo-4 LIVE language switch: main.rs
-                // owns deploy_language(), the backend, the port and the tray
-                // refresh sender, so it orchestrates here and shell_menu.rs
-                // stays menu-build + label-computation only.
+                // owns the deploy language (deploy_config module), the backend,
+                // the port and the tray refresh sender, so it orchestrates
+                // here and shell_menu.rs stays menu-build + label-computation
+                // only.
                 let menu_shell_settings = setup_shell_settings.clone();
                 let menu_backend = setup_backend.clone();
                 app.on_menu_event(move |app, event| match event.id().as_ref() {
@@ -198,7 +194,7 @@ fn main() -> Result<()> {
                             &menu_shell_settings
                                 .lock()
                                 .unwrap()
-                                .resolved_language(deploy_language().as_deref()),
+                                .resolved_language(crate::deploy_config::language().as_deref()),
                         );
                         crate::shell_menu::spawn_check_update(app, &menu_shell_settings, labels);
                     }
@@ -226,7 +222,7 @@ fn main() -> Result<()> {
                         // (b) Relabel + re-check the INSTALLED app menu in
                         // place (muda handles update the macOS bar live).
                         let labels = crate::menu_model::shell_menu_labels(
-                            &updated.resolved_language(deploy_language().as_deref()),
+                            &updated.resolved_language(crate::deploy_config::language().as_deref()),
                         );
                         if let Some(handles) = &menu_handles {
                             if let Err(e) = handles.apply_labels(&labels, &updated) {
@@ -412,20 +408,6 @@ fn main() -> Result<()> {
         });
     Ok(())
 }
-/// Webui language from `config/deploy.yaml` (`Gui.Language`), which selects
-/// the label tables; zh-CN fallback via `ShellSettings::resolved_language`.
-/// Replicated from the private `tray::deploy_language` (tray.rs:615) so this
-/// todo's commit stages only shell_menu.rs + main.rs (decision recorded in
-/// evidence task-3-shell-settings-menu.md).
-#[cfg(target_os = "macos")]
-fn deploy_language() -> Option<String> {
-    get_deploy_config()?
-        .get("Gui")?
-        .get("Language")?
-        .as_str()
-        .map(String::from)
-}
-
 #[tauri::command]
 fn save_as(app_handle: tauri::AppHandle, filename: &str, data: &str) {
     match BASE64_STANDARD.decode(data) {

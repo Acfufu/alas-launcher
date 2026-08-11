@@ -815,11 +815,14 @@ mod real_payload_tests {
 
     /// `Deploy.Update.EnableReload` from config/deploy.yaml (true when
     /// missing — the ALAS default): decides which process is the uvicorn.
+    /// Kept as a payload-path mirror (QA runs against an arbitrary installed
+    /// payload, not the launcher cwd) but the traversal itself is delegated
+    /// to the shared `deploy_config` module so the mirror cannot drift.
     fn deploy_enable_reload(payload: &Path) -> bool {
         std::fs::read_to_string(payload.join("config").join("deploy.yaml"))
             .ok()
             .and_then(|s| serde_yaml::from_str::<Value>(&s).ok())
-            .and_then(|c| c["Deploy"]["Update"]["EnableReload"].as_bool())
+            .map(|c| crate::deploy_config::DeployConfig::from_value(Some(&c)).enable_reload())
             .unwrap_or(true)
     }
 
