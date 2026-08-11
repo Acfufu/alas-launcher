@@ -3,7 +3,7 @@ use std::{
     process::{Command, ExitStatus},
     sync::Mutex,
     thread::sleep,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Result};
@@ -16,11 +16,6 @@ use command_group::GroupChild;
 
 use crate::child_process::port::{is_same_process_group, port_owner_pid};
 use crate::child_process::{kill_group, spawn_with_group, ManagedChild};
-
-// macOS-only: the tray (the sole caller of advance_intent_if_changed) is
-// cfg-gated, and menu_model is not compiled on win/linux.
-#[cfg(target_os = "macos")]
-use crate::menu_model::scheduler_intent_after_scan;
 
 /// Lifecycle status of the ALAS backend (the spawned gui.py process).
 ///
@@ -70,6 +65,11 @@ pub struct BackendState {
     pub start_failed: bool,
     pub crashed: bool,
     pub scheduler_intent: SchedulerIntent,
+    /// When the current `Start` intent was armed (`begin_start` / `start`
+    /// success) — the MINOR-2 TTL clock. `None` = no start in flight; cleared
+    /// on disarm/stop. Read only by the macOS-gated
+    /// `advance_intent_if_changed` (win/linux writes are harmless).
+    start_intent_at: Option<Instant>,
     /// Generation counter for the exit race (see `BackendLifecycle::start`):
     /// `stop()` bumps it, so a start whose spawn is still in flight detects
     /// the interruption when it re-locks after the spawn and disposes its
@@ -88,6 +88,7 @@ impl Default for BackendState {
             start_failed: false,
             crashed: false,
             scheduler_intent: SchedulerIntent::None,
+            start_intent_at: None,
             epoch: 0,
             pending_start_epoch: None,
         }
@@ -283,6 +284,9 @@ impl BackendLifecycle {
         state.start_failed = false;
         state.crashed = false;
         state.scheduler_intent = SchedulerIntent::Start;
+        // Start the MINOR-2 TTL clock: an unconfirmed Start intent older than
+        // START_INTENT_TTL disarms on the next scan (abnormal-stop semantics).
+        state.start_intent_at = Some(Instant::now());
         // Bind this start attempt to the current epoch; `start()` compares it
         // against the live epoch to detect a `stop()` landing in the
         // begin_start → spawn window (the exit race, MAJOR-2).
@@ -336,6 +340,7 @@ impl BackendLifecycle {
                     state.start_failed = false;
                     state.crashed = false;
                     state.scheduler_intent = SchedulerIntent::None;
+                    state.start_intent_at = None;
                     drop(state);
                     let mut backend = backend;
                     let _ = backend.terminate();
@@ -346,6 +351,9 @@ impl BackendLifecycle {
                 state.status = BackendStatus::Running;
                 state.crashed = false;
                 state.scheduler_intent = SchedulerIntent::Start;
+                // Re-arm the TTL clock at the moment the backend is actually
+                // up: the 90s boot window starts here.
+                state.start_intent_at = Some(Instant::now());
                 Ok(())
             }
             Err(e) => {
@@ -357,6 +365,7 @@ impl BackendLifecycle {
                 state.start_failed = true;
                 state.crashed = false;
                 state.scheduler_intent = SchedulerIntent::None;
+                state.start_intent_at = None;
                 Err(e)
             }
         }
@@ -374,6 +383,7 @@ impl BackendLifecycle {
             state.start_failed = false;
             state.crashed = false;
             state.scheduler_intent = SchedulerIntent::None;
+            state.start_intent_at = None;
             state.epoch += 1;
             // pending_start_epoch is deliberately NOT cleared: it must survive
             // so a start() arriving after this stop can still detect it.
@@ -390,6 +400,7 @@ impl BackendLifecycle {
         state.status = BackendStatus::Stopped;
         state.crashed = false;
         state.scheduler_intent = SchedulerIntent::None;
+        state.start_intent_at = None;
     }
 
     /// Stopped-with-error transition: the backend died on its own (port probe
@@ -401,12 +412,20 @@ impl BackendLifecycle {
         state.start_failed = false;
         state.crashed = true;
         state.scheduler_intent = SchedulerIntent::None;
+        state.start_intent_at = None;
     }
 
     /// Record the user's last scheduler Start/Stop request (see
-    /// [`SchedulerIntent`]); `None` disarms.
+    /// [`SchedulerIntent`]); `None` disarms. A non-Start intent also clears
+    /// the MINOR-2 TTL clock: the start (if any) is no longer in flight.
+    /// `Start` armed here (scheduler-only WS clicks) leaves the clock
+    /// untouched — `begin_start`/`start` are the recorded TTL origins.
     pub fn set_scheduler_intent(&self, intent: SchedulerIntent) {
-        self.state.lock().unwrap().scheduler_intent = intent;
+        let mut state = self.state.lock().unwrap();
+        state.scheduler_intent = intent;
+        if intent != SchedulerIntent::Start {
+            state.start_intent_at = None;
+        }
     }
 
     /// Run ONE poll-scan intent transition atomically (MINOR-1): read the
@@ -419,14 +438,27 @@ impl BackendLifecycle {
     ///
     /// `alive` is the scan's scheduler liveness — `None` when the backend is
     /// not Running (the transition is a no-op then). No I/O happens under the
-    /// lock: the transition is a pure match on the snapshot fields. The
-    /// decision function stays in menu_model until todo 8 moves it here (the
-    /// same change that extends this method with the Start-intent TTL).
+    /// lock: the transition is a pure match on the snapshot fields.
+    ///
+    /// The decision function lives here with `toggle_decision` — both are
+    /// backend-lifecycle decisions, not menu rendering (todo 8 relocation).
+    /// MINOR-2: the elapsed time for the Start-intent TTL is derived from the
+    /// internal `start_intent_at` record (armed by `begin_start`/`start`,
+    /// cleared on disarm/stop) — an unconfirmed Start intent that survives
+    /// [`START_INTENT_TTL`] disarms, so a scheduler that never boots
+    /// eventually renders as abnormal stop. Stop intents are never TTL'd.
     #[cfg(target_os = "macos")]
     pub fn advance_intent_if_changed(&self, alive: Option<bool>) -> SchedulerIntent {
         let mut state = self.state.lock().unwrap();
-        let next = scheduler_intent_after_scan(state.scheduler_intent, alive);
+        let elapsed = state
+            .start_intent_at
+            .map(|t| t.elapsed())
+            .unwrap_or(Duration::ZERO);
+        let next = scheduler_intent_after_scan(state.scheduler_intent, alive, elapsed);
         state.scheduler_intent = next;
+        if next != SchedulerIntent::Start {
+            state.start_intent_at = None;
+        }
         next
     }
 
@@ -525,6 +557,45 @@ pub(crate) fn toggle_decision(
                 ToggleAction::StartScheduler
             }
         }
+    }
+}
+
+/// Start-intent TTL (MINOR-2): an unconfirmed `Start` intent older than this
+/// disarms to `None` on the next scan, restoring the abnormal-stop semantics
+/// for a scheduler that never came up after a user start.
+#[cfg(target_os = "macos")]
+pub const START_INTENT_TTL: Duration = Duration::from_secs(90);
+
+/// Whether the ALAS scheduler is running, per the pinned process-tree
+/// discriminator (evidence task-3): the uvicorn process's alive, non-zombie,
+/// non-resource-tracker child count. The multiprocessing.Manager is the
+/// permanent baseline child (+1); the scheduler adds a second one.
+#[cfg(target_os = "macos")]
+pub fn scheduler_alive(alive_child_count: usize) -> bool {
+    alive_child_count > 1
+}
+
+/// What scheduler intent survives one poll scan (pure, no I/O).
+///
+/// The poll thread calls this after every liveness scan:
+/// - a confirmed-alive scan disarms a `Start` intent (the boot window is
+///   over — a later death has no user start behind it and must render as
+///   abnormal stop);
+/// - an UNCONFIRMED `Start` intent disarms once `elapsed` (the time since
+///   the start was recorded) reaches [`START_INTENT_TTL`] — a scheduler that
+///   never boots stops rendering as a normal stop (MINOR-2);
+/// - every other combination leaves the intent untouched. `Stop` survives
+///   alive scans so a user stop can never re-arm into the abnormal path.
+#[cfg(target_os = "macos")]
+pub fn scheduler_intent_after_scan(
+    intent: SchedulerIntent,
+    scheduler_alive: Option<bool>,
+    elapsed: Duration,
+) -> SchedulerIntent {
+    match (intent, scheduler_alive) {
+        (SchedulerIntent::Start, Some(true)) => SchedulerIntent::None,
+        (SchedulerIntent::Start, _) if elapsed >= START_INTENT_TTL => SchedulerIntent::None,
+        _ => intent,
     }
 }
 
@@ -816,6 +887,120 @@ mod tests {
         assert_eq!(lc.advance_intent_if_changed(Some(true)), SchedulerIntent::Stop);
         assert_eq!(lc.advance_intent_if_changed(Some(false)), SchedulerIntent::Stop);
         assert_eq!(lc.advance_intent_if_changed(None), SchedulerIntent::Stop);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn start_intent_ttl_matrix() {
+        // MINOR-2 matrix: Start + unconfirmed + <90s stays; >=90s disarms to
+        // None (abnormal-stop semantics back); Start + confirmed always
+        // disarms; Stop is never subject to the TTL.
+        let below_ttl = Duration::from_secs(1);
+        let at_ttl = START_INTENT_TTL;
+        let past_ttl = START_INTENT_TTL + Duration::from_secs(3600);
+        // Start + unconfirmed + <90s -> stays (boot window, never alarms).
+        assert_eq!(
+            scheduler_intent_after_scan(SchedulerIntent::Start, None, below_ttl),
+            SchedulerIntent::Start
+        );
+        assert_eq!(
+            scheduler_intent_after_scan(SchedulerIntent::Start, Some(false), below_ttl),
+            SchedulerIntent::Start
+        );
+        // Start + unconfirmed + >=90s -> disarm.
+        assert_eq!(
+            scheduler_intent_after_scan(SchedulerIntent::Start, None, at_ttl),
+            SchedulerIntent::None
+        );
+        assert_eq!(
+            scheduler_intent_after_scan(SchedulerIntent::Start, Some(false), past_ttl),
+            SchedulerIntent::None
+        );
+        // Start + confirmed -> None regardless of elapsed.
+        assert_eq!(
+            scheduler_intent_after_scan(SchedulerIntent::Start, Some(true), below_ttl),
+            SchedulerIntent::None
+        );
+        assert_eq!(
+            scheduler_intent_after_scan(SchedulerIntent::Start, Some(true), past_ttl),
+            SchedulerIntent::None
+        );
+        // Stop -> always stays, any alive x any elapsed.
+        for alive in [None, Some(false), Some(true)] {
+            for elapsed in [below_ttl, at_ttl, past_ttl] {
+                assert_eq!(
+                    scheduler_intent_after_scan(SchedulerIntent::Stop, alive, elapsed),
+                    SchedulerIntent::Stop,
+                    "Stop must never be TTL'd (alive {alive:?}, elapsed {elapsed:?})"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn advance_intent_ttl_disarms_stale_start_via_lifecycle() {
+        let lc = BackendLifecycle::new_with_spawner(ok_spawner());
+        lc.begin_start();
+        lc.start(22267).unwrap();
+        // Fresh start: a dead scan keeps the intent armed (boot window).
+        assert_eq!(
+            lc.advance_intent_if_changed(Some(false)),
+            SchedulerIntent::Start
+        );
+        // Backdate the recorded start moment past the TTL: the next dead scan
+        // must disarm — the scheduler never came up.
+        lc.state.lock().unwrap().start_intent_at =
+            Some(Instant::now() - START_INTENT_TTL - Duration::from_secs(1));
+        assert_eq!(
+            lc.advance_intent_if_changed(Some(false)),
+            SchedulerIntent::None,
+            "unconfirmed Start past the TTL disarms"
+        );
+        assert_eq!(lc.snapshot().scheduler_intent, SchedulerIntent::None);
+        assert!(
+            lc.state.lock().unwrap().start_intent_at.is_none(),
+            "disarm clears the TTL clock"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn scheduler_intent_after_scan_only_disarms_start_on_confirmed_alive() {
+        // With a fresh (zero) elapsed, only (Start, Some(true)) disarms;
+        // everything else is a no-op — the TTL matrix above covers elapsed
+        // >= START_INTENT_TTL.
+        for (intent, alive) in [
+            (SchedulerIntent::None, None),
+            (SchedulerIntent::None, Some(false)),
+            (SchedulerIntent::None, Some(true)),
+            (SchedulerIntent::Stop, None),
+            (SchedulerIntent::Stop, Some(false)),
+            (SchedulerIntent::Stop, Some(true)),
+            (SchedulerIntent::Start, None),
+            (SchedulerIntent::Start, Some(false)),
+        ] {
+            assert_eq!(
+                scheduler_intent_after_scan(intent, alive, Duration::ZERO),
+                intent,
+                "intent {intent:?} alive {alive:?}"
+            );
+        }
+        assert_eq!(
+            scheduler_intent_after_scan(SchedulerIntent::Start, Some(true), Duration::ZERO),
+            SchedulerIntent::None
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn scheduler_alive_count_boundaries() {
+        // Pinned rule (evidence task-3): Manager baseline = 1 -> not alive;
+        // a second alive child (the scheduler) crosses the threshold.
+        assert!(!scheduler_alive(0), "no children");
+        assert!(!scheduler_alive(1), "Manager baseline only");
+        assert!(scheduler_alive(2), "Manager + scheduler");
+        assert!(scheduler_alive(3), "any extra child counts alive");
     }
 
     /// BLOCKER-3 double-spawn insurance: while a start is in flight the

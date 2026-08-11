@@ -758,7 +758,7 @@ mod client_tests {
 ///   toolkit PATH + LD_LIBRARY_PATH prepended, `./toolkit/bin/python`.
 /// - Scheduler detection mirrors the todo-3 discriminator (tray.rs
 ///   `uvicorn_alive_child_count`) and its production predicate
-///   `menu_model::scheduler_alive`: alive, non-zombie, non-resource-tracker
+///   `backend::scheduler_alive`: alive, non-zombie, non-resource-tracker
 ///   children of the uvicorn process (the reload wrapper's child when
 ///   `Deploy.Update.EnableReload`; the backend process itself otherwise);
 ///   baseline = the multiprocessing.Manager only (1), scheduler running => 2.
