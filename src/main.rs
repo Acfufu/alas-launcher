@@ -172,7 +172,17 @@ fn main() -> Result<()> {
                 let menu_shell_settings = setup_shell_settings.clone();
                 let menu_backend = setup_backend.clone();
                 app.on_menu_event(move |app, event| match event.id().as_ref() {
-                    "settings-check-update" => warn!("check-update handler wired in todo 5"),
+                    "settings-check-update" => {
+                        // Labels are computed at CLICK time so the dialog shows
+                        // in the CURRENT language, not the startup one.
+                        let labels = crate::menu_model::shell_menu_labels(
+                            &menu_shell_settings
+                                .lock()
+                                .unwrap()
+                                .resolved_language(deploy_language().as_deref()),
+                        );
+                        crate::shell_menu::spawn_check_update(app, &menu_shell_settings, labels);
+                    }
                     "settings-auto-start" => warn!("auto-start handler wired in todo 6"),
                     id if id.starts_with("settings-lang-") => {
                         // (a) Apply the click: mutate the shared language +

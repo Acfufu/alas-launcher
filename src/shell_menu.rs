@@ -30,18 +30,28 @@
 //! click; the tray wake + stopped-page re-navigation stay in main.rs (it
 //! owns backend + port + the tray refresh sender).
 
-use std::sync::{Arc, Mutex};
+use std::{
+    path::Path,
+    process::{Child, Command, Stdio},
+    sync::{mpsc, Arc, Mutex},
+    time::Duration,
+};
 
 use tauri::{
     menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
-    AppHandle, Wry,
+    AppHandle, Manager, Wry,
 };
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 use crate::{
     menu_model::ShellMenuLabels,
     shell_settings::ShellSettings,
 };
+
+/// Git command timeout for the check-update worker, mirroring
+/// `SCHEDULER_CLICK_TIMEOUT` (tray.rs:46): a hung git (dead network, blocked
+/// DNS) must degrade to 检查失败, never hang the worker forever.
+const CHECK_UPDATE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Settings language ids in the same fixed order as `labels.lang_names`
 /// (简体中文 / 繁體中文 / English / 日本語) — index `i` of each array maps to
@@ -96,6 +106,199 @@ pub fn handle_language_click(
         warn!("failed to persist shell settings: {e}; language applies for this session only");
     }
     updated
+}
+
+/// Pure: the sha of the `git ls-remote` HEAD line (`<sha>\tHEAD`), e.g. from
+/// `git ls-remote origin HEAD`. `None` when no HEAD line or empty output.
+#[allow(dead_code)] // plan-mandated pure surface; unit-tested, worker parses branch refs
+pub fn parse_ls_remote(output: &str) -> Option<String> {
+    output
+        .lines()
+        .map(str::trim_end)
+        .find_map(|line| line.strip_suffix("\tHEAD").or_else(|| line.strip_suffix(" HEAD")))
+        .map(|sha| sha.trim().to_string())
+        .filter(|sha| !sha.is_empty())
+}
+
+/// Pure: the sha of the `git ls-remote origin <branch>` line for the LOCAL
+/// branch being compared (MINOR-3 — never compare against the remote default
+/// branch). Matches `refs/heads/<branch>` (full ref form) or a bare
+/// `<branch>` ref; `None` when absent (no such remote branch / no remote).
+pub fn parse_ls_remote_branch(output: &str, branch: &str) -> Option<String> {
+    let head = format!("\trefs/heads/{branch}");
+    let bare = format!("\t{branch}");
+    output
+        .lines()
+        .map(str::trim_end)
+        .find_map(|line| {
+            if let Some(sha) = line.strip_suffix(&head) {
+                Some(sha)
+            } else {
+                line.strip_suffix(&bare)
+            }
+        })
+        .map(|sha| sha.trim().to_string())
+        .filter(|sha| !sha.is_empty())
+}
+
+/// Pure: true when the remote branch head differs from the local HEAD —
+/// i.e. an update is available. `None` remote (check failed) is never
+/// "available".
+pub fn update_available(local: &str, remote: Option<&str>) -> bool {
+    match remote {
+        Some(remote) => remote != local,
+        None => false,
+    }
+}
+
+/// Command builder: `git rev-parse HEAD` in the ALAS directory — the local
+/// commit the remote is compared against.
+pub fn build_rev_parse_cmd(cwd: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.args(["rev-parse", "HEAD"]).current_dir(cwd);
+    cmd
+}
+
+/// Command builder: `git rev-parse --abbrev-ref HEAD` in the ALAS directory —
+/// the LOCAL branch name, so the remote comparison targets the same branch
+/// (MINOR-3: never `ls-remote origin HEAD`, which would compare against the
+/// remote DEFAULT branch and misreport on non-default checkouts).
+pub fn build_branch_cmd(cwd: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.args(["rev-parse", "--abbrev-ref", "HEAD"]).current_dir(cwd);
+    cmd
+}
+
+/// Command builder: `git ls-remote origin <branch>` in the ALAS directory —
+/// the remote tracking branch head. Read-only (no fetch/pull/update).
+pub fn build_ls_remote_cmd(cwd: &Path, branch: &str) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.args(["ls-remote", "origin", branch]).current_dir(cwd);
+    cmd
+}
+
+/// Run one git command with piped stdout read on a reader thread (mirrors the
+/// setup.rs git_update reader pattern), enforcing `timeout` via recv_timeout —
+/// on timeout the child is killed and the step degrades. Returns stdout only
+/// when the process exited successfully; any spawn/exit/timeout failure → None.
+fn run_git_capture(cmd: &mut Command, timeout: Duration) -> Option<String> {
+    let mut child = cmd.stdout(Stdio::piped()).spawn().ok()?;
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => {
+            let _ = kill_child(&mut child);
+            return None;
+        }
+    };
+    let mut stdout = stdout;
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = std::io::Read::read_to_string(&mut stdout, &mut buf);
+        let _ = tx.send(buf);
+    });
+    let output = match rx.recv_timeout(timeout) {
+        Ok(out) => out,
+        Err(_) => {
+            let _ = kill_child(&mut child);
+            return None;
+        }
+    };
+    if !child.wait().is_ok_and(|s| s.success()) {
+        return None;
+    }
+    let out = output.trim();
+    if out.is_empty() {
+        None
+    } else {
+        Some(output)
+    }
+}
+
+/// Kill + reap a timed-out child; returns its exit status.
+fn kill_child(child: &mut Child) -> Option<std::process::ExitStatus> {
+    let _ = child.kill();
+    child.wait().ok()
+}
+
+/// Worker: run the whole check-update git sequence on a dedicated thread —
+/// branch name → local HEAD sha → remote same-branch sha (all read-only), then
+/// surface the result as a native dialog, hopping to the main thread
+/// (`AppHandle::run_on_main_thread`, present in locked tauri 2.5.1) because
+/// the dialog API is not callable from a worker thread. Any step failing
+/// (no git / not a repo / no remote / network hang past the 15s timeout)
+/// degrades to 检查失败 — the plan's failure path.
+///
+/// Mirrors `spawn_scheduler_click` (tray.rs:476): dedicated thread, UI thread
+/// never blocks, no settings lock held across the git I/O.
+pub fn spawn_check_update(
+    app: &AppHandle,
+    settings: &Arc<Mutex<ShellSettings>>,
+    labels: ShellMenuLabels,
+) {
+    let app = app.clone();
+    let settings = settings.clone();
+    if let Err(e) = std::thread::Builder::new()
+        .name("check-update".into())
+        .spawn(move || {
+            let _ = settings; // worker never writes settings (todo 7 constraint)
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let msg = check_update_message(&cwd, &labels);
+            info!(%msg, "check-update worker finished");
+            let dialog_app = app.clone();
+            let title = labels.check_update.clone();
+            if let Err(e) = app.run_on_main_thread(move || {
+                use tauri_plugin_dialog::DialogExt;
+                let mut builder = dialog_app
+                    .dialog()
+                    .message(msg)
+                    .kind(tauri_plugin_dialog::MessageDialogKind::Info)
+                    .title(title);
+                // Parent the alert to the main window: with a parent rfd uses
+                // the NSAlert sheet path; the parent-less async path falls
+                // back to the legacy off-main CFUserNotification API, which
+                // never displayed in QA, and the async sheet closed itself
+                // within seconds. blocking_show runs the sync runModal path
+                // (modal until dismissed) — the reliable one.
+                if let Some(win) = dialog_app.get_webview_window("main") {
+                    builder = builder.parent(&win);
+                }
+                builder.blocking_show();
+            }) {
+                warn!("check-update dialog hop to main thread failed: {e}");
+            }
+        })
+    {
+        warn!("failed to spawn check-update worker: {e}");
+    }
+}
+
+/// The worker body split out for testability: run the git sequence and return
+/// the localized message. `check_failed` on any step failure (degraded).
+fn check_update_message(cwd: &Path, labels: &ShellMenuLabels) -> String {
+    let Some(branch_out) = run_git_capture(&mut build_branch_cmd(cwd), CHECK_UPDATE_TIMEOUT) else {
+        debug!(?cwd, "check-update: branch resolve failed");
+        return labels.check_failed.clone();
+    };
+    let Some(branch) = branch_out.lines().next().map(str::trim).filter(|b| !b.is_empty()) else {
+        debug!(?cwd, "check-update: empty branch name");
+        return labels.check_failed.clone();
+    };
+    let Some(local) = run_git_capture(&mut build_rev_parse_cmd(cwd), CHECK_UPDATE_TIMEOUT) else {
+        debug!(?cwd, "check-update: local HEAD resolve failed");
+        return labels.check_failed.clone();
+    };
+    let local = local.trim().to_string();
+    let remote = run_git_capture(&mut build_ls_remote_cmd(cwd, branch), CHECK_UPDATE_TIMEOUT)
+        .and_then(|out| parse_ls_remote_branch(&out, branch));
+    match remote {
+        Some(remote) if update_available(&local, Some(&remote)) => labels.update_available.clone(),
+        Some(_) => labels.up_to_date.clone(),
+        None => {
+            debug!(?cwd, branch, "check-update: no remote branch head");
+            labels.check_failed.clone()
+        }
+    }
 }
 
 /// Owned handles to every localizable part of the installed settings menu.
@@ -285,5 +488,73 @@ mod tests {
     #[test]
     fn checked_language_id_unknown_lang_falls_back_to_follow() {
         assert_eq!(checked_language_id(&Some("fr-FR".into())), "settings-lang-follow");
+    }
+
+    #[test]
+    fn parse_ls_remote_extracts_head_sha() {
+        assert_eq!(
+            parse_ls_remote("abc123def456\n789012\tHEAD\n"),
+            Some("789012".to_string())
+        );
+        assert_eq!(
+            parse_ls_remote("abc123def456\trefs/heads/master\nabc123def456\tHEAD\n"),
+            Some("abc123def456".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_ls_remote_no_head_line_is_none() {
+        assert_eq!(parse_ls_remote("abc123def456\trefs/heads/master\n"), None);
+    }
+
+    #[test]
+    fn parse_ls_remote_empty_output_is_none() {
+        assert_eq!(parse_ls_remote(""), None);
+        assert_eq!(parse_ls_remote("\n\n"), None);
+    }
+
+    #[test]
+    fn parse_ls_remote_branch_matches_refs_heads_and_bare() {
+        let out = "abc\trefs/heads/master\nabc\tHEAD\n";
+        assert_eq!(parse_ls_remote_branch(out, "master"), Some("abc".to_string()));
+        assert_eq!(parse_ls_remote_branch("abc\tmaster\n", "master"), Some("abc".to_string()));
+    }
+
+    #[test]
+    fn parse_ls_remote_branch_missing_branch_is_none() {
+        assert_eq!(parse_ls_remote_branch("abc\trefs/heads/dev\n", "master"), None);
+        assert_eq!(parse_ls_remote_branch("", "master"), None);
+    }
+
+    #[test]
+    fn update_available_compares_remote_to_local() {
+        assert!(!update_available("abc", Some("abc")));
+        assert!(update_available("abc", Some("def")));
+        assert!(!update_available("abc", None));
+        assert!(!update_available("", None));
+    }
+
+    #[test]
+    fn build_rev_parse_cmd_targets_local_head_in_cwd() {
+        let cmd = build_rev_parse_cmd(std::path::Path::new("/tmp/alas"));
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, vec!["rev-parse", "HEAD"]);
+        assert_eq!(cmd.get_current_dir(), Some(std::path::Path::new("/tmp/alas")));
+    }
+
+    #[test]
+    fn build_ls_remote_cmd_targets_origin_branch_in_cwd() {
+        let cmd = build_ls_remote_cmd(std::path::Path::new("/tmp/alas"), "master");
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, vec!["ls-remote", "origin", "master"]);
+        assert_eq!(cmd.get_current_dir(), Some(std::path::Path::new("/tmp/alas")));
+    }
+
+    #[test]
+    fn build_branch_cmd_abbrev_ref_in_cwd() {
+        let cmd = build_branch_cmd(std::path::Path::new("/tmp/alas"));
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, vec!["rev-parse", "--abbrev-ref", "HEAD"]);
+        assert_eq!(cmd.get_current_dir(), Some(std::path::Path::new("/tmp/alas")));
     }
 }
