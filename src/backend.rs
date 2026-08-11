@@ -12,6 +12,11 @@ use tracing::warn;
 
 use crate::window_util::CreateNoWindow as _;
 
+// macOS-only: the tray (the sole caller of advance_intent_if_changed) is
+// cfg-gated, and menu_model is not compiled on win/linux.
+#[cfg(target_os = "macos")]
+use crate::menu_model::scheduler_intent_after_scan;
+
 /// Lifecycle status of the ALAS backend (the spawned gui.py process).
 ///
 /// Three states: `Initializing` (the Ready thread or a menu Start is still
@@ -197,7 +202,8 @@ impl Drop for ManagedBackend {
 /// terminate-before-spawn contract, port readiness, start_failed, Drop
 /// residue cleanup, process-group termination) lives here behind a small
 /// interface — `status` / `snapshot` / `begin_start` / `start` / `stop` /
-/// `mark_stopped`. The `Mutex` is INTERNAL: callers never lock it, so lock
+/// `mark_stopped` / `set_scheduler_intent` / `advance_intent_if_changed`
+/// (macOS-only). The `Mutex` is INTERNAL: callers never lock it, so lock
 /// discipline (brief reads, no lock across the long spawn) cannot leak out.
 pub struct BackendLifecycle {
     state: Mutex<BackendState>,
@@ -379,6 +385,27 @@ impl BackendLifecycle {
     /// [`SchedulerIntent`]); `None` disarms.
     pub fn set_scheduler_intent(&self, intent: SchedulerIntent) {
         self.state.lock().unwrap().scheduler_intent = intent;
+    }
+
+    /// Run ONE poll-scan intent transition atomically (MINOR-1): read the
+    /// current intent, apply [`scheduler_intent_after_scan`], write back —
+    /// all under a single lock acquisition. The old rebuild_menu sequence
+    /// (snapshot → compute → set_scheduler_intent) took three separate locks,
+    /// leaving a read-modify-write window a concurrent toggle could slip
+    /// into. Returns the surviving intent so the caller can render the
+    /// post-transition state.
+    ///
+    /// `alive` is the scan's scheduler liveness — `None` when the backend is
+    /// not Running (the transition is a no-op then). No I/O happens under the
+    /// lock: the transition is a pure match on the snapshot fields. The
+    /// decision function stays in menu_model until todo 8 moves it here (the
+    /// same change that extends this method with the Start-intent TTL).
+    #[cfg(target_os = "macos")]
+    pub fn advance_intent_if_changed(&self, alive: Option<bool>) -> SchedulerIntent {
+        let mut state = self.state.lock().unwrap();
+        let next = scheduler_intent_after_scan(state.scheduler_intent, alive);
+        state.scheduler_intent = next;
+        next
     }
 
     /// Pid of the live backend process, if any — the root of the process-tree
@@ -724,6 +751,48 @@ mod tests {
             "no spawn may happen after a stop"
         );
         assert_eq!(lc.status(), BackendStatus::Stopped);
+    }
+
+    // ---- MINOR-1: atomic intent transition -----------------------------------
+
+    /// The whole poll-scan intent transition (read current intent, apply
+    /// scheduler_intent_after_scan, write back) now runs under ONE lock via
+    /// advance_intent_if_changed — the old rebuild_menu sequence (snapshot →
+    /// compute → set_scheduler_intent) took three separate lock acquisitions,
+    /// so a toggle landing between them could be silently overwritten.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn advance_intent_disarms_start_on_confirmed_alive() {
+        let lc = BackendLifecycle::new_with_spawner(ok_spawner());
+        lc.set_scheduler_intent(SchedulerIntent::Start);
+        let next = lc.advance_intent_if_changed(Some(true));
+        assert_eq!(next, SchedulerIntent::None, "confirmed alive disarms Start");
+        assert_eq!(
+            lc.snapshot().scheduler_intent,
+            SchedulerIntent::None,
+            "the write lands inside the same lock"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn advance_intent_keeps_intent_on_dead_or_unknown_scans() {
+        // The boot window: a dead/unknown scan keeps Start armed (the death
+        // renders as a normal stop until the scheduler is confirmed alive).
+        let lc = BackendLifecycle::new_with_spawner(ok_spawner());
+        lc.set_scheduler_intent(SchedulerIntent::Start);
+        assert_eq!(
+            lc.advance_intent_if_changed(Some(false)),
+            SchedulerIntent::Start
+        );
+        assert_eq!(lc.advance_intent_if_changed(None), SchedulerIntent::Start);
+        // No intent + any scan stays None.
+        assert_eq!(lc.advance_intent_if_changed(Some(true)), SchedulerIntent::None);
+        // A user Stop survives every scan (never re-arms into abnormal).
+        lc.set_scheduler_intent(SchedulerIntent::Stop);
+        assert_eq!(lc.advance_intent_if_changed(Some(true)), SchedulerIntent::Stop);
+        assert_eq!(lc.advance_intent_if_changed(Some(false)), SchedulerIntent::Stop);
+        assert_eq!(lc.advance_intent_if_changed(None), SchedulerIntent::Stop);
     }
 
     /// BLOCKER-3 double-spawn insurance: while a start is in flight the
