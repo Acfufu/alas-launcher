@@ -12,7 +12,7 @@
 use std::{
     net::TcpStream,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         mpsc, Arc, Mutex,
     },
     time::Duration,
@@ -31,7 +31,7 @@ use crate::{
     backend::{toggle_decision, BackendLifecycle, BackendStateSnapshot, BackendStatus, SchedulerIntent, ToggleAction},
     menu_model::{
         control_labels, poll_decision, poll_needs_rebuild, scheduler_alive,
-        scheduler_intent_after_scan, status_line_for, task_section, task_section_items,
+        status_line_for, task_section, task_section_items,
         toggle_enabled, toggle_label, ControlLabels, TaskMenuItem, TaskSection,
     },
     pywebio::{check_pywebio_version, click_scheduler, pywebio_version, SchedulerAction},
@@ -52,7 +52,9 @@ const SCHEDULER_CLICK_TIMEOUT: Duration = Duration::from_secs(15);
 /// flag (shared with main.rs so ExitRequested can halt the poll thread),
 /// the refresh signal channel (manual Refresh menu item, and the todo-4
 /// language-switch wake) and the WS in-flight flag (dedups concurrent
-/// toggles — only one scheduler click session at a time).
+/// toggles — only one scheduler click session at a time). `port_fail_count`
+/// is the poll thread's CONSECUTIVE failed-probe streak (MINOR-5): two
+/// misses mark the backend crashed, a success resets it.
 #[derive(Clone)]
 struct TrayShared {
     backend: Arc<BackendLifecycle>,
@@ -61,6 +63,7 @@ struct TrayShared {
     stop: Arc<AtomicBool>,
     refresh: mpsc::Sender<()>,
     in_flight: Arc<AtomicBool>,
+    port_fail_count: Arc<AtomicU8>,
 }
 
 /// Build the macOS menu-bar tray icon with its native menu.
@@ -92,6 +95,7 @@ pub fn build_tray(
         stop,
         refresh: refresh_tx.clone(),
         in_flight: Arc::new(AtomicBool::new(false)),
+        port_fail_count: Arc::new(AtomicU8::new(0)),
     };
 
     let labels = load_control_labels(&shared.settings);
@@ -550,16 +554,16 @@ fn spawn_start_worker(
 /// both route through here (never build-then-set inline).
 ///
 /// This is ALSO the single intent-transition site: every rebuild runs the
-/// scan result through [`scheduler_intent_after_scan`] before rendering, so
-/// NO status-reporting path (poll thread OR toggle rebuild) can ever show
-/// 异常停止 with a stale Start/Stop intent. `scheduler_alive` is None when
-/// the backend is not Running; the transition is a no-op then.
+/// scan result through [`BackendLifecycle::advance_intent_if_changed`] before
+/// rendering, so NO status-reporting path (poll thread OR toggle rebuild) can
+/// ever show 异常停止 with a stale Start/Stop intent. `scheduler_alive` is
+/// None when the backend is not Running; the transition is a no-op then.
 fn rebuild_menu(app: &AppHandle, shared: &TrayShared, section: TaskSection, scheduler_alive: Option<bool>) {
-    let snapshot = shared.backend.snapshot();
-    let next = scheduler_intent_after_scan(snapshot.scheduler_intent, scheduler_alive);
-    if next != snapshot.scheduler_intent {
-        shared.backend.set_scheduler_intent(next);
-    }
+    // MINOR-1: the read-compute-write transition runs under ONE lock inside
+    // BackendLifecycle — the old snapshot → scheduler_intent_after_scan →
+    // set_scheduler_intent sequence took three separate locks, leaving a
+    // window a concurrent toggle could slip into.
+    shared.backend.advance_intent_if_changed(scheduler_alive);
     let snapshot = shared.backend.snapshot();
     let tasks = shared.tasks.lock().unwrap().clone();
     let labels = load_control_labels(&shared.settings);
@@ -613,10 +617,20 @@ fn poll_once(
     // (the backend crashed or was killed outside the launcher) -> abnormal
     // Stopped via mark_stopped_crashed(), so the toggle recovers to
     // StartBackend instead of showing a stuck Running state. The probe is
-    // lock-free.
+    // lock-free. MINOR-5: the marking needs TWO CONSECUTIVE failures — one
+    // missed connect can be transient (bind races, packet loss); a success in
+    // between resets the streak. The click-time toggle probe stays
+    // single-shot: that is a real-time decision on the user's click.
     if status == BackendStatus::Running && !backend_port_alive(port) {
-        shared.backend.mark_stopped_crashed();
-        status = BackendStatus::Stopped;
+        let streak = shared.port_fail_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if should_mark_crashed(streak) {
+            shared.backend.mark_stopped_crashed();
+            status = BackendStatus::Stopped;
+        }
+    } else {
+        // Successful probe — or no probe this cycle (not Running): the streak
+        // only ever counts consecutive failures.
+        shared.port_fail_count.store(0, Ordering::Relaxed);
     }
 
     // (b/c) Running -> fetch outside any lock; anything else -> degraded.
@@ -744,6 +758,16 @@ fn warn_on_pywebio_mismatch() {
 fn backend_port_alive(port: u16) -> bool {
     let address = format!("127.0.0.1:{port}").parse().unwrap();
     TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok()
+}
+
+/// Pure two-strike decision (MINOR-5): mark the backend crashed only after
+/// TWO CONSECUTIVE failed port probes. `fail_count` is the caller's current
+/// consecutive-failure streak (incremented BEFORE the call); a success in
+/// between resets it to 0, so one transient miss never kills a Running
+/// backend. The click-time toggle probe stays single-shot — that is a
+/// real-time decision on the user's click.
+fn should_mark_crashed(fail_count: u8) -> bool {
+    fail_count >= 2
 }
 
 /// The multiprocessing resource_tracker child of the gui.py wrapper; excluded
@@ -951,6 +975,39 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         assert!(backend_port_alive(port));
+    }
+
+    // ---- MINOR-5 two-strike port probe ---------------------------------------
+
+    #[test]
+    fn should_mark_crashed_requires_two_consecutive_failures() {
+        // A single probe failure must NOT kill a Running backend (a transient
+        // miss — port bind race, packet loss); only >= 2 consecutive failures
+        // earn the abnormal-stop marking.
+        assert!(!should_mark_crashed(0), "no failures -> healthy");
+        assert!(!should_mark_crashed(1), "one failure -> keep Running");
+        assert!(should_mark_crashed(2), "two failures -> crashed");
+        assert!(should_mark_crashed(3), "more failures stay crashed");
+    }
+
+    #[test]
+    fn port_fail_counter_state_machine() {
+        // The caller protocol replicated: failed probe -> fetch_add(1), any
+        // successful probe (or a non-Running status) -> store(0). The counter
+        // only ever counts CONSECUTIVE failures, so the decision sees the
+        // current streak, not a lifetime total.
+        let counter = Arc::new(AtomicU8::new(0));
+        let probe_fail = |c: &AtomicU8| c.fetch_add(1, Ordering::Relaxed) + 1;
+        let probe_ok = |c: &AtomicU8| c.store(0, Ordering::Relaxed);
+
+        // fail once -> not crashed
+        assert!(!should_mark_crashed(probe_fail(&counter)));
+        // success in between -> reset
+        probe_ok(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), 0, "success resets the streak");
+        // fail twice consecutively -> crashed on the second
+        assert!(!should_mark_crashed(probe_fail(&counter)));
+        assert!(should_mark_crashed(probe_fail(&counter)));
     }
 
     // ---- uvicorn_alive_child_count (real processes, pinned rule) -------------
