@@ -25,16 +25,41 @@ pub enum BackendStatus {
     Stopped,
 }
 
+/// Outstanding user intent about the ALAS SCHEDULER (not the backend), for
+/// distinguishing "stopped on purpose" from "stopped because it errored".
+///
+/// The scheduler-death signal alone cannot tell them apart (both look like
+/// Running backend + dead scheduler process), so the toggle records what the
+/// user last asked for; the poll thread disarms `Start` once the scheduler is
+/// confirmed alive again. `None` = no outstanding intent — a dead scheduler
+/// then means it died on its own (abnormal stop).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SchedulerIntent {
+    /// No outstanding user intent — scheduler death renders as abnormal stop.
+    #[default]
+    None,
+    /// User's last scheduler action was Stop — death renders as normal stop.
+    Stop,
+    /// User's last action was Start (scheduler or whole backend) — the dead
+    /// window while the scheduler boots renders as normal stop, not abnormal.
+    Start,
+}
+
 /// Whole-backend lifecycle state. Internal to [`BackendLifecycle`] (callers
 /// never see or lock it); kept as-is from the pre-deep-module layout.
 /// `status` drives the tray menu labels/enabled state; `backend` holds the
 /// live process handle; `start_failed` distinguishes "stopped" from "last
 /// start attempt failed" so the tray can show the start-failed label instead
-/// of silently reverting to Start.
+/// of silently reverting to Start. `crashed` distinguishes "stopped because
+/// the backend died on its own" from a normal stop; `scheduler_intent`
+/// records the user's last scheduler Start/Stop request (see
+/// [`SchedulerIntent`]).
 pub struct BackendState {
     pub status: BackendStatus,
     pub backend: Option<ManagedBackend>,
     pub start_failed: bool,
+    pub crashed: bool,
+    pub scheduler_intent: SchedulerIntent,
 }
 
 impl Default for BackendState {
@@ -43,6 +68,8 @@ impl Default for BackendState {
             status: BackendStatus::Stopped,
             backend: None,
             start_failed: false,
+            crashed: false,
+            scheduler_intent: SchedulerIntent::None,
         }
     }
 }
@@ -54,6 +81,8 @@ impl Default for BackendState {
 pub struct BackendStateSnapshot {
     pub status: BackendStatus,
     pub start_failed: bool,
+    pub crashed: bool,
+    pub scheduler_intent: SchedulerIntent,
 }
 
 pub struct ManagedBackend {
@@ -193,23 +222,29 @@ impl BackendLifecycle {
         self.state.lock().unwrap().status
     }
 
-    /// Copy of the render-relevant state (status + start_failed).
+    /// Copy of the render-relevant state (status + failure flags).
     pub fn snapshot(&self) -> BackendStateSnapshot {
         let state = self.state.lock().unwrap();
         BackendStateSnapshot {
             status: state.status,
             start_failed: state.start_failed,
+            crashed: state.crashed,
+            scheduler_intent: state.scheduler_intent,
         }
     }
 
     /// Mark the backend as initializing (and clear any previous start-failed
     /// flag) BEFORE the possibly-long spawn. Callers invoke this first so the
     /// menu shows "initializing…" and a concurrent toggle is a no-op
-    /// (BLOCKER-3: never two backends).
+    /// (BLOCKER-3: never two backends). The start is user-initiated, so the
+    /// scheduler intent arms to `Start` — the boot window renders as a normal
+    /// stop, not an abnormal one.
     pub fn begin_start(&self) {
         let mut state = self.state.lock().unwrap();
         state.status = BackendStatus::Initializing;
         state.start_failed = false;
+        state.crashed = false;
+        state.scheduler_intent = SchedulerIntent::Start;
     }
 
     /// Start the backend on `port`.
@@ -238,6 +273,8 @@ impl BackendLifecycle {
                 let mut state = self.state.lock().unwrap();
                 state.backend = Some(backend);
                 state.status = BackendStatus::Running;
+                state.crashed = false;
+                state.scheduler_intent = SchedulerIntent::Start;
                 Ok(())
             }
             Err(e) => {
@@ -247,19 +284,24 @@ impl BackendLifecycle {
                 let mut state = self.state.lock().unwrap();
                 state.status = BackendStatus::Stopped;
                 state.start_failed = true;
+                state.crashed = false;
+                state.scheduler_intent = SchedulerIntent::None;
                 Err(e)
             }
         }
     }
 
-    /// Stop the backend (if any): status -> Stopped, start_failed cleared,
-    /// then the process is terminated and dropped OUTSIDE the lock. Always
-    /// ends Stopped; never panics on a missing backend.
+    /// Stop the backend (if any): status -> Stopped, all failure flags and
+    /// the scheduler intent cleared, then the process is terminated and
+    /// dropped OUTSIDE the lock. Always ends Stopped; never panics on a
+    /// missing backend.
     pub fn stop(&self) -> BackendStatus {
         let old = {
             let mut state = self.state.lock().unwrap();
             state.status = BackendStatus::Stopped;
             state.start_failed = false;
+            state.crashed = false;
+            state.scheduler_intent = SchedulerIntent::None;
             state.backend.take()
         };
         terminate_old(old);
@@ -271,6 +313,25 @@ impl BackendLifecycle {
     pub fn mark_stopped(&self) {
         let mut state = self.state.lock().unwrap();
         state.status = BackendStatus::Stopped;
+        state.crashed = false;
+        state.scheduler_intent = SchedulerIntent::None;
+    }
+
+    /// Stopped-with-error transition: the backend died on its own (port probe
+    /// dead while Running) or was killed outside the launcher. Renders as the
+    /// abnormal-stop label instead of a plain stop.
+    pub fn mark_stopped_crashed(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.status = BackendStatus::Stopped;
+        state.start_failed = false;
+        state.crashed = true;
+        state.scheduler_intent = SchedulerIntent::None;
+    }
+
+    /// Record the user's last scheduler Start/Stop request (see
+    /// [`SchedulerIntent`]); `None` disarms.
+    pub fn set_scheduler_intent(&self, intent: SchedulerIntent) {
+        self.state.lock().unwrap().scheduler_intent = intent;
     }
 
     /// Pid of the live backend process, if any — the root of the process-tree
@@ -460,6 +521,46 @@ mod tests {
     }
 
     #[test]
+    fn mark_stopped_crashed_marks_abnormal_stop() {
+        let lc = BackendLifecycle::new_with_spawner(ok_spawner());
+        lc.begin_start();
+        lc.mark_stopped_crashed();
+        let s = lc.snapshot();
+        assert_eq!(s.status, BackendStatus::Stopped);
+        assert!(!s.start_failed);
+        assert!(s.crashed);
+        assert_eq!(s.scheduler_intent, SchedulerIntent::None);
+    }
+
+    #[test]
+    fn scheduler_intent_roundtrip_and_clearing() {
+        let lc = BackendLifecycle::new_with_spawner(ok_spawner());
+        lc.set_scheduler_intent(SchedulerIntent::Stop);
+        assert_eq!(lc.snapshot().scheduler_intent, SchedulerIntent::Stop);
+        // A user start re-arms to Start; begin_start also arms Start.
+        lc.set_scheduler_intent(SchedulerIntent::Start);
+        assert_eq!(lc.snapshot().scheduler_intent, SchedulerIntent::Start);
+        lc.begin_start();
+        assert_eq!(lc.snapshot().scheduler_intent, SchedulerIntent::Start);
+        // Stop (and mark_stopped_crashed) disarm to None.
+        lc.stop();
+        assert_eq!(lc.snapshot().scheduler_intent, SchedulerIntent::None);
+        lc.set_scheduler_intent(SchedulerIntent::Stop);
+        lc.mark_stopped_crashed();
+        assert_eq!(lc.snapshot().scheduler_intent, SchedulerIntent::None);
+    }
+
+    #[test]
+    fn start_arms_start_intent_and_success_keeps_it() {
+        let lc = BackendLifecycle::new_with_spawner(ok_spawner());
+        lc.start(22267).unwrap();
+        let s = lc.snapshot();
+        assert_eq!(s.status, BackendStatus::Running);
+        assert_eq!(s.scheduler_intent, SchedulerIntent::Start);
+        assert!(!s.crashed);
+    }
+
+    #[test]
     fn backend_pid_tracks_the_live_child() {
         let lc = BackendLifecycle::new_with_spawner(ok_spawner());
         assert_eq!(lc.backend_pid(), None, "no backend before start");
@@ -508,6 +609,8 @@ mod tests {
         let snapshot = |status| BackendStateSnapshot {
             status,
             start_failed: false,
+            crashed: false,
+            scheduler_intent: SchedulerIntent::None,
         };
         let stopped = snapshot(BackendStatus::Stopped);
         let running = snapshot(BackendStatus::Running);

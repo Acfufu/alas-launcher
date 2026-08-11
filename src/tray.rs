@@ -28,11 +28,11 @@ use tracing::warn;
 
 use crate::{
     alas_tasks::{self, Task},
-    backend::{toggle_decision, BackendLifecycle, BackendStateSnapshot, BackendStatus, ToggleAction},
+    backend::{toggle_decision, BackendLifecycle, BackendStateSnapshot, BackendStatus, SchedulerIntent, ToggleAction},
     menu_model::{
-        control_labels, poll_decision, poll_needs_rebuild, scheduler_alive, status_line_for,
-        task_section, task_section_items, toggle_enabled, toggle_label, ControlLabels,
-        TaskMenuItem, TaskSection,
+        control_labels, poll_decision, poll_needs_rebuild, scheduler_alive,
+        scheduler_intent_after_scan, status_line_for, task_section, task_section_items,
+        toggle_enabled, toggle_label, ControlLabels, TaskMenuItem, TaskSection,
     },
     pywebio::{check_pywebio_version, click_scheduler, pywebio_version, SchedulerAction},
 };
@@ -92,6 +92,8 @@ pub fn build_tray(
     let initial = BackendStateSnapshot {
         status: BackendStatus::Stopped,
         start_failed: false,
+        crashed: false,
+        scheduler_intent: SchedulerIntent::None,
     };
     let menu = build_menu(
         app.handle(),
@@ -346,7 +348,10 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
             .map(|pid| scheduler_alive(uvicorn_alive_child_count(pid, deploy_enable_reload())))
             .unwrap_or(false)
     } else if snapshot.status == BackendStatus::Running {
-        shared.backend.mark_stopped();
+        // Backend died on its own (dead port despite a Running snapshot) —
+        // mark the abnormal stop so the status line shows 异常停止, not a
+        // plain stop.
+        shared.backend.mark_stopped_crashed();
         snapshot = shared.backend.snapshot();
         false
     } else {
@@ -394,10 +399,20 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
             // Scheduler-only control: the click is delivered from a worker
             // thread and the window is deliberately NOT navigated. A failed
             // click only warns — the poll thread self-heals the status line
-            // and the toggle stays retryable.
+            // and the toggle stays retryable. The intent arms BEFORE the
+            // click so a scheduler-dead window never flashes 异常停止 while
+            // the user's own stop/start is in flight (a failed click leaves
+            // the stale intent until the next toggle — accepted: the user is
+            // mid-interaction and the status line stays non-alarming).
             let scheduler_action = match action {
-                ToggleAction::StopScheduler => SchedulerAction::Stop,
-                _ => SchedulerAction::Start,
+                ToggleAction::StopScheduler => {
+                    shared.backend.set_scheduler_intent(SchedulerIntent::Stop);
+                    SchedulerAction::Stop
+                }
+                _ => {
+                    shared.backend.set_scheduler_intent(SchedulerIntent::Start);
+                    SchedulerAction::Start
+                }
             };
             spawn_scheduler_click(
                 port,
@@ -479,7 +494,18 @@ fn spawn_scheduler_click(
 /// Rebuild the menu from the current state + task cache and re-attach it to
 /// the tray. The single set_menu site: the toggle handler and the poll thread
 /// both route through here (never build-then-set inline).
+///
+/// This is ALSO the single intent-transition site: every rebuild runs the
+/// scan result through [`scheduler_intent_after_scan`] before rendering, so
+/// NO status-reporting path (poll thread OR toggle rebuild) can ever show
+/// 异常停止 with a stale Start/Stop intent. `scheduler_alive` is None when
+/// the backend is not Running; the transition is a no-op then.
 fn rebuild_menu(app: &AppHandle, shared: &TrayShared, section: TaskSection, scheduler_alive: Option<bool>) {
+    let snapshot = shared.backend.snapshot();
+    let next = scheduler_intent_after_scan(snapshot.scheduler_intent, scheduler_alive);
+    if next != snapshot.scheduler_intent {
+        shared.backend.set_scheduler_intent(next);
+    }
     let snapshot = shared.backend.snapshot();
     let tasks = shared.tasks.lock().unwrap().clone();
     let labels = load_control_labels();
@@ -530,11 +556,12 @@ fn poll_once(
     let mut status = shared.backend.status();
 
     // (a2) Backend-liveness re-check: Running but the webui port is dead
-    // (the backend crashed or was killed outside the launcher) -> plain
-    // Stopped via mark_stopped(), so the toggle recovers to StartBackend
-    // instead of showing a stuck Running state. The probe is lock-free.
+    // (the backend crashed or was killed outside the launcher) -> abnormal
+    // Stopped via mark_stopped_crashed(), so the toggle recovers to
+    // StartBackend instead of showing a stuck Running state. The probe is
+    // lock-free.
     if status == BackendStatus::Running && !backend_port_alive(port) {
-        shared.backend.mark_stopped();
+        shared.backend.mark_stopped_crashed();
         status = BackendStatus::Stopped;
     }
 
@@ -557,7 +584,9 @@ fn poll_once(
 
     // (d) Scheduler liveness for the status line: process-tree scan rooted at
     // the backend pid (lock-free; sysinfo reads the OS process table). No
-    // handle / no scan result -> None -> conservative stopped.
+    // handle / no scan result -> None -> conservative stopped. The intent
+    // transition (disarm Start on confirmed alive) runs inside rebuild_menu —
+    // the single render choke point — so every status-reporting path shares it.
     let scheduler = if status == BackendStatus::Running {
         shared.backend.backend_pid().map(|pid| {
             scheduler_alive(uvicorn_alive_child_count(pid, deploy_enable_reload()))
