@@ -16,9 +16,9 @@
 //! All functions are pure Rust + serde + dirs; no tauri, no process spawning,
 //! so the module is unit-testable without a runtime.
 
-// Staged module: consumers (settings menu + ready-thread wiring) land in
-// later commits (todo 3+); until then the bin target must not fail
-// clippy -D warnings on unused items.
+// `#![allow(dead_code)]` retained because `settings_path` is only consumed
+// by test code in non-test builds (shell_menu.rs test guard); the rest of the
+// surface (load/save/resolved_language) is live from main.rs and tray.rs.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
@@ -57,9 +57,16 @@ impl Default for ShellSettings {
 }
 
 /// Absolute path of the settings file, per the current platform's config dir.
+///
+/// Returns an EMPTY [`PathBuf`] when the platform's config dir is
+/// unavailable (chosen over `Option<PathBuf>` to keep the public signature
+/// stable). Empty path is NOT a valid location: callers must treat it as
+/// "no persistence" — and must NOT fall back to the current directory, which
+/// would be the payload's `./config` tree, wiped by `atomic_failure_cleanup`
+/// (setup.rs) on every launch.
 pub fn settings_path() -> PathBuf {
     dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
+        .unwrap_or_default()
         .join("alas-launcher")
         .join("settings.json")
 }
@@ -67,9 +74,15 @@ pub fn settings_path() -> PathBuf {
 /// Load settings from [`settings_path`].
 ///
 /// Missing file → defaults (first run, silent); empty/corrupt JSON → defaults
-/// with a warning. Never panics.
+/// with a warning. Never panics. With no config dir, defaults are returned
+/// (in-memory only) and the reason is logged.
 pub fn load() -> ShellSettings {
-    load_from(&settings_path())
+    let path = settings_path();
+    if path.as_os_str().is_empty() {
+        warn!("no config dir; shell settings are in-memory only this session");
+        return ShellSettings::default();
+    }
+    load_from(&path)
 }
 
 fn load_from(path: &Path) -> ShellSettings {
@@ -105,11 +118,27 @@ impl ShellSettings {
 
     /// Persist these settings to [`settings_path`], creating parent dirs as
     /// needed. Fails with `anyhow` on IO/serialization errors (callers warn
-    /// and keep the in-memory state).
+    /// and keep the in-memory state). With no config dir the save is skipped
+    /// (in-memory only) and the reason is logged.
     pub fn save(&self) -> Result<()> {
-        self.save_to(&settings_path())
+        let path = settings_path();
+        if path.as_os_str().is_empty() {
+            warn!("no config dir; shell settings not persisted (in-memory only)");
+            return Ok(());
+        }
+        self.save_to(&path)
     }
 
+    /// Atomic write: stage `settings.json.tmp` in the SAME directory, fsync
+    /// it (crash consistency — the tmp content is durable before the rename),
+    /// then `fs::rename` over the target (atomic on the same filesystem).
+    /// A crash mid-save therefore leaves either the old file or the new one,
+    /// never a truncated settings.json. The parent directory fsync is
+    /// deliberately skipped: on macOS it costs an extra open+sync_all, and a
+    /// lost *rename* on crash only defaults settings back one save — the file
+    /// itself is never corrupt. If the atomic path fails (tmp write or
+    /// rename), fall back to a direct write and warn: persistence is
+    /// best-effort, the caller keeps the in-memory state regardless.
     fn save_to(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -117,7 +146,25 @@ impl ShellSettings {
         }
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| anyhow!("serialize settings: {e}"))?;
-        std::fs::write(path, json).map_err(|e| anyhow!("write settings {:?}: {e}", path))
+        let tmp = path.with_extension("json.tmp");
+        let stage = (|| -> std::io::Result<()> {
+            let mut file = std::fs::File::create(&tmp)?;
+            std::io::Write::write_all(&mut file, json.as_bytes())?;
+            file.sync_all()
+        })();
+        if let Err(e) = stage {
+            let _ = std::fs::remove_file(&tmp); // never leave .tmp residue
+            warn!("atomic settings write failed ({e}); falling back to direct write");
+            return std::fs::write(path, json).map_err(|e| anyhow!("write settings {:?}: {e}", path));
+        }
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp); // never leave .tmp residue
+                warn!("atomic settings rename failed ({e}); falling back to direct write");
+                std::fs::write(path, json).map_err(|e| anyhow!("write settings {:?}: {e}", path))
+            }
+        }
     }
 }
 
@@ -154,6 +201,11 @@ mod tests {
     fn write_raw(path: &Path, content: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, content).unwrap();
+    }
+
+    /// The temp file the atomic writer stages next to the target.
+    fn tmp_path(path: &Path) -> PathBuf {
+        path.with_extension("json.tmp")
     }
 
     #[test]
@@ -241,5 +293,61 @@ mod tests {
         // Empty object: language absent → None, auto_start_backend → true.
         let settings: ShellSettings = serde_json::from_str("{}").unwrap();
         assert_eq!(settings, defaults());
+    }
+
+    #[test]
+    fn atomic_save_leaves_no_tmp_residue() {
+        let path = temp_settings_path("atomic");
+        let settings = ShellSettings {
+            language: Some("en-US".to_string()),
+            auto_start_backend: false,
+        };
+        settings.save_to(&path).unwrap();
+        // Content is readable via the tolerant load path.
+        assert_eq!(load_from(&path), settings);
+        // Atomic contract: the staged temp file must not linger next to the
+        // target (a naive "write tmp, forget rename" leaves a stale copy).
+        assert!(!tmp_path(&path).exists());
+        cleanup("atomic");
+    }
+
+    #[test]
+    fn save_to_rename_failure_falls_back_and_errors() {
+        // Simulate a rename-only failure: the target path is an existing
+        // DIRECTORY, which rename() rejects (file→dir is EISDIR on Unix). The
+        // fallback direct write hits the same wall (O_WRONLY on a dir path is
+        // EISDIR), so save_to must surface Err — and must still not leave the
+        // staged .tmp behind.
+        let dir = temp_settings_path("rename-fail");
+        let parent = dir.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+        let result = defaults().save_to(&dir);
+        assert!(result.is_err());
+        assert!(!tmp_path(&dir).exists());
+        std::fs::remove_dir_all(&parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_save_replaces_target_symlink_instead_of_writing_through() {
+        use std::os::unix::fs::symlink;
+        let parent = temp_settings_path("symlink")
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let target = parent.join("settings.json");
+        let real = parent.join("real-file.json");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::write(&real, "original").unwrap();
+        symlink(&real, &target).unwrap();
+        defaults().save_to(&target).unwrap();
+        // Atomic rename replaces the symlink itself — the pre-existing real
+        // file stays untouched (a direct write would have gone THROUGH the
+        // link), and the target is now a plain file with our JSON.
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "original");
+        let meta = std::fs::symlink_metadata(&target).unwrap();
+        assert!(!meta.file_type().is_symlink());
+        assert_eq!(load_from(&target), defaults());
+        std::fs::remove_dir_all(&parent).unwrap();
     }
 }
