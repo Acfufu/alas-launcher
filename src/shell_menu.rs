@@ -427,8 +427,11 @@ pub fn build_settings_menu(
         checked_id == "settings-lang-follow",
         None::<&str>,
     )?;
-    let lang_refs: Vec<&dyn IsMenuItem<Wry>> =
+    let mut lang_refs: Vec<&dyn IsMenuItem<Wry>> =
         lang_items.iter().map(|i| i as &dyn IsMenuItem<Wry>).collect();
+    // follow must be IN the submenu (todo-8 regression: created but never
+    // appended since the todo-4 rewrite; user could not switch back to follow).
+    lang_refs.push(&follow);
     let language_submenu = Submenu::with_id_and_items(
         app,
         "settings-language",
