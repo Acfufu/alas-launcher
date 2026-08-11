@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200" height="440" viewBox="0 0 1200 440"
+     role="img" aria-labelledby="title desc">
+  <title id="title">ALAS Launcher Directory Layout</title>
+  <desc id="desc">After extraction you get the ALAS root directory, containing the launcher, a portable toolkit (Python, Git, Adb) and the ALAS source tree.</desc>
+
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#081B30"/>
+      <stop offset="1" stop-color="#143152"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="440" rx="26" fill="url(#bg)"/>
+  <rect x="1" y="1" width="1198" height="438" rx="25" fill="none" stroke="#2E5A8A" stroke-opacity="0.55" stroke-width="2"/>
+
+  <text x="96" y="76" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="38" font-weight="700" fill="#F5F9FF">Directory Layout</text>
+  <rect x="98" y="94" width="120" height="4" rx="2" fill="#4CC9F0"/>
+
+  <!-- tree -->
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="22">
+    <text x="96" y="164" fill="#7FD4F2" font-weight="700">AzurLaneAutoScript/</text>
+    <text x="96" y="212" fill="#C9DDF2">├─ <tspan fill="#E8EFF8" font-weight="600">alas-launcher</tspan>          <tspan fill="#6E8FB0" font-size="17">← the launcher</tspan></text>
+    <text x="96" y="260" fill="#C9DDF2">├─ <tspan fill="#E8EFF8" font-weight="600">toolkit/</tspan>               <tspan fill="#6E8FB0" font-size="17">← portable env (venv-like)</tspan></text>
+    <text x="140" y="308" fill="#9FB8D4">├─ <tspan fill="#C9DDF2">bin/</tspan>               <tspan fill="#6E8FB0" font-size="17">← adb (Unix)</tspan></text>
+    <text x="140" y="356" fill="#9FB8D4">├─ <tspan fill="#C9DDF2">git/</tspan>               <tspan fill="#6E8FB0" font-size="17">← MinGit (Windows)</tspan></text>
+    <text x="140" y="404" fill="#9FB8D4">└─ <tspan fill="#C9DDF2">Scripts/</tspan>           <tspan fill="#6E8FB0" font-size="17">← Python env, injected into PATH</tspan></text>
+  </g>
+</svg>

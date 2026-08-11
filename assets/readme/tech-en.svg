@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200" height="300" viewBox="0 0 1200 300"
+     role="img" aria-labelledby="title desc">
+  <title id="title">ALAS Launcher Tech Stack</title>
+  <desc id="desc">Rust and Tauri 2 shell, uv portable Python, self-built MXNet 1.9.1, manual releases.</desc>
+
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#081B30"/>
+      <stop offset="1" stop-color="#143152"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="300" rx="26" fill="url(#bg)"/>
+  <rect x="1" y="1" width="1198" height="298" rx="25" fill="none" stroke="#2E5A8A" stroke-opacity="0.55" stroke-width="2"/>
+
+  <text x="96" y="86" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="38" font-weight="700" fill="#F5F9FF">Tech Stack</text>
+  <rect x="98" y="104" width="120" height="4" rx="2" fill="#4CC9F0"/>
+
+  <g font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+    <rect x="96" y="148" width="240" height="64" rx="14" fill="#122B49" stroke="#2E5A8A"/>
+    <text x="120" y="178" font-size="21" font-weight="700" fill="#F0F6FD">Rust + Tauri 2</text>
+    <text x="120" y="202" font-size="16" fill="#9FB8D4">Native shell, low footprint</text>
+
+    <rect x="356" y="148" width="240" height="64" rx="14" fill="#122B49" stroke="#2E5A8A"/>
+    <text x="380" y="178" font-size="21" font-weight="700" fill="#F0F6FD">uv Portable Python</text>
+    <text x="380" y="202" font-size="16" fill="#9FB8D4">Runs anywhere, zero pollution</text>
+
+    <rect x="616" y="148" width="240" height="64" rx="14" fill="#122B49" stroke="#2E5A8A"/>
+    <text x="640" y="178" font-size="21" font-weight="700" fill="#F0F6FD">Self-built MXNet 1.9.1</text>
+    <text x="640" y="202" font-size="16" fill="#9FB8D4">Backward-compatible, all platforms</text>
+
+    <rect x="876" y="148" width="240" height="64" rx="14" fill="#122B49" stroke="#2E5A8A"/>
+    <text x="900" y="178" font-size="21" font-weight="700" fill="#F0F6FD">Manual Releases</text>
+    <text x="900" y="202" font-size="16" fill="#9FB8D4">Local builds · published by hand</text>
+  </g>
+
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="17" fill="#6E8FB0">
+    <text x="96" y="268">swordfeng/mxnet-build · cnocr · numpy · monkey-patch: np.bool</text>
+  </g>
+</svg>

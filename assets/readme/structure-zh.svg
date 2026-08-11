@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200" height="440" viewBox="0 0 1200 440"
+     role="img" aria-labelledby="title desc">
+  <title id="title">ALAS Launcher 目录结构</title>
+  <desc id="desc">解压后得到 ALAS 根目录，内含启动器、绿色 toolkit 环境（Python、Git、Adb）与 ALAS 本体源码目录。</desc>
+
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#081B30"/>
+      <stop offset="1" stop-color="#143152"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="440" rx="26" fill="url(#bg)"/>
+  <rect x="1" y="1" width="1198" height="438" rx="25" fill="none" stroke="#2E5A8A" stroke-opacity="0.55" stroke-width="2"/>
+
+  <text x="96" y="76" font-family="system-ui, -apple-system, 'PingFang SC', sans-serif" font-size="38" font-weight="700" fill="#F5F9FF">目录结构</text>
+  <rect x="98" y="94" width="120" height="4" rx="2" fill="#4CC9F0"/>
+
+  <!-- 目录树 -->
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="22">
+    <text x="96" y="164" fill="#7FD4F2" font-weight="700">AzurLaneAutoScript/</text>
+    <text x="96" y="212" fill="#C9DDF2">├─ <tspan fill="#E8EFF8" font-weight="600">alas-launcher</tspan>          <tspan fill="#6E8FB0" font-size="17">← 启动器本体</tspan></text>
+    <text x="96" y="260" fill="#C9DDF2">├─ <tspan fill="#E8EFF8" font-weight="600">toolkit/</tspan>               <tspan fill="#6E8FB0" font-size="17">← 绿色环境（类似 venv）</tspan></text>
+    <text x="140" y="308" fill="#9FB8D4">├─ <tspan fill="#C9DDF2">bin/</tspan>               <tspan fill="#6E8FB0" font-size="17">← adb（Unix）</tspan></text>
+    <text x="140" y="356" fill="#9FB8D4">├─ <tspan fill="#C9DDF2">git/</tspan>               <tspan fill="#6E8FB0" font-size="17">← MinGit（Windows）</tspan></text>
+    <text x="140" y="404" fill="#9FB8D4">└─ <tspan fill="#C9DDF2">Scripts/</tspan>           <tspan fill="#6E8FB0" font-size="17">← Python 环境，启动器注入 PATH</tspan></text>
+  </g>
+</svg>
