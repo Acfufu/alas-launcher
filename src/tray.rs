@@ -341,7 +341,7 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
     // Password/SSL degradation guard (plan todo 6b): with a webui password or
     // TLS configured the plain ws:// client cannot drive the scheduler, so
     // the toggle falls back to process-level control.
-    let ws_available = ws_available();
+    let ws_available = crate::deploy_config::ws_control_available();
     if !ws_available {
         warn!("WebSocket scheduler control unavailable (webui password/SSL configured); falling back to process-level toggle");
     }
@@ -356,7 +356,7 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
         shared
             .backend
             .backend_pid()
-            .map(|pid| scheduler_alive(uvicorn_alive_child_count(pid, deploy_enable_reload())))
+            .map(|pid| scheduler_alive(uvicorn_alive_child_count(pid, crate::deploy_config::enable_reload())))
             .unwrap_or(false)
     } else if snapshot.status == BackendStatus::Running {
         // Backend died on its own (dead port despite a Running snapshot) —
@@ -644,7 +644,7 @@ fn poll_once(
         // brief settings lock (deploy.yaml read BEFORE the lock — no file
         // I/O under the lock), cloned, and the lock released before the
         // fetch below.
-        let deploy_lang = deploy_language();
+        let deploy_lang = crate::deploy_config::language();
         let task_language = shared
             .settings
             .lock()
@@ -667,7 +667,7 @@ fn poll_once(
     // the single render choke point — so every status-reporting path shares it.
     let scheduler = if status == BackendStatus::Running {
         shared.backend.backend_pid().map(|pid| {
-            scheduler_alive(uvicorn_alive_child_count(pid, deploy_enable_reload()))
+            scheduler_alive(uvicorn_alive_child_count(pid, crate::deploy_config::enable_reload()))
         })
     } else {
         None
@@ -685,58 +685,6 @@ fn poll_once(
         rebuild_menu(app, shared, outcome.section, scheduler);
         *last_section = outcome.section;
     }
-}
-
-/// Webui language from `config/deploy.yaml` (`Gui.Language`), which selects
-/// the i18n file for task display names. zh-CN fallback — the payload default
-/// (verified live: deploy.yaml `Language: zh-CN`).
-fn deploy_language() -> Option<String> {
-    crate::setup::get_deploy_config()?
-        .get("Gui")?
-        .get("Language")?
-        .as_str()
-        .map(String::from)
-}
-
-/// `Deploy.Update.EnableReload` from config/deploy.yaml (true when missing —
-/// the ALAS default, deploy.yaml:86): decides WHICH process is the uvicorn
-/// (reload wrapper vs the backend process itself) per the pinned rule.
-fn deploy_enable_reload() -> bool {
-    crate::setup::get_deploy_config()
-        .and_then(|c| c["Deploy"]["Update"]["EnableReload"].as_bool())
-        .unwrap_or(true)
-}
-
-/// Pure degradation check: WS scheduler control is unusable when the webui
-/// has a password or TLS configured. Reads the REAL payload paths
-/// (`Deploy.Webui.Password` / `WebuiSSLKey` / `WebuiSSLCert` — verified
-/// against the live deploy.yaml and app.py:1008 / gui.py:59-60; the plan's
-/// "Gui.Password" is stale). A non-empty string counts as configured; null,
-/// missing and empty all mean "no credential" (ALAS skips login for an empty
-/// password).
-fn ws_control_available(config: &serde_json::Value) -> bool {
-    let configured = |path: &[&str]| -> bool {
-        let mut cur = config;
-        for key in path {
-            cur = match cur.get(key) {
-                Some(v) => v,
-                None => return false,
-            };
-        }
-        cur.as_str().map(|s| !s.is_empty()).unwrap_or(false)
-    };
-    !(configured(&["Deploy", "Webui", "Password"])
-        || configured(&["Deploy", "Webui", "WebuiSSLKey"])
-        || configured(&["Deploy", "Webui", "WebuiSSLCert"]))
-}
-
-/// WS availability from the live deploy.yaml; true when it is missing (no
-/// credentials can be configured without a file).
-fn ws_available() -> bool {
-    crate::setup::get_deploy_config()
-        .as_ref()
-        .map(ws_control_available)
-        .unwrap_or(true)
 }
 
 /// Runtime pywebio version guard: warn once per toggle when the payload pins
@@ -816,7 +764,7 @@ fn uvicorn_alive_child_count(backend_pid: u32, enable_reload: bool) -> usize {
 /// the tray without a restart.
 fn load_control_labels(settings: &Arc<Mutex<crate::shell_settings::ShellSettings>>) -> ControlLabels {
     // deploy.yaml is file I/O — read it BEFORE taking the settings lock.
-    let deploy_lang = deploy_language();
+    let deploy_lang = crate::deploy_config::language();
     let lang = settings
         .lock()
         .unwrap()
@@ -928,39 +876,6 @@ mod tests {
         assert!(!flag.load(Ordering::Relaxed), "drop clears the flag");
         let g2 = try_acquire_in_flight(&flag).expect("re-acquire after release");
         drop(g2);
-    }
-
-    // ---- ws_control_available (password/SSL degradation) ---------------------
-
-    #[test]
-    fn ws_control_available_degrades_on_password() {
-        let cfg = serde_json::json!({"Deploy": {"Webui": {"Password": "secret"}}});
-        assert!(!ws_control_available(&cfg), "password configured -> degraded");
-    }
-
-    #[test]
-    fn ws_control_available_degrades_on_ssl() {
-        let key = serde_json::json!({"Deploy": {"Webui": {"WebuiSSLKey": "/tmp/k.pem"}}});
-        assert!(!ws_control_available(&key), "ssl key -> degraded");
-        let cert = serde_json::json!({"Deploy": {"Webui": {"WebuiSSLCert": "/tmp/c.pem"}}});
-        assert!(!ws_control_available(&cert), "ssl cert -> degraded");
-    }
-
-    #[test]
-    fn ws_control_available_null_missing_and_empty_are_available() {
-        // Real payload shape: Password/SSL all null (live deploy.yaml).
-        let nulls = serde_json::json!({"Deploy": {"Webui": {
-            "Password": serde_json::Value::Null,
-            "WebuiSSLKey": serde_json::Value::Null,
-            "WebuiSSLCert": serde_json::Value::Null,
-        }}});
-        assert!(ws_control_available(&nulls), "nulls -> available");
-        // Empty string = no password in ALAS semantics.
-        let empty = serde_json::json!({"Deploy": {"Webui": {"Password": ""}}});
-        assert!(ws_control_available(&empty), "empty password -> available");
-        // Missing sections entirely.
-        assert!(ws_control_available(&serde_json::json!({})));
-        assert!(ws_control_available(&serde_json::json!({"Deploy": {}})));
     }
 
     // ---- backend_port_alive --------------------------------------------------
