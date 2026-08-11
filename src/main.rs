@@ -313,6 +313,19 @@ fn main() -> Result<()> {
                             // Stopped. This is a setup failure, not a
                             // backend-start failure — start_failed stays false.
                             backend.mark_stopped();
+                            // MAJOR-1 code-review assertion: the timed poll's
+                            // three gates (task diff / section change / status
+                            // transition) all stay false after a failed setup —
+                            // backend-status transitions alone never re-fire the
+                            // rebuild — so without this wake the tray would stay
+                            // stuck on 启动中…/Initializing with a disabled toggle
+                            // until a manual Refresh.
+                            #[cfg(target_os = "macos")]
+                            {
+                                if let Some(sender) = tray_refresh_slot.lock().unwrap().as_ref() {
+                                    let _ = sender.send(());
+                                }
+                            }
                             return;
                         }
                         if auto_start {
@@ -324,6 +337,20 @@ fn main() -> Result<()> {
                                 // Stopped + start_failed so the tray shows the
                                 // localized start-failed label.
                                 error!("Failed to start backend: {e}");
+                                // MAJOR-1 code-review assertion: same failure
+                                // hazard as the setup path above — the timed
+                                // poll's three gates all stay false after a
+                                // failed start, so without this wake the tray
+                                // stays stuck on 启动中…/Initializing until a
+                                // manual Refresh.
+                                #[cfg(target_os = "macos")]
+                                {
+                                    if let Some(sender) =
+                                        tray_refresh_slot.lock().unwrap().as_ref()
+                                    {
+                                        let _ = sender.send(());
+                                    }
+                                }
                             } else {
                                 splash.destroy().unwrap();
                                 info!("Webview is ready");
