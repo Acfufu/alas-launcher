@@ -1,0 +1,165 @@
+{
+  "schema_version": 1,
+  "width": 1200,
+  "fps": 30,
+  "duration": 5.0,
+  "colors": 192,
+  "dither": "none",
+  "transparent_color": "#ff00ff",
+  "alpha_threshold": 128,
+  "clip_to_base_alpha": true,
+  "max_size_mb": 2.0,
+  "reveals": [
+    {
+      "id": "title-block",
+      "axis": "x",
+      "start": 0.15,
+      "end": 0.95,
+      "exit": {
+        "start": 4.05,
+        "end": 4.75
+      }
+    },
+    {
+      "id": "pills",
+      "axis": "x",
+      "start": 0.45,
+      "end": 1.25,
+      "exit": {
+        "start": 4.15,
+        "end": 4.85
+      }
+    },
+    {
+      "id": "desc-block",
+      "axis": "x",
+      "start": 0.65,
+      "end": 1.45,
+      "exit": {
+        "start": 4.2,
+        "end": 4.9
+      }
+    },
+    {
+      "id": "meta",
+      "axis": "x",
+      "start": 1.0,
+      "end": 1.8,
+      "exit": {
+        "start": 4.2,
+        "end": 4.9
+      }
+    }
+  ],
+  "layers": [
+    {
+      "id": "radar",
+      "enter": {
+        "start": 0.3,
+        "end": 1.2,
+        "from": [
+          60,
+          0
+        ]
+      },
+      "exit": {
+        "start": 4.0,
+        "end": 4.8,
+        "to": [
+          30,
+          0
+        ]
+      }
+    },
+    {
+      "id": "anchor",
+      "enter": {
+        "start": 0.5,
+        "end": 1.3,
+        "from": [
+          -40,
+          0
+        ]
+      },
+      "exit": {
+        "start": 4.1,
+        "end": 4.9,
+        "to": [
+          -20,
+          0
+        ]
+      }
+    },
+    {
+      "id": "chip-win",
+      "enter": {
+        "start": 0.8,
+        "end": 1.6,
+        "from": [
+          0,
+          30
+        ]
+      },
+      "exit": {
+        "start": 4.1,
+        "end": 4.8,
+        "to": [
+          0,
+          14
+        ]
+      }
+    },
+    {
+      "id": "chip-mac",
+      "enter": {
+        "start": 1.0,
+        "end": 1.8,
+        "from": [
+          0,
+          30
+        ]
+      },
+      "exit": {
+        "start": 4.1,
+        "end": 4.8,
+        "to": [
+          0,
+          14
+        ]
+      }
+    },
+    {
+      "id": "chip-linux",
+      "enter": {
+        "start": 1.2,
+        "end": 2.0,
+        "from": [
+          0,
+          30
+        ]
+      },
+      "exit": {
+        "start": 4.1,
+        "end": 4.8,
+        "to": [
+          0,
+          14
+        ]
+      }
+    }
+  ],
+  "reduced_motion": {
+    "mode": "static",
+    "visible": [
+      "title",
+      "pills",
+      "desc",
+      "meta",
+      "radar",
+      "anchor",
+      "chip-win",
+      "chip-mac",
+      "chip-linux"
+    ]
+  }
+}
