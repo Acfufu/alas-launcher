@@ -21,6 +21,10 @@ mod tray;
 // menu (shell_menu.rs) lands — win/linux builds must not compile it.
 #[cfg(target_os = "macos")]
 mod shell_settings;
+// macOS app menu bar shell-settings submenu (builds the 外壳设置 menu from
+// ShellSettings + ShellMenuLabels); gated so win/linux builds stay untouched.
+#[cfg(target_os = "macos")]
+mod shell_menu;
 mod setup;
 mod window_util;
 
@@ -76,6 +80,18 @@ fn main() -> Result<()> {
     let tray_stop = Arc::new(AtomicBool::new(false));
     let setup_tray_stop = tray_stop.clone();
 
+    // Shared shell settings (macOS app menu). Created in main() scope — the
+    // setup closure (menu build + events) and the run closure (todo 6
+    // auto-start Ready thread) are separate move closures, so each gets its
+    // own clone; a local created inside setup would be invisible to the run
+    // callback (plan MAJOR-1).
+    #[cfg(target_os = "macos")]
+    let shell_settings = Arc::new(std::sync::Mutex::new(crate::shell_settings::load()));
+    #[cfg(target_os = "macos")]
+    let setup_shell_settings = shell_settings.clone();
+    #[cfg(target_os = "macos")]
+    let run_shell_settings = shell_settings.clone();
+
     info!("Starting Webview...");
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![save_as])
@@ -101,6 +117,42 @@ fn main() -> Result<()> {
             if let Err(e) = crate::tray::build_tray(app, setup_backend.clone(), port, setup_tray_stop.clone()) {
                 warn!("tray failed: {e}");
             }
+            #[cfg(target_os = "macos")]
+            {
+                // App menu bar: build the 外壳设置 menu from the shared
+                // settings + localized labels, then install it. warn-and-
+                // continue — a menu failure must never abort startup (mirrors
+                // the build_tray call site above).
+                let labels = crate::menu_model::shell_menu_labels(
+                    &setup_shell_settings
+                        .lock()
+                        .unwrap()
+                        .resolved_language(deploy_language().as_deref()),
+                );
+                match crate::shell_menu::build_settings_menu(
+                    app.handle(),
+                    &setup_shell_settings,
+                    &labels,
+                ) {
+                    Ok(menu) => {
+                        if let Err(e) = app.set_menu(menu) {
+                            warn!("settings menu failed: {e}");
+                        }
+                    }
+                    Err(e) => warn!("settings menu failed: {e}"),
+                }
+                // App-level menu events (settings-* ids). Independent from the
+                // tray's own on_menu_event (tray-* ids, tray.rs:119); stub
+                // handlers — real behavior lands in todos 4-6.
+                app.on_menu_event(|_app, event| match event.id().as_ref() {
+                    "settings-check-update" => warn!("check-update handler wired in todo 5"),
+                    "settings-auto-start" => warn!("auto-start handler wired in todo 6"),
+                    id if id.starts_with("settings-lang-") => {
+                        warn!("lang handler wired in todo 4")
+                    }
+                    _ => {}
+                });
+            }
             Ok(())
         })
         .build(tauri::generate_context!())?
@@ -114,6 +166,12 @@ fn main() -> Result<()> {
                     }).expect("Error setting Ctrl-C handler");
                     let app_handle = app_handle.clone();
                     let backend = backend.clone();
+                    // todo 6: auto-start backend gate — the Ready-thread
+                    // branch reads this shared settings clone (MAJOR-1: the
+                    // setup closure's clone is invisible here; the run
+                    // callback is FnMut so we clone, not move).
+                    #[cfg(target_os = "macos")]
+                    let _shell_settings = run_shell_settings.clone();
                     thread::spawn(move || {
                         backend.begin_start();
                         let splash = app_handle.get_webview_window("splash").unwrap();
@@ -169,6 +227,19 @@ fn main() -> Result<()> {
             };
         });
     Ok(())
+}
+/// Webui language from `config/deploy.yaml` (`Gui.Language`), which selects
+/// the label tables; zh-CN fallback via `ShellSettings::resolved_language`.
+/// Replicated from the private `tray::deploy_language` (tray.rs:615) so this
+/// todo's commit stages only shell_menu.rs + main.rs (decision recorded in
+/// evidence task-3-shell-settings-menu.md).
+#[cfg(target_os = "macos")]
+fn deploy_language() -> Option<String> {
+    get_deploy_config()?
+        .get("Gui")?
+        .get("Language")?
+        .as_str()
+        .map(String::from)
 }
 
 #[tauri::command]
