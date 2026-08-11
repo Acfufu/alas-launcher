@@ -72,6 +72,34 @@ pub fn language_after_click(current: Option<String>, clicked: &str) -> Option<St
     }
 }
 
+/// Pure: whether the launcher should auto-start the backend at launch. The
+/// Ready thread (main.rs) branches on this AFTER the repo setup; the
+/// `settings-auto-start` menu toggle flips the underlying `auto_start_backend`
+/// field. Kept as an explicit function (plan todo 6) so the launch gate is a
+/// tested, named decision point instead of an inline field read.
+pub fn should_auto_start(settings: &ShellSettings) -> bool {
+    settings.auto_start_backend
+}
+
+/// Apply a `settings-auto-start` click: flip the shared `auto_start_backend`,
+/// persist it, and return the updated settings. `save()` runs AFTER the lock
+/// is dropped (no file I/O under the lock); a failed save only warns — the
+/// in-memory value still applies for this session (todo-4 precedent in
+/// [`handle_language_click`]). The caller (main.rs) re-checks the installed
+/// CheckMenuItem in place via [`SettingsMenuHandles::apply_auto_start`]. The
+/// toggle ONLY affects the NEXT launch — no backend action happens here.
+pub fn handle_auto_start_click(settings: &Arc<Mutex<ShellSettings>>) -> ShellSettings {
+    let updated = {
+        let mut guard = settings.lock().unwrap();
+        guard.auto_start_backend = !guard.auto_start_backend;
+        guard.clone()
+    };
+    if let Err(e) = updated.save() {
+        warn!("failed to persist shell settings: {e}; auto-start applies for this session only");
+    }
+    updated
+}
+
 /// Pure: the menu id of the language item that must render CHECKED for the
 /// given setting — None → `settings-lang-follow`, each known lang → its own
 /// id, an unknown lang → follow (defensive: an unlisted language cannot be
@@ -343,6 +371,15 @@ impl SettingsMenuHandles {
         self.auto_start.set_checked(settings.auto_start_backend)?;
         Ok(())
     }
+
+    /// Re-check the installed auto-start item in place after a toggle click
+    /// (muda Arc-backed native item — the macOS bar updates live; no
+    /// re-install, the same locked-tauri-2.5.1 constraint as [`apply_labels`]).
+    /// No menu rebuild, no relabel — only the check state changes.
+    pub fn apply_auto_start(&self, settings: &ShellSettings) -> tauri::Result<()> {
+        self.auto_start.set_checked(settings.auto_start_backend)?;
+        Ok(())
+    }
 }
 
 /// Build the app menu bar menu: the runtime-installed default menu (strategy
@@ -488,6 +525,65 @@ mod tests {
     #[test]
     fn checked_language_id_unknown_lang_falls_back_to_follow() {
         assert_eq!(checked_language_id(&Some("fr-FR".into())), "settings-lang-follow");
+    }
+
+    #[test]
+    fn should_auto_start_reflects_setting() {
+        let on = ShellSettings {
+            language: None,
+            auto_start_backend: true,
+        };
+        let off = ShellSettings {
+            language: None,
+            auto_start_backend: false,
+        };
+        assert!(should_auto_start(&on));
+        assert!(!should_auto_start(&off));
+    }
+
+    #[test]
+    fn handle_auto_start_click_flips_and_persists() {
+        // The handler persists via ShellSettings::save() → the REAL settings
+        // path (no injectable path exists in the public surface, and
+        // shell_settings.rs stays untouched per plan constraints), so this
+        // test snapshots the real file and restores it unconditionally via a
+        // Drop guard — a panic mid-test still leaves the machine's settings
+        // file exactly as it was.
+        struct Restore {
+            path: std::path::PathBuf,
+            original: Option<String>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.original {
+                    Some(content) => {
+                        let _ = std::fs::write(&self.path, content);
+                    }
+                    None => {
+                        let _ = std::fs::remove_file(&self.path);
+                    }
+                }
+            }
+        }
+        let restore = Restore {
+            path: crate::shell_settings::settings_path(),
+            original: std::fs::read_to_string(crate::shell_settings::settings_path()).ok(),
+        };
+
+        let settings = Arc::new(Mutex::new(ShellSettings {
+            language: None,
+            auto_start_backend: true,
+        }));
+        let updated = handle_auto_start_click(&settings);
+        // In-memory: both the returned snapshot and the shared settings flipped.
+        assert!(!updated.auto_start_backend);
+        assert!(!settings.lock().unwrap().auto_start_backend);
+        // Persisted: the file on disk now reflects the flip (load is the
+        // tolerant read path — corrupt/missing would default TRUE and fail
+        // this assertion, so it genuinely verifies the write).
+        assert!(!crate::shell_settings::load().auto_start_backend);
+
+        drop(restore); // restore the pre-test file state
     }
 
     #[test]
