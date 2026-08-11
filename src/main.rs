@@ -92,6 +92,21 @@ fn main() -> Result<()> {
     #[cfg(target_os = "macos")]
     let run_shell_settings = shell_settings.clone();
 
+    // Tray poll-wake channel slot: build_tray creates the sender inside the
+    // setup closure, but todo 6's auto-start-off branch (Ready thread, run
+    // closure) needs it to wake the poll after mark_stopped — the poll's diff
+    // gate ignores backend-status transitions, so without the wake the tray
+    // stays frozen on the Initializing render with a DISABLED toggle and the
+    // plan's "tray can still start the backend" requirement breaks. The slot
+    // is filled in setup, read in the run closure (MAJOR-1 pattern).
+    #[cfg(target_os = "macos")]
+    let tray_refresh_slot: Arc<std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    #[cfg(target_os = "macos")]
+    let setup_tray_refresh_slot = tray_refresh_slot.clone();
+    #[cfg(target_os = "macos")]
+    let run_tray_refresh_slot = tray_refresh_slot.clone();
+
     info!("Starting Webview...");
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![save_as])
@@ -131,6 +146,10 @@ fn main() -> Result<()> {
                         None
                     }
                 };
+            #[cfg(target_os = "macos")]
+            if let Some(refresh) = &tray_refresh {
+                *setup_tray_refresh_slot.lock().unwrap() = Some(refresh.clone());
+            }
             #[cfg(target_os = "macos")]
             {
                 // App menu bar: build the 外壳设置 menu from the shared
@@ -183,7 +202,21 @@ fn main() -> Result<()> {
                         );
                         crate::shell_menu::spawn_check_update(app, &menu_shell_settings, labels);
                     }
-                    "settings-auto-start" => warn!("auto-start handler wired in todo 6"),
+                    "settings-auto-start" => {
+                        // Flip + persist the shared setting (warn on save
+                        // failure; the in-memory value wins this session),
+                        // then re-check the installed CheckMenuItem in place
+                        // (muda Arc-backed native item, live update). NO
+                        // backend action at click time — the toggle only
+                        // affects the NEXT launch (the Ready-thread gate).
+                        let updated =
+                            crate::shell_menu::handle_auto_start_click(&menu_shell_settings);
+                        if let Some(handles) = &menu_handles {
+                            if let Err(e) = handles.apply_auto_start(&updated) {
+                                warn!("settings menu auto-start re-check failed: {e}");
+                            }
+                        }
+                    }
                     id if id.starts_with("settings-lang-") => {
                         // (a) Apply the click: mutate the shared language +
                         // persist (in-memory wins on save failure), returns
@@ -238,9 +271,27 @@ fn main() -> Result<()> {
                     // setup closure's clone is invisible here; the run
                     // callback is FnMut so we clone, not move).
                     #[cfg(target_os = "macos")]
-                    let _shell_settings = run_shell_settings.clone();
+                    let shell_settings = run_shell_settings.clone();
+                    #[cfg(target_os = "macos")]
+                    let tray_refresh_slot = run_tray_refresh_slot.clone();
                     thread::spawn(move || {
+                        // MAJOR-2 code-review invariant (plan todo 6, must-not
+                        // #4): begin_start runs BEFORE the setup window in
+                        // EVERY mode (auto-start on or off). BackendLifecycle
+                        // goes Initializing → the tray toggle is disabled
+                        // while setup_alas_repo wipes/rebuilds ./config, so a
+                        // user click in that window can never spawn gui.py
+                        // under a config dir mid-cleanup. Skipping begin_start
+                        // would leave the lifecycle at default Stopped with an
+                        // ENABLED toggle — the exact hazard the plan names.
                         backend.begin_start();
+                        // Brief settings lock: read the launch gate, release
+                        // before any I/O (setup_alas_repo below).
+                        #[cfg(target_os = "macos")]
+                        let auto_start =
+                            crate::shell_menu::should_auto_start(&shell_settings.lock().unwrap());
+                        #[cfg(not(target_os = "macos"))]
+                        let auto_start = true;
                         let splash = app_handle.get_webview_window("splash").unwrap();
                         let status_updater = |text: &str| {
                             let content = format!("Loading ALAS, please wait..\n\n{}", text);
@@ -249,6 +300,10 @@ fn main() -> Result<()> {
                         };
                         status_updater("Initialize ALAS");
                         if let Err(e) = setup_alas_repo(&status_updater) {
+                            // MINOR-2: this error path is IDENTICAL for both
+                            // auto-start modes — the splash keeps the error
+                            // text (destroying it here would hide the failure
+                            // reason), plain mark_stopped only.
                             error!("{e}");
                             let content = format!("Failed loading ALAS, reason: {}\n\nPlease run alas-launcher from terminal for detailed logs", e);
                             let url = Url::parse(&text_to_splash(&content)).unwrap();
@@ -260,21 +315,56 @@ fn main() -> Result<()> {
                             backend.mark_stopped();
                             return;
                         }
-                        info!("Starting gui.py on {}", crate::backend::webui_url(port));
-                        status_updater("Starting GUI");
-                        if let Err(e) = backend.start(port) {
-                            // Same as today: the splash stays on the "Starting GUI"
-                            // page, main window stays hidden. The module set
-                            // Stopped + start_failed so the tray shows the
-                            // localized start-failed label.
-                            error!("Failed to start backend: {e}");
-                        } else {
+                        if auto_start {
+                            info!("Starting gui.py on {}", crate::backend::webui_url(port));
+                            status_updater("Starting GUI");
+                            if let Err(e) = backend.start(port) {
+                                // Same as today: the splash stays on the "Starting GUI"
+                                // page, main window stays hidden. The module set
+                                // Stopped + start_failed so the tray shows the
+                                // localized start-failed label.
+                                error!("Failed to start backend: {e}");
+                            } else {
+                                splash.destroy().unwrap();
+                                info!("Webview is ready");
+                                let window = app_handle.get_webview_window("main").unwrap();
+                                window
+                                    .navigate(Url::parse(&crate::backend::webui_url(port)).unwrap())
+                                    .unwrap();
+                                window.show().unwrap();
+                            }
+                        }
+                        #[cfg(target_os = "macos")]
+                        if !auto_start {
+                            // auto-start OFF: the repo is updated, but the
+                            // backend must NOT spawn. End in usable plain
+                            // Stopped (start_failed untouched — no start was
+                            // attempted), navigate the main window to the
+                            // localized stopped page (labels resolved from the
+                            // shared settings via tray::refresh_stopped_page —
+                            // load_control_labels is tray-private, so the
+                            // pub(crate) helper is the intended call), show it,
+                            // and leave the tray toggle ready for manual start.
+                            backend.mark_stopped();
+                            // Wake the tray poll so it re-renders the enabled
+                            // Stopped toggle: its diff gate ignores backend-
+                            // status transitions (a timed poll rebuilds once
+                            // during Initializing and then never re-fires for
+                            // Stopped), so without this wake the tray would
+                            // stay frozen on 启动中… with a disabled toggle and
+                            // the plan's manual-start-from-tray requirement
+                            // would be unreachable.
+                            if let Some(sender) = tray_refresh_slot.lock().unwrap().as_ref() {
+                                let _ = sender.send(());
+                            }
                             splash.destroy().unwrap();
-                            info!("Webview is ready");
+                            crate::tray::refresh_stopped_page(
+                                &app_handle,
+                                &backend,
+                                &shell_settings,
+                                port,
+                            );
                             let window = app_handle.get_webview_window("main").unwrap();
-                            window
-                                .navigate(Url::parse(&crate::backend::webui_url(port)).unwrap())
-                                .unwrap();
                             window.show().unwrap();
                         }
                     });
