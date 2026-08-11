@@ -114,41 +114,98 @@ fn main() -> Result<()> {
             .on_page_load(page_load_injector)
             .build()?;
             #[cfg(target_os = "macos")]
-            if let Err(e) = crate::tray::build_tray(app, setup_backend.clone(), port, setup_tray_stop.clone()) {
-                warn!("tray failed: {e}");
-            }
+            let tray_refresh: Option<std::sync::mpsc::Sender<()>> =
+                match crate::tray::build_tray(
+                    app,
+                    setup_backend.clone(),
+                    port,
+                    setup_tray_stop.clone(),
+                    setup_shell_settings.clone(),
+                ) {
+                    // build_tray returns the poll-thread refresh channel (todo
+                    // 4 wake mechanism): the language handler below sends on
+                    // it to force a tray rebuild in the new language.
+                    Ok((_tray, refresh)) => Some(refresh),
+                    Err(e) => {
+                        warn!("tray failed: {e}");
+                        None
+                    }
+                };
             #[cfg(target_os = "macos")]
             {
                 // App menu bar: build the 外壳设置 menu from the shared
-                // settings + localized labels, then install it. warn-and-
-                // continue — a menu failure must never abort startup (mirrors
-                // the build_tray call site above).
+                // settings + localized labels, install it, and KEEP the item
+                // handles — a live language switch relabels the installed
+                // native items in place (locked tauri 2.5.1 exposes no
+                // AppHandle::set_menu; see shell_menu.rs module doc for the
+                // full design rationale). warn-and-continue — a menu failure
+                // must never abort startup (mirrors the build_tray call site).
                 let labels = crate::menu_model::shell_menu_labels(
                     &setup_shell_settings
                         .lock()
                         .unwrap()
                         .resolved_language(deploy_language().as_deref()),
                 );
-                match crate::shell_menu::build_settings_menu(
-                    app.handle(),
-                    &setup_shell_settings,
-                    &labels,
-                ) {
-                    Ok(menu) => {
-                        if let Err(e) = app.set_menu(menu) {
-                            warn!("settings menu failed: {e}");
+                let menu_handles: Option<crate::shell_menu::SettingsMenuHandles> =
+                    match crate::shell_menu::build_settings_menu(
+                        app.handle(),
+                        &setup_shell_settings,
+                        &labels,
+                    ) {
+                        Ok(handles) => {
+                            if let Err(e) = app.set_menu(handles.menu()) {
+                                warn!("settings menu failed: {e}");
+                            }
+                            Some(handles)
                         }
-                    }
-                    Err(e) => warn!("settings menu failed: {e}"),
-                }
+                        Err(e) => {
+                            warn!("settings menu failed: {e}");
+                            None
+                        }
+                    };
                 // App-level menu events (settings-* ids). Independent from the
-                // tray's own on_menu_event (tray-* ids, tray.rs:119); stub
-                // handlers — real behavior lands in todos 4-6.
-                app.on_menu_event(|_app, event| match event.id().as_ref() {
+                // tray's own on_menu_event (tray-* ids, tray.rs:119).
+                // settings-lang-* is the todo-4 LIVE language switch: main.rs
+                // owns deploy_language(), the backend, the port and the tray
+                // refresh sender, so it orchestrates here and shell_menu.rs
+                // stays menu-build + label-computation only.
+                let menu_shell_settings = setup_shell_settings.clone();
+                let menu_backend = setup_backend.clone();
+                app.on_menu_event(move |app, event| match event.id().as_ref() {
                     "settings-check-update" => warn!("check-update handler wired in todo 5"),
                     "settings-auto-start" => warn!("auto-start handler wired in todo 6"),
                     id if id.starts_with("settings-lang-") => {
-                        warn!("lang handler wired in todo 4")
+                        // (a) Apply the click: mutate the shared language +
+                        // persist (in-memory wins on save failure), returns
+                        // the updated settings for label computation.
+                        let updated =
+                            crate::shell_menu::handle_language_click(&menu_shell_settings, id);
+                        // (b) Relabel + re-check the INSTALLED app menu in
+                        // place (muda handles update the macOS bar live).
+                        let labels = crate::menu_model::shell_menu_labels(
+                            &updated.resolved_language(deploy_language().as_deref()),
+                        );
+                        if let Some(handles) = &menu_handles {
+                            if let Err(e) = handles.apply_labels(&labels, &updated) {
+                                warn!("settings menu relabel failed: {e}");
+                            }
+                        }
+                        // (c) Wake the tray poll thread — a woken poll ALWAYS
+                        // rebuilds (force_rebuild path, tray.rs), so the tray
+                        // menu re-renders in the new language even when the
+                        // task section is unchanged.
+                        if let Some(refresh) = &tray_refresh {
+                            let _ = refresh.send(());
+                        }
+                        // (d) The stopped-page copy is baked into its data:
+                        // URL at build time — re-navigate it when the backend
+                        // is not Running (the webui URL is language-free).
+                        crate::tray::refresh_stopped_page(
+                            app,
+                            &menu_backend,
+                            &menu_shell_settings,
+                            port,
+                        );
                     }
                     _ => {}
                 });
