@@ -28,9 +28,12 @@ use tracing::warn;
 
 use crate::{
     alas_tasks::{self, Task},
-    backend::{toggle_decision, BackendLifecycle, BackendStateSnapshot, BackendStatus, SchedulerIntent, ToggleAction},
+    backend::{
+        scheduler_alive, toggle_decision, BackendLifecycle, BackendStateSnapshot,
+        BackendStatus, SchedulerIntent, ToggleAction,
+    },
     menu_model::{
-        control_labels, poll_decision, poll_needs_rebuild, scheduler_alive,
+        control_labels, poll_decision, poll_needs_rebuild,
         status_line_for, task_section, task_section_items,
         toggle_enabled, toggle_label, ControlLabels, TaskMenuItem, TaskSection,
     },

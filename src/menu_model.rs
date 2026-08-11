@@ -259,31 +259,6 @@ pub fn status_line_for(
     format!("{}{}{}", labels.scheduler, labels.sep, word)
 }
 
-/// Whether the ALAS scheduler is running, per the pinned process-tree
-/// discriminator (evidence task-3): the uvicorn process's alive, non-zombie,
-/// non-resource-tracker child count. The multiprocessing.Manager is the
-/// permanent baseline child (+1); the scheduler adds a second one.
-pub fn scheduler_alive(alive_child_count: usize) -> bool {
-    alive_child_count > 1
-}
-
-/// What scheduler intent survives one poll scan (pure, no I/O).
-///
-/// The poll thread calls this after every liveness scan: a confirmed-alive
-/// scan disarms a `Start` intent (the boot window is over — a later death has
-/// no user start behind it and must render as abnormal stop); every other
-/// combination leaves the intent untouched. `Stop` survives alive scans so a
-/// user stop can never re-arm into the abnormal path.
-pub fn scheduler_intent_after_scan(
-    intent: SchedulerIntent,
-    scheduler_alive: Option<bool>,
-) -> SchedulerIntent {
-    match (intent, scheduler_alive) {
-        (SchedulerIntent::Start, Some(true)) => SchedulerIntent::None,
-        _ => intent,
-    }
-}
-
 /// Localized labels for the tray's scheduler-control rows (status line +
 /// Start/Stop toggle), following the webui language. `scheduler`, `running`,
 /// `start` and `stop` come from the ALAS i18n file when the keys exist and
@@ -494,6 +469,8 @@ pub fn shell_menu_labels(lang: &str) -> ShellMenuLabels {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::scheduler_intent_after_scan;
+    use std::time::Duration;
 
     #[test]
     fn toggle_label_matrix() {
@@ -669,13 +646,13 @@ mod tests {
             scheduler_intent: SchedulerIntent::Start,
         };
         // Boot window: dead scan stays non-alarming, intent stays armed.
-        assert_eq!(scheduler_intent_after_scan(running.scheduler_intent, Some(false)), SchedulerIntent::Start);
+        assert_eq!(scheduler_intent_after_scan(running.scheduler_intent, Some(false), Duration::ZERO), SchedulerIntent::Start);
         assert_eq!(
             status_line_for(&running, Some(false), &labels),
             "调度器：已停止"
         );
         // Confirmed alive: intent disarms.
-        let after_boot = scheduler_intent_after_scan(running.scheduler_intent, Some(true));
+        let after_boot = scheduler_intent_after_scan(running.scheduler_intent, Some(true), Duration::ZERO);
         assert_eq!(after_boot, SchedulerIntent::None);
         // Scheduler dies on its own, no user intent behind it -> abnormal.
         let crashed_running = BackendStateSnapshot {
@@ -701,9 +678,9 @@ mod tests {
             scheduler_intent: SchedulerIntent::Stop,
         };
         // The stop click is in flight (scheduler still alive): no disarm.
-        assert_eq!(scheduler_intent_after_scan(user_stopped.scheduler_intent, Some(true)), SchedulerIntent::Stop);
+        assert_eq!(scheduler_intent_after_scan(user_stopped.scheduler_intent, Some(true), Duration::ZERO), SchedulerIntent::Stop);
         // Stop lands: dead scan renders a normal stop.
-        assert_eq!(scheduler_intent_after_scan(user_stopped.scheduler_intent, Some(false)), SchedulerIntent::Stop);
+        assert_eq!(scheduler_intent_after_scan(user_stopped.scheduler_intent, Some(false), Duration::ZERO), SchedulerIntent::Stop);
         assert_eq!(
             status_line_for(&user_stopped, Some(false), &labels),
             "调度器：已停止"
@@ -713,41 +690,6 @@ mod tests {
             status_line_for(&user_stopped, None, &labels),
             "调度器：已停止"
         );
-    }
-
-    #[test]
-    fn scheduler_intent_after_scan_only_disarms_start_on_confirmed_alive() {
-        // Only (Start, Some(true)) disarms; everything else is a no-op.
-        for (intent, alive) in [
-            (SchedulerIntent::None, None),
-            (SchedulerIntent::None, Some(false)),
-            (SchedulerIntent::None, Some(true)),
-            (SchedulerIntent::Stop, None),
-            (SchedulerIntent::Stop, Some(false)),
-            (SchedulerIntent::Stop, Some(true)),
-            (SchedulerIntent::Start, None),
-            (SchedulerIntent::Start, Some(false)),
-        ] {
-            assert_eq!(
-                scheduler_intent_after_scan(intent, alive),
-                intent,
-                "intent {intent:?} alive {alive:?}"
-            );
-        }
-        assert_eq!(
-            scheduler_intent_after_scan(SchedulerIntent::Start, Some(true)),
-            SchedulerIntent::None
-        );
-    }
-
-    #[test]
-    fn scheduler_alive_count_boundaries() {
-        // Pinned rule (evidence task-3): Manager baseline = 1 -> not alive;
-        // a second alive child (the scheduler) crosses the threshold.
-        assert!(!scheduler_alive(0), "no children");
-        assert!(!scheduler_alive(1), "Manager baseline only");
-        assert!(scheduler_alive(2), "Manager + scheduler");
-        assert!(scheduler_alive(3), "any extra child counts alive");
     }
 
     fn stopped_snapshot() -> BackendStateSnapshot {
