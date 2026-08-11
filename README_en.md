@@ -144,6 +144,8 @@ The launcher adds the following environment variables:
 - The launcher shell does not include the ALAS payload; it must be assembled manually (see [Building and Assembling the Full Payload](#building-and-assembling-the-full-payload)).
 - The macOS app is unsigned; the first launch requires manually removing quarantine.
 - The menu bar quick view (task list / scheduler toggle) is enabled on macOS only.
+- Language switching only affects the launcher UI (menu bar, tray, stopped page); the ALAS web page language always follows `Gui.Language` in `config/deploy.yaml`, and the two can be out of sync (by design).
+- When the WebUI is secured with a password or SSL (`Deploy.Webui.Password` / `WebuiSSLKey` / `WebuiSSLCert`), the menu bar scheduler toggle degrades to process-level control (WebSocket scheduler control is unavailable), and the tray status line appends a "password/SSL configured, process-level control only" degraded hint.
 - Linux depends on `libwebkit2gtk-4.1` and a recent `glibc`.
 - adb restart/replacement is not implemented, and automatic pip updates are disabled.
 - The remote Release is a draft and has not been declared a stable public installer.

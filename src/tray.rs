@@ -118,7 +118,12 @@ pub fn build_tray(
         // stopped label regardless (toggle_label/status_line_for ignore the
         // discriminator outside Running).
         None,
-        &status_line_for(&initial, None, &labels),
+        &status_line_for(
+            &initial,
+            None,
+            &labels,
+            crate::deploy_config::ws_control_available(),
+        ),
         // No click in flight at startup.
         false,
     )?;
@@ -570,7 +575,12 @@ fn rebuild_menu(app: &AppHandle, shared: &TrayShared, section: TaskSection, sche
     let snapshot = shared.backend.snapshot();
     let tasks = shared.tasks.lock().unwrap().clone();
     let labels = load_control_labels(&shared.settings);
-    let status_line = status_line_for(&snapshot, scheduler_alive, &labels);
+    let status_line = status_line_for(
+        &snapshot,
+        scheduler_alive,
+        &labels,
+        crate::deploy_config::ws_control_available(),
+    );
     // Processing = a scheduler-control click is in flight; rebuilds during
     // that window render the disabled 处理中… toggle instead of the real one.
     let processing = shared.in_flight.load(Ordering::Relaxed);

@@ -229,10 +229,15 @@ pub fn toggle_enabled(status: BackendStatus, processing: bool) -> bool {
 /// SCHEDULER: `scheduler_alive` is the process-tree discriminator result
 /// (Some), or None when no process handle / scan result exists — conservative
 /// stopped (evidence task-3: unknown must never claim running).
+/// `ws_available` carries the degraded-mode flag (password/SSL configured in
+/// deploy.yaml): when false the line appends the localized degraded hint
+/// (process-level control only). The flag is a config property, not part of
+/// the backend snapshot — callers read `deploy_config::ws_control_available()`.
 pub fn status_line_for(
     snapshot: &BackendStateSnapshot,
     scheduler_alive: Option<bool>,
     labels: &ControlLabels,
+    ws_available: bool,
 ) -> String {
     let word = if snapshot.start_failed {
         &labels.failed
@@ -256,7 +261,13 @@ pub fn status_line_for(
             },
         }
     };
-    format!("{}{}{}", labels.scheduler, labels.sep, word)
+    let mut line = format!("{}{}{}", labels.scheduler, labels.sep, word);
+    if !ws_available {
+        // MINOR-4: degraded mode (password/SSL configured) — the status line
+        // carries the localized process-level-control hint.
+        line.push_str(&labels.degraded_hint);
+    }
+    line
 }
 
 /// Localized labels for the tray's scheduler-control rows (status line +
@@ -278,12 +289,16 @@ pub struct ControlLabels {
     pub stop: String,
     pub processing: String,
     pub sep: String,
+    /// Launcher-owned copy appended to the status line in degraded mode
+    /// (ws unavailable: password/SSL configured). NEVER overridden from the
+    /// ALAS i18n file — the webui has no equivalent string.
+    pub degraded_hint: String,
 }
 
 /// Built-in label table, keyed by webui language; any unknown or empty
 /// language falls back to zh-CN.
 fn builtin_labels(lang: &str) -> ControlLabels {
-    let (scheduler, running, stopped, initializing, failed, crashed, start, stop, processing, sep) =
+    let (scheduler, running, stopped, initializing, failed, crashed, start, stop, processing, sep, degraded_hint) =
         match lang {
             "zh-TW" => (
                 "調度器",
@@ -296,6 +311,7 @@ fn builtin_labels(lang: &str) -> ControlLabels {
                 "停止",
                 "處理中…",
                 "：",
+                "（密碼/SSL 已配置，僅進程級控制）",
             ),
             "en-US" => (
                 "Scheduler",
@@ -308,6 +324,8 @@ fn builtin_labels(lang: &str) -> ControlLabels {
                 "Stop",
                 "Processing…",
                 ": ",
+                // Leading space: appended after the status word, en template.
+                " (password/SSL configured, process-level control only)",
             ),
             "ja-JP" => (
                 "スケジューラー",
@@ -321,6 +339,7 @@ fn builtin_labels(lang: &str) -> ControlLabels {
                 "処理中…",
                 // Half-width ": " (en template), NOT the full-width "：".
                 ": ",
+                "（パスワード/SSL 設定済み、プロセスレベル制御のみ）",
             ),
             // zh-CN doubles as the fallback for any unknown or empty language.
             _ => (
@@ -334,6 +353,7 @@ fn builtin_labels(lang: &str) -> ControlLabels {
                 "停止",
                 "处理中…",
                 "：",
+                "（密码/SSL 已配置，仅进程级控制）",
             ),
         };
     ControlLabels {
@@ -347,6 +367,7 @@ fn builtin_labels(lang: &str) -> ControlLabels {
         stop: stop.into(),
         processing: processing.into(),
         sep: sep.into(),
+        degraded_hint: degraded_hint.into(),
     }
 }
 
@@ -532,14 +553,14 @@ mod tests {
             crashed: false,
             scheduler_intent: SchedulerIntent::None,
         };
-        assert_eq!(status_line_for(&stopped_failed, None, &labels), "调度器：启动失败");
+        assert_eq!(status_line_for(&stopped_failed, None, &labels, true), "调度器：启动失败");
         let stopped_clean = BackendStateSnapshot {
             status: BackendStatus::Stopped,
             start_failed: false,
             crashed: false,
             scheduler_intent: SchedulerIntent::None,
         };
-        assert_eq!(status_line_for(&stopped_clean, Some(true), &labels), "调度器：已停止");
+        assert_eq!(status_line_for(&stopped_clean, Some(true), &labels, true), "调度器：已停止");
         let initializing_clean = BackendStateSnapshot {
             status: BackendStatus::Initializing,
             start_failed: false,
@@ -547,7 +568,7 @@ mod tests {
             scheduler_intent: SchedulerIntent::None,
         };
         assert_eq!(
-            status_line_for(&initializing_clean, None, &labels),
+            status_line_for(&initializing_clean, None, &labels, true),
             "调度器：启动中…"
         );
     }
@@ -563,12 +584,12 @@ mod tests {
         };
         // Scheduler confirmed alive -> running; scan unknown (None) ->
         // conservative stopped (never alarm on an unknown scan).
-        assert_eq!(status_line_for(&running, Some(true), &labels), "调度器：运行中");
-        assert_eq!(status_line_for(&running, None, &labels), "调度器：已停止");
+        assert_eq!(status_line_for(&running, Some(true), &labels, true), "调度器：运行中");
+        assert_eq!(status_line_for(&running, None, &labels, true), "调度器：已停止");
         // Dead scheduler with no user intent -> abnormal stop.
-        assert_eq!(status_line_for(&running, Some(false), &labels), "调度器：异常停止");
+        assert_eq!(status_line_for(&running, Some(false), &labels, true), "调度器：异常停止");
         // Non-Running statuses ignore the discriminator entirely.
-        assert_eq!(status_line_for(&stopped_snapshot(), Some(true), &labels), "调度器：已停止");
+        assert_eq!(status_line_for(&stopped_snapshot(), Some(true), &labels, true), "调度器：已停止");
         let initializing = BackendStateSnapshot {
             status: BackendStatus::Initializing,
             start_failed: false,
@@ -576,7 +597,7 @@ mod tests {
             scheduler_intent: SchedulerIntent::None,
         };
         assert_eq!(
-            status_line_for(&initializing, Some(false), &labels),
+            status_line_for(&initializing, Some(false), &labels, true),
             "调度器：启动中…"
         );
     }
@@ -593,20 +614,20 @@ mod tests {
         // Dead scheduler: user stop intent and the post-start boot window both
         // render as a normal stop; a death with NO intent is abnormal.
         assert_eq!(
-            status_line_for(&snapshot(SchedulerIntent::Stop), Some(false), &labels),
+            status_line_for(&snapshot(SchedulerIntent::Stop), Some(false), &labels, true),
             "调度器：已停止"
         );
         assert_eq!(
-            status_line_for(&snapshot(SchedulerIntent::Start), Some(false), &labels),
+            status_line_for(&snapshot(SchedulerIntent::Start), Some(false), &labels, true),
             "调度器：已停止"
         );
         assert_eq!(
-            status_line_for(&snapshot(SchedulerIntent::None), Some(false), &labels),
+            status_line_for(&snapshot(SchedulerIntent::None), Some(false), &labels, true),
             "调度器：异常停止"
         );
         // Intent is irrelevant while the scheduler is confirmed alive.
         assert_eq!(
-            status_line_for(&snapshot(SchedulerIntent::Stop), Some(true), &labels),
+            status_line_for(&snapshot(SchedulerIntent::Stop), Some(true), &labels, true),
             "调度器：运行中"
         );
     }
@@ -620,16 +641,62 @@ mod tests {
             crashed: true,
             scheduler_intent: SchedulerIntent::None,
         };
-        assert_eq!(status_line_for(&crashed, None, &labels), "调度器：异常停止");
+        assert_eq!(status_line_for(&crashed, None, &labels, true), "调度器：异常停止");
         // start_failed outranks crashed.
         let crashed_after_failed_start = BackendStateSnapshot {
             start_failed: true,
             ..crashed
         };
         assert_eq!(
-            status_line_for(&crashed_after_failed_start, None, &labels),
+            status_line_for(&crashed_after_failed_start, None, &labels, true),
             "调度器：启动失败"
         );
+    }
+
+    #[test]
+    fn status_line_for_appends_degraded_hint_four_languages() {
+        // MINOR-4: ws unavailable (password/SSL configured) -> the status
+        // line carries the localized degraded hint; one assertion per
+        // language, plus a Running case to prove the hint rides any word.
+        let cases = [
+            ("zh-CN", "调度器：已停止（密码/SSL 已配置，仅进程级控制）"),
+            ("zh-TW", "調度器：已停止（密碼/SSL 已配置，僅進程級控制）"),
+            ("en-US", "Scheduler: stopped (password/SSL configured, process-level control only)"),
+            ("ja-JP", "スケジューラー: 停止済み（パスワード/SSL 設定済み、プロセスレベル制御のみ）"),
+        ];
+        for (lang, expected) in cases {
+            let labels = expected_labels(lang);
+            let line = status_line_for(&stopped_snapshot(), None, &labels, false);
+            assert_eq!(line, expected, "lang {lang}");
+        }
+        let zh = expected_labels("zh-CN");
+        let running = BackendStateSnapshot {
+            status: BackendStatus::Running,
+            start_failed: false,
+            crashed: false,
+            scheduler_intent: SchedulerIntent::None,
+        };
+        assert_eq!(
+            status_line_for(&running, Some(true), &zh, false),
+            "调度器：运行中（密码/SSL 已配置，仅进程级控制）"
+        );
+    }
+
+    #[test]
+    fn status_line_for_omits_degraded_hint_when_ws_available() {
+        // Normal mode (no password/SSL): the line is byte-identical to the
+        // pre-MINOR-4 format — the hint must never leak into normal operation.
+        let cases = [
+            ("zh-CN", "调度器：已停止"),
+            ("zh-TW", "調度器：已停止"),
+            ("en-US", "Scheduler: stopped"),
+            ("ja-JP", "スケジューラー: 停止済み"),
+        ];
+        for (lang, expected) in cases {
+            let labels = expected_labels(lang);
+            let line = status_line_for(&stopped_snapshot(), None, &labels, true);
+            assert_eq!(line, expected, "lang {lang}");
+        }
     }
 
     /// REGRESSION: scheduler boots (Start intent), is confirmed alive (intent
@@ -648,7 +715,7 @@ mod tests {
         // Boot window: dead scan stays non-alarming, intent stays armed.
         assert_eq!(scheduler_intent_after_scan(running.scheduler_intent, Some(false), Duration::ZERO), SchedulerIntent::Start);
         assert_eq!(
-            status_line_for(&running, Some(false), &labels),
+            status_line_for(&running, Some(false), &labels, true),
             "调度器：已停止"
         );
         // Confirmed alive: intent disarms.
@@ -660,7 +727,7 @@ mod tests {
             ..running
         };
         assert_eq!(
-            status_line_for(&crashed_running, Some(false), &labels),
+            status_line_for(&crashed_running, Some(false), &labels, true),
             "调度器：异常停止"
         );
     }
@@ -682,12 +749,12 @@ mod tests {
         // Stop lands: dead scan renders a normal stop.
         assert_eq!(scheduler_intent_after_scan(user_stopped.scheduler_intent, Some(false), Duration::ZERO), SchedulerIntent::Stop);
         assert_eq!(
-            status_line_for(&user_stopped, Some(false), &labels),
+            status_line_for(&user_stopped, Some(false), &labels, true),
             "调度器：已停止"
         );
         // Even an unknown scan after a user stop stays a normal stop.
         assert_eq!(
-            status_line_for(&user_stopped, None, &labels),
+            status_line_for(&user_stopped, None, &labels, true),
             "调度器：已停止"
         );
     }
@@ -716,12 +783,12 @@ mod tests {
     /// Expected full label set per language, from the REAL ALAS payload
     /// cross-check (evidence task-1: zero delta vs the built-in table).
     fn expected_labels(lang: &str) -> ControlLabels {
-        let (scheduler, running, stopped, initializing, failed, crashed, start, stop, processing, sep) =
+        let (scheduler, running, stopped, initializing, failed, crashed, start, stop, processing, sep, degraded_hint) =
             match lang {
-                "zh-TW" => ("調度器", "執行中", "已停止", "啟動中…", "啟動失敗", "異常停止", "啟動", "停止", "處理中…", "："),
-                "en-US" => ("Scheduler", "Running", "stopped", "initializing…", "start failed", "stopped unexpectedly", "Start", "Stop", "Processing…", ": "),
-                "ja-JP" => ("スケジューラー", "実行中", "停止済み", "起動中…", "起動失敗", "異常停止", "実行", "中止", "処理中…", ": "),
-                _ => ("调度器", "运行中", "已停止", "启动中…", "启动失败", "异常停止", "启动", "停止", "处理中…", "："),
+                "zh-TW" => ("調度器", "執行中", "已停止", "啟動中…", "啟動失敗", "異常停止", "啟動", "停止", "處理中…", "：", "（密碼/SSL 已配置，僅進程級控制）"),
+                "en-US" => ("Scheduler", "Running", "stopped", "initializing…", "start failed", "stopped unexpectedly", "Start", "Stop", "Processing…", ": ", " (password/SSL configured, process-level control only)"),
+                "ja-JP" => ("スケジューラー", "実行中", "停止済み", "起動中…", "起動失敗", "異常停止", "実行", "中止", "処理中…", ": ", "（パスワード/SSL 設定済み、プロセスレベル制御のみ）"),
+                _ => ("调度器", "运行中", "已停止", "启动中…", "启动失败", "异常停止", "启动", "停止", "处理中…", "：", "（密码/SSL 已配置，仅进程级控制）"),
             };
         ControlLabels {
             scheduler: scheduler.into(),
@@ -734,6 +801,7 @@ mod tests {
             stop: stop.into(),
             processing: processing.into(),
             sep: sep.into(),
+            degraded_hint: degraded_hint.into(),
         }
     }
 

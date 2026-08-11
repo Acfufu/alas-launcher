@@ -144,6 +144,8 @@ gh release create v0.1.0 release/AzurLaneAutoScript.app --title "v0.1.0" --notes
 - 启动器外壳不含 ALAS payload，需要手动拼装（见[构建与完整 payload 组装](#构建与完整-payload-组装)）。
 - macOS 应用未签名，首次打开需要手动解除 quarantine。
 - 菜单栏速览（任务列表/调度器启停）仅在 macOS 上启用。
+- 语言切换仅影响启动器 UI（菜单栏、托盘、停止页）；ALAS 网页语言始终跟随 `config/deploy.yaml` 的 `Gui.Language`，二者可能不同步（设计如此）。
+- 为 WebUI 配置密码或 SSL（`Deploy.Webui.Password` / `WebuiSSLKey` / `WebuiSSLCert`）后，菜单栏调度器开关退化为进程级控制（无法通过 WebSocket 驱动调度器），托盘状态行会追加「密码/SSL 已配置，仅进程级控制」降级提示。
 - Linux 依赖 `libwebkit2gtk-4.1` 与较新的 `glibc`。
 - adb 重启/替换未实现；pip 自动更新已禁用。
 - 远程 Release 为草稿，尚未声明为稳定公开安装包。
