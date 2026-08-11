@@ -46,17 +46,18 @@ const TRAY_POLL_INTERVAL_SECS: Duration = Duration::from_secs(3);
 const SCHEDULER_CLICK_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Everything the tray menu needs beyond the AppHandle: the backend state
-/// (shared with main.rs), the cached task list, the resolved webui language
-/// (read ONCE from deploy.yaml at build time — it selects the i18n file for
-/// task display names), the stop flag (shared with main.rs so ExitRequested
-/// can halt the poll thread), the refresh signal channel (manual Refresh
-/// menu item) and the WS in-flight flag (dedups concurrent toggles — only
-/// one scheduler click session at a time).
+/// (shared with main.rs), the cached task list, the shared shell settings
+/// (todo 4 — the effective UI language is re-resolved from it on every menu
+/// build / poll so a live language switch re-renders the tray), the stop
+/// flag (shared with main.rs so ExitRequested can halt the poll thread),
+/// the refresh signal channel (manual Refresh menu item, and the todo-4
+/// language-switch wake) and the WS in-flight flag (dedups concurrent
+/// toggles — only one scheduler click session at a time).
 #[derive(Clone)]
 struct TrayShared {
     backend: Arc<BackendLifecycle>,
     tasks: Arc<Mutex<Vec<Task>>>,
-    language: String,
+    settings: Arc<Mutex<crate::shell_settings::ShellSettings>>,
     stop: Arc<AtomicBool>,
     refresh: mpsc::Sender<()>,
     in_flight: Arc<AtomicBool>,
@@ -67,28 +68,33 @@ struct TrayShared {
 /// `backend` is the shared lifecycle object (also owned by main.rs); `port`
 /// is the ALAS webui port used for the main-page URL and the task fetch;
 /// `stop` is the shared poll-thread stop flag (also owned by main.rs, set in
-/// ExitRequested). A returned `Err` is warn-and-continue at the call site — a
-/// tray failure must never abort app startup.
+/// ExitRequested); `settings` is the shared shell settings (todo 4) whose
+/// effective language selects every label — re-read per menu build, so a
+/// language switch re-renders the tray. A returned `Err` is warn-and-continue
+/// at the call site — a tray failure must never abort app startup.
+///
+/// Returns the tray icon PLUS the poll-thread refresh channel (todo 4 wake
+/// mechanism): main.rs keeps the sender so the app-level language handler can
+/// force a tray rebuild (`refresh.send(())` wakes the poll thread, which
+/// always rebuilds on a wake — the force_rebuild path below).
 pub fn build_tray(
     app: &tauri::App,
     backend: Arc<BackendLifecycle>,
     port: u16,
     stop: Arc<AtomicBool>,
-) -> tauri::Result<tauri::tray::TrayIcon> {
+    settings: Arc<Mutex<crate::shell_settings::ShellSettings>>,
+) -> tauri::Result<(tauri::tray::TrayIcon, mpsc::Sender<()>)> {
     let (refresh_tx, refresh_rx) = mpsc::channel::<()>();
-    // deploy.yaml is read once here, not per poll cycle: the language only
-    // changes on app restart anyway (Gui.Language).
-    let language = deploy_language().unwrap_or_else(|| "zh-CN".to_string());
     let shared = TrayShared {
         backend,
         tasks: Arc::new(Mutex::new(Vec::new())),
-        language,
+        settings,
         stop,
-        refresh: refresh_tx,
+        refresh: refresh_tx.clone(),
         in_flight: Arc::new(AtomicBool::new(false)),
     };
 
-    let labels = load_control_labels();
+    let labels = load_control_labels(&shared.settings);
     let initial = BackendStateSnapshot {
         status: BackendStatus::Stopped,
         start_failed: false,
@@ -183,7 +189,7 @@ pub fn build_tray(
         }
     });
 
-    Ok(tray)
+    Ok((tray, refresh_tx))
 }
 
 /// (Re)build the whole menu from the current backend state, task cache and
@@ -359,7 +365,7 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
     };
 
     let action = toggle_decision(&snapshot, scheduler_alive, ws_available);
-    let labels = load_control_labels();
+    let labels = load_control_labels(&shared.settings);
     match action {
         // Initializing -> NoOp (the item is disabled anyway; this also makes
         // a second click during a 60s start window a no-op — BLOCKER-3:
@@ -508,7 +514,7 @@ fn rebuild_menu(app: &AppHandle, shared: &TrayShared, section: TaskSection, sche
     }
     let snapshot = shared.backend.snapshot();
     let tasks = shared.tasks.lock().unwrap().clone();
-    let labels = load_control_labels();
+    let labels = load_control_labels(&shared.settings);
     let status_line = status_line_for(&snapshot, scheduler_alive, &labels);
     // Processing = a scheduler-control click is in flight; rebuilds during
     // that window render the disabled 处理中… toggle instead of the real one.
@@ -572,10 +578,20 @@ fn poll_once(
     // API, see alas_tasks module doc).
     let fetched: Result<Vec<Task>, ()> = if status == BackendStatus::Running {
         let alas_dir = std::env::current_dir().unwrap_or_default();
+        // Effective UI language for task display names: resolved under a
+        // brief settings lock (deploy.yaml read BEFORE the lock — no file
+        // I/O under the lock), cloned, and the lock released before the
+        // fetch below.
+        let deploy_lang = deploy_language();
+        let task_language = shared
+            .settings
+            .lock()
+            .unwrap()
+            .resolved_language(deploy_lang.as_deref());
         match alas_tasks::now_str() {
             // Clock failure -> Err(()) like a fetch failure (now_str already
             // logged the real error); poll_decision degrades the section.
-            Ok(now) => alas_tasks::fetch_tasks(&alas_dir, &now, &shared.language).map_err(|_| ()),
+            Ok(now) => alas_tasks::fetch_tasks(&alas_dir, &now, &task_language).map_err(|_| ()),
             Err(_) => Err(()),
         }
     } else {
@@ -721,13 +737,39 @@ fn uvicorn_alive_child_count(backend_pid: u32, enable_reload: bool) -> usize {
         .count()
 }
 
-/// Tray control labels resolved from deploy.yaml language + the ALAS i18n
-/// file (current dir); missing payload → built-in zh-CN table, never panic.
-fn load_control_labels() -> ControlLabels {
-    let lang = deploy_language().unwrap_or_else(|| "zh-CN".to_string());
+/// Tray control labels resolved from the shared shell settings' effective
+/// language (todo 4: settings override → deploy.yaml → zh-CN) + the ALAS
+/// i18n file (current dir); missing payload → built-in zh-CN table, never
+/// panic. Called per menu build/poll, so a live language switch re-renders
+/// the tray without a restart.
+fn load_control_labels(settings: &Arc<Mutex<crate::shell_settings::ShellSettings>>) -> ControlLabels {
+    // deploy.yaml is file I/O — read it BEFORE taking the settings lock.
+    let deploy_lang = deploy_language();
+    let lang = settings
+        .lock()
+        .unwrap()
+        .resolved_language(deploy_lang.as_deref());
     let alas_dir = std::env::current_dir().unwrap_or_default();
     let i18n = alas_tasks::load_i18n(&alas_dir, &lang);
     control_labels(&lang, &i18n)
+}
+
+/// Re-navigate the main window to a freshly localized stopped page after a
+/// language switch (todo 4). The stopped-page copy is baked into its data:
+/// URL at build time, so a language change must rebuild it; the webui URL
+/// (backend Running) is language-independent and needs no refresh. Called by
+/// the main.rs menu-event orchestration; a no-op while the backend runs.
+pub(crate) fn refresh_stopped_page(
+    app: &AppHandle,
+    backend: &BackendLifecycle,
+    settings: &Arc<Mutex<crate::shell_settings::ShellSettings>>,
+    port: u16,
+) {
+    if backend.snapshot().status == BackendStatus::Running {
+        return;
+    }
+    let labels = load_control_labels(settings);
+    navigate_main(app, main_page_url(BackendStatus::Stopped, port, &labels));
 }
 
 /// Point the main window at `url` (errors are non-fatal).
@@ -795,8 +837,10 @@ mod tests {
         assert_eq!(labels.scheduler, "调度器");
         assert_eq!(labels.failed, "启动失败");
         assert_eq!(labels.sep, "：");
-        // Live call must not panic regardless of ambient cwd.
-        let live = load_control_labels();
+        // Live call must not panic regardless of ambient cwd; the language
+        // now resolves from the shared settings (None → deploy.yaml → zh-CN).
+        let settings = Arc::new(Mutex::new(crate::shell_settings::ShellSettings::default()));
+        let live = load_control_labels(&settings);
         assert!(!live.scheduler.is_empty());
     }
 
