@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "width": 1200,
+  "fps": 30,
+  "duration": 6.0,
+  "colors": 256,
+  "dither": "none",
+  "transparent_color": "#ff00ff",
+  "alpha_threshold": 128,
+  "clip_to_base_alpha": true,
+  "max_size_mb": 2.0,
+  "reveals": [
+    {"id": "step-1", "axis": "x", "start": 0.15, "end": 0.75, "exit": {"start": 5.0, "end": 5.7}},
+    {"id": "step-2", "axis": "x", "start": 0.55, "end": 1.15, "exit": {"start": 5.0, "end": 5.7}},
+    {"id": "step-3", "axis": "x", "start": 0.95, "end": 1.55, "exit": {"start": 5.0, "end": 5.7}},
+    {"id": "step-4", "axis": "x", "start": 1.35, "end": 1.95, "exit": {"start": 5.0, "end": 5.7}},
+    {"id": "step-5", "axis": "x", "start": 1.75, "end": 2.35, "exit": {"start": 5.0, "end": 5.7}}
+  ],
+  "layers": [
+    {"id": "arrow-1", "enter": {"start": 0.75, "end": 1.1, "from": [0, 0]}, "exit": {"start": 5.0, "end": 5.6, "to": [0, 0]}},
+    {"id": "arrow-2", "enter": {"start": 1.15, "end": 1.5, "from": [0, 0]}, "exit": {"start": 5.0, "end": 5.6, "to": [0, 0]}},
+    {"id": "arrow-3", "enter": {"start": 1.55, "end": 1.9, "from": [0, 0]}, "exit": {"start": 5.0, "end": 5.6, "to": [0, 0]}},
+    {"id": "arrow-4", "enter": {"start": 1.95, "end": 2.3, "from": [0, 0]}, "exit": {"start": 5.0, "end": 5.6, "to": [0, 0]}}
+  ],
+  "reduced_motion": {"mode": "static", "visible": ["step-1", "step-2", "step-3", "step-4", "step-5", "arrow-1", "arrow-2", "arrow-3", "arrow-4"]}
+}
