@@ -60,6 +60,14 @@ pub struct BackendState {
     pub start_failed: bool,
     pub crashed: bool,
     pub scheduler_intent: SchedulerIntent,
+    /// Generation counter for the exit race (see `BackendLifecycle::start`):
+    /// `stop()` bumps it, so a start whose spawn is still in flight detects
+    /// the interruption when it re-locks after the spawn and disposes its
+    /// late child instead of overwriting the stopped state.
+    epoch: u64,
+    /// Epoch captured by the latest `begin_start()` — the start attempt the
+    /// next `start()` call belongs to. `None` = no begin_start pending.
+    pending_start_epoch: Option<u64>,
 }
 
 impl Default for BackendState {
@@ -70,6 +78,8 @@ impl Default for BackendState {
             start_failed: false,
             crashed: false,
             scheduler_intent: SchedulerIntent::None,
+            epoch: 0,
+            pending_start_epoch: None,
         }
     }
 }
@@ -245,6 +255,10 @@ impl BackendLifecycle {
         state.start_failed = false;
         state.crashed = false;
         state.scheduler_intent = SchedulerIntent::Start;
+        // Bind this start attempt to the current epoch; `start()` compares it
+        // against the live epoch to detect a `stop()` landing in the
+        // begin_start → spawn window (the exit race, MAJOR-2).
+        state.pending_start_epoch = Some(state.epoch);
     }
 
     /// Start the backend on `port`.
@@ -258,12 +272,26 @@ impl BackendLifecycle {
     /// No lock is held across the spawn either: the port-readiness wait inside
     /// `ManagedBackend::new` can take up to 60s, and status readers (the tray
     /// poll thread reads the status every 3s) must never block on it.
+    ///
+    /// EXIT RACE (MAJOR-2): once the spawn runs on a worker thread, an
+    /// ExitRequested can land inside the spawn window. `stop()` bumps the
+    /// epoch, so this method detects the interruption — at entry (a stop
+    /// between `begin_start` and here aborts before any spawn) or after the
+    /// spawn (a stop mid-spawn disposes the late child and re-affirms
+    /// Stopped). Either way the exit path stays authoritative and the start
+    /// reports `STOP_INTERVENED` — never a bogus Running.
     pub fn start(&self, port: u16) -> Result<()> {
-        let old = {
+        let (old, epoch) = {
             let mut state = self.state.lock().unwrap();
+            if let Some(pending) = state.pending_start_epoch {
+                state.pending_start_epoch = None;
+                if pending != state.epoch {
+                    return Err(anyhow!(STOP_INTERVENED));
+                }
+            }
             state.status = BackendStatus::Initializing;
             state.start_failed = false;
-            state.backend.take()
+            (state.backend.take(), state.epoch)
         };
         // Outside the lock: fully terminate + drop the old backend before any
         // new process can exist.
@@ -271,6 +299,21 @@ impl BackendLifecycle {
         match (self.spawner)(port) {
             Ok(backend) => {
                 let mut state = self.state.lock().unwrap();
+                if state.epoch != epoch {
+                    // A stop() intervened while the spawn was in flight: it
+                    // already took backend=None and set Stopped. Dispose the
+                    // late child (terminate the process group) so it cannot
+                    // orphan, re-affirm Stopped, and report the interruption.
+                    state.status = BackendStatus::Stopped;
+                    state.start_failed = false;
+                    state.crashed = false;
+                    state.scheduler_intent = SchedulerIntent::None;
+                    drop(state);
+                    let mut backend = backend;
+                    let _ = backend.terminate();
+                    drop(backend);
+                    return Err(anyhow!(STOP_INTERVENED));
+                }
                 state.backend = Some(backend);
                 state.status = BackendStatus::Running;
                 state.crashed = false;
@@ -294,7 +337,8 @@ impl BackendLifecycle {
     /// Stop the backend (if any): status -> Stopped, all failure flags and
     /// the scheduler intent cleared, then the process is terminated and
     /// dropped OUTSIDE the lock. Always ends Stopped; never panics on a
-    /// missing backend.
+    /// missing backend. Bumps the epoch so an in-flight async start detects
+    /// the stop and disposes its late child (the exit race, MAJOR-2).
     pub fn stop(&self) -> BackendStatus {
         let old = {
             let mut state = self.state.lock().unwrap();
@@ -302,6 +346,9 @@ impl BackendLifecycle {
             state.start_failed = false;
             state.crashed = false;
             state.scheduler_intent = SchedulerIntent::None;
+            state.epoch += 1;
+            // pending_start_epoch is deliberately NOT cleared: it must survive
+            // so a start() arriving after this stop can still detect it.
             state.backend.take()
         };
         terminate_old(old);
@@ -357,6 +404,10 @@ fn terminate_old(old: Option<ManagedBackend>) {
         drop(old);
     }
 }
+
+/// Error text for a start interrupted by [`BackendLifecycle::stop`] (the exit
+/// race) — the caller must not treat it as a start failure.
+const STOP_INTERVENED: &str = "stop intervened during backend start";
 
 /// The webui root URL for `port` (owns the port concept; plain String, no
 /// tauri dependency).
@@ -597,6 +648,100 @@ mod tests {
             "first child must be terminated before the second spawn"
         );
         assert!(process_is_alive(pids[1]), "second child stays up");
+    }
+
+    // ---- the exit race (MAJOR-2): stop() landing inside the spawn window ----
+
+    /// The worker-thread start runs outside the menu-event thread, so an
+    /// ExitRequested can land while the (up-to-60s) spawn is still in flight.
+    /// `stop()` must not be overwritten by the late-finishing start: the fresh
+    /// child is disposed, the state stays Stopped, and start() reports the
+    /// interruption.
+    #[test]
+    fn stop_during_start_disposes_child_and_restores_stopped() {
+        // A 2-party barrier used twice keeps the ordering deterministic
+        // (no sleep, no channel race): round 1 signals "the spawn step is
+        // entered", round 2 releases the spawn only AFTER the test's stop()
+        // has landed — so the epoch bump strictly precedes the re-lock.
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let gate2 = Arc::clone(&gate);
+        let pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let pids2 = Arc::clone(&pids);
+        let lc = Arc::new(BackendLifecycle::new_with_spawner(move |_| {
+            gate2.wait(); // signal mid-spawn
+            gate2.wait(); // hold until the test's stop() has landed
+            let child = sleep_child();
+            pids2.lock().unwrap().push(child.id());
+            Ok(ManagedBackend::from_child(child))
+        }));
+
+        lc.begin_start();
+        let worker = {
+            let lc = Arc::clone(&lc);
+            std::thread::spawn(move || lc.start(22267))
+        };
+        gate.wait(); // the worker is now inside the spawn step
+
+        lc.stop(); // the exit race lands inside the spawn window
+
+        gate.wait(); // release the spawn; the epoch bump already landed
+        let err = worker.join().unwrap().unwrap_err();
+        assert!(
+            err.to_string().contains("stop intervened"),
+            "start must report the interruption, got: {err}"
+        );
+        let s = lc.snapshot();
+        assert_eq!(s.status, BackendStatus::Stopped, "state restored to Stopped");
+        assert!(!s.start_failed, "an interruption is not a start failure");
+        assert_eq!(lc.backend_pid(), None, "interrupted child is not installed");
+        let pid = pids.lock().unwrap()[0];
+        assert!(
+            !process_is_alive(pid),
+            "interrupted child must be disposed, not orphaned"
+        );
+    }
+
+    /// A stop landing between begin_start and the worker's start() entry must
+    /// abort the start BEFORE any spawn — the exit path stays authoritative.
+    #[test]
+    fn stop_between_begin_start_and_start_aborts_without_spawning() {
+        let spawn_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let spawn_count2 = Arc::clone(&spawn_count);
+        let lc = BackendLifecycle::new_with_spawner(move |_| {
+            *spawn_count2.lock().unwrap() += 1;
+            Ok(ManagedBackend::from_child(sleep_child()))
+        });
+        lc.begin_start();
+        lc.stop(); // the exit lands between begin_start and start()
+        let err = lc.start(22267).unwrap_err();
+        assert!(
+            err.to_string().contains("stop intervened"),
+            "start must report the interruption, got: {err}"
+        );
+        assert_eq!(
+            *spawn_count.lock().unwrap(),
+            0,
+            "no spawn may happen after a stop"
+        );
+        assert_eq!(lc.status(), BackendStatus::Stopped);
+    }
+
+    /// BLOCKER-3 double-spawn insurance: while a start is in flight the
+    /// lifecycle is Initializing, which makes the toggle decision NoOp for
+    /// every (scheduler_alive, ws_available) combination — a second click
+    /// never reaches a second start(). The tray's in-flight guard is the
+    /// second layer on top (tray.rs in_flight_acquire_rejects_second_toggle).
+    #[test]
+    fn begin_start_disables_toggle_so_a_second_click_cannot_spawn() {
+        let lc = BackendLifecycle::new_with_spawner(ok_spawner());
+        lc.begin_start();
+        let s = lc.snapshot();
+        assert_eq!(s.status, BackendStatus::Initializing);
+        for alive in [false, true] {
+            for ws in [false, true] {
+                assert_eq!(toggle_decision(&s, alive, ws), ToggleAction::NoOp);
+            }
+        }
     }
 
     #[test]
