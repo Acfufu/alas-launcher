@@ -9,8 +9,6 @@
 // It consumes these rows and turns them into native menu items; this module
 // never knows a menu bar exists.
 
-use std::collections::HashSet;
-
 use crate::{
     alas_tasks::{self, Task},
     backend::{BackendStateSnapshot, BackendStatus, SchedulerIntent},
@@ -89,7 +87,16 @@ pub fn task_section_items(tasks: &[Task]) -> Vec<TaskMenuItem> {
 }
 
 /// The task-section rendering implied by backend status + fetch result.
+/// Delegates to [`section_for`] — kept for the tray's render path.
 pub fn task_section(status: BackendStatus, fetch: Result<Vec<Task>, ()>) -> TaskSection {
+    section_for(status, fetch)
+}
+
+/// The task-section implied by backend status + fetch result: Degraded when
+/// the backend is not Running or the fetch failed, Empty when it ran with
+/// zero tasks, Tasks otherwise. Pure — the single mapping shared by
+/// [`task_section`] and [`poll_decision`].
+pub fn section_for(status: BackendStatus, fetch: Result<Vec<Task>, ()>) -> TaskSection {
     if status != BackendStatus::Running {
         return TaskSection::Degraded;
     }
@@ -100,18 +107,23 @@ pub fn task_section(status: BackendStatus, fetch: Result<Vec<Task>, ()>) -> Task
     }
 }
 
-/// Whether the command-name set differs between the old and new task lists,
-/// used to decide whether a rebuild is needed. True iff any command in OLD is
-/// missing from NEW, or any command in NEW is missing from OLD.
+/// Whether the task rows must be rebuilt between the old and new task lists:
+/// true iff the lists differ in length or any position differs in the
+/// (command, status, next_time) triple. Command changes move tasks in/out of
+/// the list, status changes move a row between groups (运行中/队列中/等待中),
+/// and next_time changes the row's shown time — all require a rebuild.
 ///
-/// Identity is the `command` key, NOT the display `name`: names come from the
-/// i18n file (`Task.<command>.name`) and can change with the webui language,
-/// while the command equals the stable alas.json top-level key.
+/// The `name` field is deliberately NOT compared: names come from the i18n
+/// file (`Task.<command>.name`) and change with the webui language, while
+/// command/status/next_time come from the stable alas.json data. fetch_tasks
+/// sorts by `next_time` (stable), so same-list zip comparison is
+/// deterministic and cannot false-positive on reordering.
 pub fn menu_diff_changed(old: &[Task], new: &[Task]) -> bool {
-    let new_commands: HashSet<&str> = new.iter().map(|t| t.command.as_str()).collect();
-    let old_commands: HashSet<&str> = old.iter().map(|t| t.command.as_str()).collect();
-    old.iter().any(|t| !new_commands.contains(t.command.as_str()))
-        || new.iter().any(|t| !old_commands.contains(t.command.as_str()))
+    old.len() != new.len()
+        || old
+            .iter()
+            .zip(new.iter())
+            .any(|(a, b)| a.command != b.command || a.status != b.status || a.next_time != b.next_time)
 }
 
 /// One poll cycle's decision: the section to render, whether the menu must be
@@ -156,11 +168,7 @@ pub fn poll_decision(
             replace_cache: None,
         },
         Ok(tasks) => {
-            let section = if tasks.is_empty() {
-                TaskSection::Empty
-            } else {
-                TaskSection::Tasks
-            };
+            let section = section_for(status, Ok(tasks.clone()));
             let changed = last_section != section || menu_diff_changed(cached, &tasks);
             PollOutcome {
                 section,
@@ -1090,21 +1098,53 @@ mod tests {
     }
 
     #[test]
-    fn menu_diff_changed_unchanged_is_false() {
+    fn menu_diff_changed_status_and_time_change_rebuilds() {
         let old = vec![Task {
             name: "每日任务".into(),
             command: "Daily".into(),
             ..Default::default()
         }];
-        // Same command set (status changed) -> no structural change.
+        // Same command set but status AND next_time changed -> MUST rebuild:
+        // a completed task moves to another status group and its row would
+        // otherwise show a stale next-time. (Flipped from the old behavior
+        // that locked "status change does NOT rebuild".)
         let new = vec![Task {
             name: "每日任务".into(),
             command: "Daily".into(),
             status: alas_tasks::TaskStatus::Waiting,
             next_time: Some("2026-08-11 00:00:00".into()),
         }];
-        assert!(!menu_diff_changed(&old, &new));
+        assert!(menu_diff_changed(&old, &new));
         assert!(!menu_diff_changed(&[], &[]));
+    }
+
+    #[test]
+    fn menu_diff_changed_triple_matrix() {
+        let base = || Task {
+            name: "每日任务".into(),
+            command: "Daily".into(),
+            status: alas_tasks::TaskStatus::Waiting,
+            next_time: Some("2026-08-11 00:00:00".into()),
+        };
+        // No change -> no rebuild.
+        assert!(!menu_diff_changed(&[base()], &[base()]));
+        // Command change -> rebuild.
+        let mut command = base();
+        command.command = "Hard".into();
+        assert!(menu_diff_changed(&[base()], &[command]));
+        // Status change -> rebuild.
+        let mut status = base();
+        status.status = alas_tasks::TaskStatus::Running;
+        assert!(menu_diff_changed(&[base()], &[status]));
+        // next_time change -> rebuild.
+        let mut next_time = base();
+        next_time.next_time = Some("2026-08-11 06:00:00".into());
+        assert!(menu_diff_changed(&[base()], &[next_time]));
+        // Display-name-only change (i18n) -> NO rebuild (whole-Task compare
+        // is forbidden: name shifts with webui language).
+        let mut name = base();
+        name.name = "Main".into();
+        assert!(!menu_diff_changed(&[base()], &[name]));
     }
 
     #[test]
@@ -1170,30 +1210,30 @@ mod tests {
     }
 
     #[test]
-    fn task_section_matrix() {
+    fn section_for_matrix() {
         let one = vec![Task {
             name: "每日任务".into(),
             command: "Daily".into(),
             ..Default::default()
         }];
         assert_eq!(
-            task_section(BackendStatus::Running, Ok(one.clone())),
+            section_for(BackendStatus::Running, Ok(one.clone())),
             TaskSection::Tasks
         );
         assert_eq!(
-            task_section(BackendStatus::Running, Ok(vec![])),
+            section_for(BackendStatus::Running, Ok(vec![])),
             TaskSection::Empty
         );
         assert_eq!(
-            task_section(BackendStatus::Running, Err(())),
+            section_for(BackendStatus::Running, Err(())),
             TaskSection::Degraded
         );
         assert_eq!(
-            task_section(BackendStatus::Stopped, Ok(one.clone())),
+            section_for(BackendStatus::Stopped, Ok(one.clone())),
             TaskSection::Degraded
         );
         assert_eq!(
-            task_section(BackendStatus::Initializing, Err(())),
+            section_for(BackendStatus::Initializing, Err(())),
             TaskSection::Degraded
         );
     }
