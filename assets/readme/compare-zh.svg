@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200" height="440" viewBox="0 0 1200 440"
+     role="img" aria-labelledby="title desc">
+  <title id="title">ALAS Launcher 与原版启动器对比</title>
+  <desc id="desc">原版启动时杀进程、更新 pip、更新 Electron、重启 adb；本启动器只更新 Repo 并打开 WebUI，重复启动仅聚焦窗口。</desc>
+
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#081B30"/>
+      <stop offset="1" stop-color="#143152"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="440" rx="26" fill="url(#bg)"/>
+  <rect x="1" y="1" width="1198" height="438" rx="25" fill="none" stroke="#2E5A8A" stroke-opacity="0.55" stroke-width="2"/>
+
+  <text x="96" y="76" font-family="system-ui, -apple-system, 'PingFang SC', sans-serif" font-size="38" font-weight="700" fill="#F5F9FF">启动时，它做了什么？</text>
+  <rect x="98" y="94" width="120" height="4" rx="2" fill="#4CC9F0"/>
+
+  <!-- 原版（左） -->
+  <rect x="96" y="132" width="470" height="236" rx="16" fill="#33121A" stroke="#8A2E43" stroke-opacity="0.9"/>
+  <text x="124" y="172" font-family="system-ui, -apple-system, 'PingFang SC', sans-serif" font-size="24" font-weight="700" fill="#E88BA0">原版启动器</text>
+  <g font-family="system-ui, -apple-system, 'PingFang SC', sans-serif" font-size="19" fill="#D8A0AE">
+    <line x1="124" y1="196" x2="538" y2="196" stroke="#8A2E43" stroke-opacity="0.6"/>
+    <text x="124" y="228"><tspan fill="#E88BA0">✕</tspan>  更新 git repo</text>
+    <text x="124" y="262"><tspan fill="#E88BA0">✕</tspan>  杀掉现有进程</text>
+    <text x="124" y="296"><tspan fill="#E88BA0">✕</tspan>  更新 pip 依赖</text>
+    <text x="124" y="330"><tspan fill="#E88BA0">✕</tspan>  更新 Electron 资源 · 重启 adb</text>
+  </g>
+
+  <!-- VS -->
+  <circle cx="631" cy="250" r="34" fill="#0E2440" stroke="#4CC9F0" stroke-width="2"/>
+  <text x="631" y="261" font-family="system-ui, -apple-system, sans-serif" font-size="24" font-weight="700" fill="#7FD4F2" text-anchor="middle">VS</text>
+
+  <!-- 本启动器（右） -->
+  <rect x="694" y="132" width="470" height="236" rx="16" fill="#0B2B3A" stroke="#2E9BC0" stroke-opacity="0.9"/>
+  <text x="722" y="172" font-family="system-ui, -apple-system, 'PingFang SC', sans-serif" font-size="24" font-weight="700" fill="#7FD4F2">ALAS Launcher</text>
+  <g font-family="system-ui, -apple-system, 'PingFang SC', sans-serif" font-size="19" fill="#A8CDDC">
+    <line x1="722" y1="196" x2="1136" y2="196" stroke="#2E9BC0" stroke-opacity="0.6"/>
+    <text x="722" y="228"><tspan fill="#6FDFA8">✓</tspan>  只更新 git repo</text>
+    <text x="722" y="262"><tspan fill="#6FDFA8">✓</tspan>  直接打开 WebUI</text>
+    <text x="722" y="296"><tspan fill="#6FDFA8">✓</tspan>  重复启动 → 聚焦已有窗口</text>
+    <text x="722" y="330"><tspan fill="#6FDFA8">✓</tspan>  不碰 pip · 不杀进程 · 不重启 adb</text>
+  </g>
+
+  <!-- 底部结论 -->
+  <rect x="96" y="386" width="1068" height="30" rx="8" fill="#0E2440" stroke="#2E5A8A" stroke-opacity="0.8"/>
+  <text x="630" y="406" font-family="system-ui, -apple-system, 'PingFang SC', sans-serif" font-size="17" fill="#8FC7E8" text-anchor="middle">原生主心态：能用就行，尽量少折腾 —— 启动只做该做的事</text>
+</svg>
