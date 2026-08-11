@@ -316,8 +316,9 @@ fn stopped_page_url(labels: &ControlLabels) -> Url {
 /// - `StartScheduler` / `StopScheduler`: scheduler-only click, NO window
 ///   navigation — the webui stays alive.
 /// - `StartBackend`: backend down — bring the whole backend up (existing
-///   ordering contract inside [`BackendLifecycle::start`]), navigate to the
-///   webui, then click Start over WS from a worker thread.
+///   ordering contract inside [`BackendLifecycle::start`]) on a worker
+///   thread so the UI thread never blocks (MAJOR-2), navigate to the
+///   webui, then click Start over WS from the SAME worker.
 /// - `StopBackend` (degraded: webui password/SSL configured): legacy
 ///   process-level stop.
 ///
@@ -378,28 +379,19 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
         }
         ToggleAction::StartBackend => {
             // Show "initializing…" (and make re-entry a no-op) for the whole
-            // spawn window, which may take up to 60s.
+            // spawn window, which may take up to 60s. The spawn itself runs
+            // on a worker thread (MAJOR-2): the menu-event thread must never
+            // block on the readiness wait.
             shared.backend.begin_start();
-            match shared.backend.start(port) {
-                Ok(()) => {
-                    navigate_main(app, main_page_url(BackendStatus::Running, port, &labels));
-                    if ws_available {
-                        spawn_scheduler_click(
-                            port,
-                            SchedulerAction::Start,
-                            labels.clone(),
-                            guard,
-                            shared.refresh.clone(),
-                        );
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to start backend: {e}");
-                    // Status is now Stopped + start_failed (set inside the
-                    // module); the window stays on the stopped page and the
-                    // next menu rebuild shows the localized failed label.
-                }
-            }
+            spawn_start_worker(
+                app.clone(),
+                Arc::clone(&shared.backend),
+                port,
+                labels.clone(),
+                guard,
+                shared.refresh.clone(),
+                ws_available,
+            );
         }
         ToggleAction::StopScheduler | ToggleAction::StartScheduler => {
             // Scheduler-only control: the click is delivered from a worker
@@ -494,6 +486,62 @@ fn spawn_scheduler_click(
         })
     {
         warn!("Failed to spawn scheduler-click worker: {e}");
+    }
+}
+
+/// Spawn the backend start on a dedicated worker thread (MAJOR-2): the
+/// up-to-60s spawn window must never block the menu-event (UI) thread.
+///
+/// The worker owns ONE in-flight guard for the whole start → navigate → WS
+/// click sequence — never a second worker for the click, which would lack
+/// in_flight protection (a fast double-click could then repeat the Start
+/// click). On exit (Ok or Err) the guard clears first, then `refresh` wakes
+/// the poll thread: the tail rebuild runs before the worker finishes and
+/// renders Initializing, and a failed start trips none of the timed poll's
+/// diff gates (Degraded == Degraded, scheduler None → None), so without the
+/// wake the tray would stay on 启动中… with the toggle disabled forever.
+fn spawn_start_worker(
+    app: AppHandle,
+    backend: Arc<BackendLifecycle>,
+    port: u16,
+    labels: ControlLabels,
+    guard: InFlightGuard,
+    refresh: mpsc::Sender<()>,
+    ws_available: bool,
+) {
+    if let Err(e) = std::thread::Builder::new()
+        .name("backend-start".into())
+        .spawn(move || {
+            let guard = guard;
+            match backend.start(port) {
+                Ok(()) => {
+                    navigate_main(&app, main_page_url(BackendStatus::Running, port, &labels));
+                    if ws_available {
+                        if let Err(e) = click_scheduler(
+                            port,
+                            SchedulerAction::Start,
+                            &labels,
+                            SCHEDULER_CLICK_TIMEOUT,
+                        ) {
+                            warn!("Scheduler control via WebSocket failed: {e:#}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to start backend: {e}");
+                    // Status is now Stopped (+ start_failed unless a stop
+                    // intervened — set inside the module); the wake below
+                    // re-renders the retryable toggle.
+                }
+            }
+            // Clear the in-flight flag BEFORE the wake, so the rebuild the
+            // poll thread runs on this signal already sees the finished
+            // state (spawn_scheduler_click ordering).
+            drop(guard);
+            let _ = refresh.send(());
+        })
+    {
+        warn!("Failed to spawn backend-start worker: {e}");
     }
 }
 
