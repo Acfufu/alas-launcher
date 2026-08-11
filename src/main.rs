@@ -10,6 +10,10 @@ mod backend;
 // EnableReload / ws credentials). Cross-platform — setup.rs
 // `get_deploy_config` is ungated, so this module is too.
 mod deploy_config;
+// Managed child processes: process-group spawn, timeout-wait, exit registry,
+// port-ownership probes. Cross-platform — setup.rs git_update (ungated) is
+// its primary consumer.
+mod child_process;
 // Pure tray menu model (no tauri). Gated to macOS only because its sole
 // macOS-bound dependency, alas_tasks (above), is gated too — a plain
 // declaration would break win/linux builds.
@@ -397,6 +401,10 @@ fn main() -> Result<()> {
                     // Stop the tray poll thread BEFORE terminating the backend:
                     // it must never set_menu on a disposed tray (Metis MAJOR-4).
                     tray_stop.store(true, Ordering::Relaxed);
+                    // Group-kill any subprocess the Ready thread registered
+                    // (e.g. the git update spawned during setup) — closing the
+                    // window mid-update must not orphan its git/pip tree.
+                    crate::child_process::kill_registered_groups();
                     backend.stop();
                 }
                 tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::CloseRequested { .. }, .. } => {

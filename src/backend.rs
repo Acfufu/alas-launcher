@@ -7,10 +7,15 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
-use command_group::{CommandGroup, GroupChild};
 use tracing::warn;
 
-use crate::window_util::CreateNoWindow as _;
+// `from_child` (test seam) and the lifecycle tests build fake process groups;
+// production code hands groups only through the child_process module.
+#[cfg(test)]
+use command_group::GroupChild;
+
+use crate::child_process::port::{is_same_process_group, port_owner_pid};
+use crate::child_process::{kill_group, spawn_with_group, ManagedChild};
 
 // macOS-only: the tray (the sole caller of advance_intent_if_changed) is
 // cfg-gated, and menu_model is not compiled on win/linux.
@@ -101,33 +106,48 @@ pub struct BackendStateSnapshot {
 }
 
 pub struct ManagedBackend {
-    child: Option<GroupChild>,
+    child: Option<ManagedChild>,
 }
 
 impl ManagedBackend {
     pub fn new(port: u16) -> Result<Self> {
         std::env::set_var("ALAS_LAUNCHER_PID", format!("{}", std::process::id()));
-        let child = Command::new("python")
-            .args(["gui.py", "--host", "127.0.0.1", "--port", &port.to_string()])
-            .group()
-            .create_no_window()
-            .spawn()?;
+        let mut cmd = Command::new("python");
+        cmd.args(["gui.py", "--host", "127.0.0.1", "--port", &port.to_string()]);
+        let child = spawn_with_group(&mut cmd)?;
         let mut res = Self { child: Some(child) };
 
         let address = format!("127.0.0.1:{}", port).parse().unwrap();
         let start_time = std::time::Instant::now();
         while start_time.elapsed() < Duration::from_secs(60) {
             if TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
-                // Metis MINOR-6: the port may be held by a stale/unrelated
-                // process. Verify the spawned child actually survived before
-                // declaring the backend ready.
                 if let Some(child) = res.child.as_mut() {
+                    // Metis MINOR-6: the port may be held by a stale/unrelated
+                    // process. Verify the spawned child actually survived before
+                    // declaring the backend ready.
                     if child
                         .try_wait()
                         .map_err(|e| anyhow!("Failed to check gui.py status: {e}"))?
                         .is_some()
                     {
                         return Err(anyhow!("gui.py exited before becoming ready"));
+                    }
+                    // MAJOR-3: the port may answer from a STALE server left by
+                    // an earlier launcher instance while our gui.py is still
+                    // coming up. Verify the listening process is our own child
+                    // (or in its process group) before declaring Running — a
+                    // mismatch means the port was already taken.
+                    let spawned = child.id();
+                    match port_owner_pid(port) {
+                        Some(owner) if !is_same_process_group(owner, spawned) => {
+                            return Err(anyhow!(
+                                "Port {port} is occupied by pid {owner} (our backend is {spawned}); refusing to start over a stale server"
+                            ));
+                        }
+                        // None → the port-owner tool is unavailable: fail-open
+                        // (see child_process::port_owner_pid) and rely on the
+                        // ALAS_LAUNCHER_PID residue scan in Drop.
+                        _ => {}
                     }
                 }
                 return Ok(res);
@@ -141,8 +161,8 @@ impl ManagedBackend {
         if let Some(mut child) = self.child.take() {
             #[cfg(unix)]
             {
-                use command_group::{Signal, UnixChildExt};
-                let _ = child.signal(Signal::SIGTERM);
+                use command_group::Signal;
+                let _ = child.signal_group(Signal::SIGTERM);
                 let start_time = std::time::Instant::now();
                 while start_time.elapsed() < Duration::from_millis(500) {
                     if let Ok(Some(exit_status)) = child.try_wait() {
@@ -152,7 +172,7 @@ impl ManagedBackend {
                 }
                 warn!("gui.py didn't exit, killing it...");
             }
-            child.kill()?;
+            kill_group(&mut child)?;
             Ok(child.wait()?)
         } else {
             Ok(ExitStatus::default())
@@ -164,7 +184,9 @@ impl ManagedBackend {
     /// readiness wait).
     #[cfg(test)]
     pub(crate) fn from_child(child: GroupChild) -> Self {
-        Self { child: Some(child) }
+        Self {
+            child: Some(ManagedChild::from_group_child(child)),
+        }
     }
 
     /// Pid of the spawned gui.py wrapper (the process-group leader), None
@@ -178,9 +200,9 @@ impl ManagedBackend {
 impl Drop for ManagedBackend {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            match child.kill() {
+            match kill_group(&mut child) {
                 Ok(_) => {}
-                Err(e) => warn!("Failed to kill gui.py process: {:?}", e),
+                Err(e) => warn!("Failed to kill gui.py process: {e}"),
             }
         }
         // Kill potential leaked processes
@@ -509,6 +531,7 @@ pub(crate) fn toggle_decision(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use command_group::CommandGroup;
     use std::sync::{Arc, Mutex};
 
     /// A harmless real process group the fake spawner hands back. `sleep 60`
