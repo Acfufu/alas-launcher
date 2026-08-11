@@ -251,11 +251,23 @@ fn kill_child(child: &mut Child) -> Option<std::process::ExitStatus> {
 
 /// Worker: run the whole check-update git sequence on a dedicated thread —
 /// branch name → local HEAD sha → remote same-branch sha (all read-only), then
-/// surface the result as a native dialog, hopping to the main thread
-/// (`AppHandle::run_on_main_thread`, present in locked tauri 2.5.1) because
-/// the dialog API is not callable from a worker thread. Any step failing
-/// (no git / not a repo / no remote / network hang past the 15s timeout)
-/// degrades to 检查失败 — the plan's failure path.
+/// surface the result as a native dialog via the plugin's ASYNC `show()`
+/// callback API. The async path is the sanctioned non-blocking one: the plugin
+/// hops to the main thread internally (desktop.rs) and returns immediately,
+/// so the worker thread never blocks the UI.
+///
+/// Do NOT switch this to `blocking_show()` / `run_on_main_thread`: that
+/// combination deadlocks the main thread. `blocking_show()` (tauri-plugin-dialog
+/// 2.2.1 lib.rs) wraps `show()` in `blocking_fn!`, which calls `show(cb)` and
+/// then blocks on `rx.recv()` — but `show()` itself queues the dialog display
+/// via `handle.run_on_main_thread(...)`. If the main thread is already inside
+/// our own `run_on_main_thread` closure (or any context that cannot service
+/// that queued task), the callback never fires, `rx.recv()` never returns, and
+/// the main thread hangs forever → the app freezes (observed: click 检查更新
+/// wedges the whole UI). Plugin docs forbid blocking_show on the main thread.
+///
+/// Any step failing (no git / not a repo / no remote / network hang past the
+/// 15s timeout) degrades to 检查失败 — the plan's failure path.
 ///
 /// Mirrors `spawn_scheduler_click` (tray.rs:476): dedicated thread, UI thread
 /// never blocks, no settings lock held across the git I/O.
@@ -275,26 +287,24 @@ pub fn spawn_check_update(
             info!(%msg, "check-update worker finished");
             let dialog_app = app.clone();
             let title = labels.check_update.clone();
-            if let Err(e) = app.run_on_main_thread(move || {
-                use tauri_plugin_dialog::DialogExt;
-                let mut builder = dialog_app
-                    .dialog()
-                    .message(msg)
-                    .kind(tauri_plugin_dialog::MessageDialogKind::Info)
-                    .title(title);
-                // Parent the alert to the main window: with a parent rfd uses
-                // the NSAlert sheet path; the parent-less async path falls
-                // back to the legacy off-main CFUserNotification API, which
-                // never displayed in QA, and the async sheet closed itself
-                // within seconds. blocking_show runs the sync runModal path
-                // (modal until dismissed) — the reliable one.
-                if let Some(win) = dialog_app.get_webview_window("main") {
-                    builder = builder.parent(&win);
-                }
-                builder.blocking_show();
-            }) {
-                warn!("check-update dialog hop to main thread failed: {e}");
+            // Non-blocking: the plugin's `show()` hops to the main thread
+            // internally (desktop.rs) and returns immediately. The previous
+            // `run_on_main_thread { blocking_show() }` wedged the main thread —
+            // blocking_show's rx.recv() waits for the plugin's queued main-
+            // thread task, which can never run while the main thread is
+            // blocked inside our own run_on_main_thread closure.
+            use tauri_plugin_dialog::DialogExt;
+            let mut builder = dialog_app
+                .dialog()
+                .message(msg)
+                .kind(tauri_plugin_dialog::MessageDialogKind::Info)
+                .title(title);
+            // Parent the alert to the main window: with a parent rfd uses
+            // the NSAlert sheet path (the reliable display path in QA).
+            if let Some(win) = dialog_app.get_webview_window("main") {
+                builder = builder.parent(&win);
             }
+            builder.show(|_| {});
         })
     {
         warn!("failed to spawn check-update worker: {e}");
