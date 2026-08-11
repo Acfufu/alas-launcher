@@ -13,7 +13,7 @@ use std::collections::HashSet;
 
 use crate::{
     alas_tasks::{self, Task},
-    backend::{BackendStateSnapshot, BackendStatus},
+    backend::{BackendStateSnapshot, BackendStatus, SchedulerIntent},
 };
 
 /// Which rendering the task section of the menu should use.
@@ -228,17 +228,24 @@ pub fn status_line_for(
 ) -> String {
     let word = if snapshot.start_failed {
         &labels.failed
+    } else if snapshot.crashed {
+        &labels.crashed
     } else {
         match snapshot.status {
             BackendStatus::Initializing => &labels.initializing,
             BackendStatus::Stopped => &labels.stopped,
-            BackendStatus::Running => {
-                if scheduler_alive == Some(true) {
-                    &labels.running
-                } else {
-                    &labels.stopped
+            BackendStatus::Running => match scheduler_alive {
+                Some(true) => &labels.running,
+                // Dead scheduler with no user stop intent (and no start in
+                // flight) means it died on its own — abnormal stop.
+                Some(false) if snapshot.scheduler_intent == SchedulerIntent::None => {
+                    &labels.crashed
                 }
-            }
+                // User stopped it, or it is booting after a user start.
+                Some(false) => &labels.stopped,
+                // Unknown scan: conservative stopped, never alarm.
+                None => &labels.stopped,
+            },
         }
     };
     format!("{}{}{}", labels.scheduler, labels.sep, word)
@@ -252,12 +259,30 @@ pub fn scheduler_alive(alive_child_count: usize) -> bool {
     alive_child_count > 1
 }
 
+/// What scheduler intent survives one poll scan (pure, no I/O).
+///
+/// The poll thread calls this after every liveness scan: a confirmed-alive
+/// scan disarms a `Start` intent (the boot window is over — a later death has
+/// no user start behind it and must render as abnormal stop); every other
+/// combination leaves the intent untouched. `Stop` survives alive scans so a
+/// user stop can never re-arm into the abnormal path.
+pub fn scheduler_intent_after_scan(
+    intent: SchedulerIntent,
+    scheduler_alive: Option<bool>,
+) -> SchedulerIntent {
+    match (intent, scheduler_alive) {
+        (SchedulerIntent::Start, Some(true)) => SchedulerIntent::None,
+        _ => intent,
+    }
+}
+
 /// Localized labels for the tray's scheduler-control rows (status line +
 /// Start/Stop toggle), following the webui language. `scheduler`, `running`,
 /// `start` and `stop` come from the ALAS i18n file when the keys exist and
-/// are strings; `stopped`, `initializing`, `failed` and `sep` ALWAYS come
-/// from the built-in table. `sep` also decides the stopped-page template
-/// style: full-width "：" → zh template, half-width ": " → en template.
+/// are strings; `stopped`, `initializing`, `failed`, `crashed` and `sep`
+/// ALWAYS come from the built-in table. `sep` also decides the stopped-page
+/// template style: full-width "：" → zh template, half-width ": " → en
+/// template.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlLabels {
     pub scheduler: String,
@@ -265,6 +290,7 @@ pub struct ControlLabels {
     pub stopped: String,
     pub initializing: String,
     pub failed: String,
+    pub crashed: String,
     pub start: String,
     pub stop: String,
     pub processing: String,
@@ -274,60 +300,66 @@ pub struct ControlLabels {
 /// Built-in label table, keyed by webui language; any unknown or empty
 /// language falls back to zh-CN.
 fn builtin_labels(lang: &str) -> ControlLabels {
-    let (scheduler, running, stopped, initializing, failed, start, stop, processing, sep) = match lang {
-        "zh-TW" => (
-            "調度器",
-            "執行中",
-            "已停止",
-            "啟動中…",
-            "啟動失敗",
-            "啟動",
-            "停止",
-            "處理中…",
-            "：",
-        ),
-        "en-US" => (
-            "Scheduler",
-            "Running",
-            "stopped",
-            "initializing…",
-            "start failed",
-            "Start",
-            "Stop",
-            "Processing…",
-            ": ",
-        ),
-        "ja-JP" => (
-            "スケジューラー",
-            "実行中",
-            "停止済み",
-            "起動中…",
-            "起動失敗",
-            "実行",
-            "中止",
-            "処理中…",
-            // Half-width ": " (en template), NOT the full-width "：".
-            ": ",
-        ),
-        // zh-CN doubles as the fallback for any unknown or empty language.
-        _ => (
-            "调度器",
-            "运行中",
-            "已停止",
-            "启动中…",
-            "启动失败",
-            "启动",
-            "停止",
-            "处理中…",
-            "：",
-        ),
-    };
+    let (scheduler, running, stopped, initializing, failed, crashed, start, stop, processing, sep) =
+        match lang {
+            "zh-TW" => (
+                "調度器",
+                "執行中",
+                "已停止",
+                "啟動中…",
+                "啟動失敗",
+                "異常停止",
+                "啟動",
+                "停止",
+                "處理中…",
+                "：",
+            ),
+            "en-US" => (
+                "Scheduler",
+                "Running",
+                "stopped",
+                "initializing…",
+                "start failed",
+                "stopped unexpectedly",
+                "Start",
+                "Stop",
+                "Processing…",
+                ": ",
+            ),
+            "ja-JP" => (
+                "スケジューラー",
+                "実行中",
+                "停止済み",
+                "起動中…",
+                "起動失敗",
+                "異常停止",
+                "実行",
+                "中止",
+                "処理中…",
+                // Half-width ": " (en template), NOT the full-width "：".
+                ": ",
+            ),
+            // zh-CN doubles as the fallback for any unknown or empty language.
+            _ => (
+                "调度器",
+                "运行中",
+                "已停止",
+                "启动中…",
+                "启动失败",
+                "异常停止",
+                "启动",
+                "停止",
+                "处理中…",
+                "：",
+            ),
+        };
     ControlLabels {
         scheduler: scheduler.into(),
         running: running.into(),
         stopped: stopped.into(),
         initializing: initializing.into(),
         failed: failed.into(),
+        crashed: crashed.into(),
         start: start.into(),
         stop: stop.into(),
         processing: processing.into(),
@@ -417,16 +449,22 @@ mod tests {
         let stopped_failed = BackendStateSnapshot {
             status: BackendStatus::Stopped,
             start_failed: true,
+            crashed: false,
+            scheduler_intent: SchedulerIntent::None,
         };
         assert_eq!(status_line_for(&stopped_failed, None, &labels), "调度器：启动失败");
         let stopped_clean = BackendStateSnapshot {
             status: BackendStatus::Stopped,
             start_failed: false,
+            crashed: false,
+            scheduler_intent: SchedulerIntent::None,
         };
         assert_eq!(status_line_for(&stopped_clean, Some(true), &labels), "调度器：已停止");
         let initializing_clean = BackendStateSnapshot {
             status: BackendStatus::Initializing,
             start_failed: false,
+            crashed: false,
+            scheduler_intent: SchedulerIntent::None,
         };
         assert_eq!(
             status_line_for(&initializing_clean, None, &labels),
@@ -440,21 +478,162 @@ mod tests {
         let running = BackendStateSnapshot {
             status: BackendStatus::Running,
             start_failed: false,
+            crashed: false,
+            scheduler_intent: SchedulerIntent::None,
         };
-        // Scheduler confirmed alive -> running; confirmed dead OR scan
-        // unknown (None) -> conservative stopped.
+        // Scheduler confirmed alive -> running; scan unknown (None) ->
+        // conservative stopped (never alarm on an unknown scan).
         assert_eq!(status_line_for(&running, Some(true), &labels), "调度器：运行中");
-        assert_eq!(status_line_for(&running, Some(false), &labels), "调度器：已停止");
         assert_eq!(status_line_for(&running, None, &labels), "调度器：已停止");
+        // Dead scheduler with no user intent -> abnormal stop.
+        assert_eq!(status_line_for(&running, Some(false), &labels), "调度器：异常停止");
         // Non-Running statuses ignore the discriminator entirely.
         assert_eq!(status_line_for(&stopped_snapshot(), Some(true), &labels), "调度器：已停止");
         let initializing = BackendStateSnapshot {
             status: BackendStatus::Initializing,
             start_failed: false,
+            crashed: false,
+            scheduler_intent: SchedulerIntent::None,
         };
         assert_eq!(
             status_line_for(&initializing, Some(false), &labels),
             "调度器：启动中…"
+        );
+    }
+
+    #[test]
+    fn status_line_for_distinguishes_user_stop_from_scheduler_death() {
+        let labels = expected_labels("zh-CN");
+        let snapshot = |intent| BackendStateSnapshot {
+            status: BackendStatus::Running,
+            start_failed: false,
+            crashed: false,
+            scheduler_intent: intent,
+        };
+        // Dead scheduler: user stop intent and the post-start boot window both
+        // render as a normal stop; a death with NO intent is abnormal.
+        assert_eq!(
+            status_line_for(&snapshot(SchedulerIntent::Stop), Some(false), &labels),
+            "调度器：已停止"
+        );
+        assert_eq!(
+            status_line_for(&snapshot(SchedulerIntent::Start), Some(false), &labels),
+            "调度器：已停止"
+        );
+        assert_eq!(
+            status_line_for(&snapshot(SchedulerIntent::None), Some(false), &labels),
+            "调度器：异常停止"
+        );
+        // Intent is irrelevant while the scheduler is confirmed alive.
+        assert_eq!(
+            status_line_for(&snapshot(SchedulerIntent::Stop), Some(true), &labels),
+            "调度器：运行中"
+        );
+    }
+
+    #[test]
+    fn status_line_for_crashed_backend_shows_abnormal_stop() {
+        let labels = expected_labels("zh-CN");
+        let crashed = BackendStateSnapshot {
+            status: BackendStatus::Stopped,
+            start_failed: false,
+            crashed: true,
+            scheduler_intent: SchedulerIntent::None,
+        };
+        assert_eq!(status_line_for(&crashed, None, &labels), "调度器：异常停止");
+        // start_failed outranks crashed.
+        let crashed_after_failed_start = BackendStateSnapshot {
+            start_failed: true,
+            ..crashed
+        };
+        assert_eq!(
+            status_line_for(&crashed_after_failed_start, None, &labels),
+            "调度器：启动失败"
+        );
+    }
+
+    /// REGRESSION: scheduler boots (Start intent), is confirmed alive (intent
+    /// disarmed to None), then dies on its own — must render 异常停止, not a
+    /// plain stop. This is the user-visible bug the intent mechanism exists
+    /// for: the death looks identical to a user stop at scan level.
+    #[test]
+    fn regression_scheduler_crash_after_clean_boot_shows_abnormal_stop() {
+        let labels = expected_labels("zh-CN");
+        let running = BackendStateSnapshot {
+            status: BackendStatus::Running,
+            start_failed: false,
+            crashed: false,
+            scheduler_intent: SchedulerIntent::Start,
+        };
+        // Boot window: dead scan stays non-alarming, intent stays armed.
+        assert_eq!(scheduler_intent_after_scan(running.scheduler_intent, Some(false)), SchedulerIntent::Start);
+        assert_eq!(
+            status_line_for(&running, Some(false), &labels),
+            "调度器：已停止"
+        );
+        // Confirmed alive: intent disarms.
+        let after_boot = scheduler_intent_after_scan(running.scheduler_intent, Some(true));
+        assert_eq!(after_boot, SchedulerIntent::None);
+        // Scheduler dies on its own, no user intent behind it -> abnormal.
+        let crashed_running = BackendStateSnapshot {
+            scheduler_intent: after_boot,
+            ..running
+        };
+        assert_eq!(
+            status_line_for(&crashed_running, Some(false), &labels),
+            "调度器：异常停止"
+        );
+    }
+
+    /// REGRESSION: a user-initiated stop must NEVER render 异常停止 — the
+    /// Stop intent survives alive scans (no disarm) and any subsequent death
+    /// keeps rendering 已停止.
+    #[test]
+    fn regression_user_stop_never_shows_abnormal_stop() {
+        let labels = expected_labels("zh-CN");
+        let user_stopped = BackendStateSnapshot {
+            status: BackendStatus::Running,
+            start_failed: false,
+            crashed: false,
+            scheduler_intent: SchedulerIntent::Stop,
+        };
+        // The stop click is in flight (scheduler still alive): no disarm.
+        assert_eq!(scheduler_intent_after_scan(user_stopped.scheduler_intent, Some(true)), SchedulerIntent::Stop);
+        // Stop lands: dead scan renders a normal stop.
+        assert_eq!(scheduler_intent_after_scan(user_stopped.scheduler_intent, Some(false)), SchedulerIntent::Stop);
+        assert_eq!(
+            status_line_for(&user_stopped, Some(false), &labels),
+            "调度器：已停止"
+        );
+        // Even an unknown scan after a user stop stays a normal stop.
+        assert_eq!(
+            status_line_for(&user_stopped, None, &labels),
+            "调度器：已停止"
+        );
+    }
+
+    #[test]
+    fn scheduler_intent_after_scan_only_disarms_start_on_confirmed_alive() {
+        // Only (Start, Some(true)) disarms; everything else is a no-op.
+        for (intent, alive) in [
+            (SchedulerIntent::None, None),
+            (SchedulerIntent::None, Some(false)),
+            (SchedulerIntent::None, Some(true)),
+            (SchedulerIntent::Stop, None),
+            (SchedulerIntent::Stop, Some(false)),
+            (SchedulerIntent::Stop, Some(true)),
+            (SchedulerIntent::Start, None),
+            (SchedulerIntent::Start, Some(false)),
+        ] {
+            assert_eq!(
+                scheduler_intent_after_scan(intent, alive),
+                intent,
+                "intent {intent:?} alive {alive:?}"
+            );
+        }
+        assert_eq!(
+            scheduler_intent_after_scan(SchedulerIntent::Start, Some(true)),
+            SchedulerIntent::None
         );
     }
 
@@ -472,6 +651,8 @@ mod tests {
         BackendStateSnapshot {
             status: BackendStatus::Stopped,
             start_failed: false,
+            crashed: false,
+            scheduler_intent: SchedulerIntent::None,
         }
     }
 
@@ -490,12 +671,12 @@ mod tests {
     /// Expected full label set per language, from the REAL ALAS payload
     /// cross-check (evidence task-1: zero delta vs the built-in table).
     fn expected_labels(lang: &str) -> ControlLabels {
-        let (scheduler, running, stopped, initializing, failed, start, stop, processing, sep) =
+        let (scheduler, running, stopped, initializing, failed, crashed, start, stop, processing, sep) =
             match lang {
-                "zh-TW" => ("調度器", "執行中", "已停止", "啟動中…", "啟動失敗", "啟動", "停止", "處理中…", "："),
-                "en-US" => ("Scheduler", "Running", "stopped", "initializing…", "start failed", "Start", "Stop", "Processing…", ": "),
-                "ja-JP" => ("スケジューラー", "実行中", "停止済み", "起動中…", "起動失敗", "実行", "中止", "処理中…", ": "),
-                _ => ("调度器", "运行中", "已停止", "启动中…", "启动失败", "启动", "停止", "处理中…", "："),
+                "zh-TW" => ("調度器", "執行中", "已停止", "啟動中…", "啟動失敗", "異常停止", "啟動", "停止", "處理中…", "："),
+                "en-US" => ("Scheduler", "Running", "stopped", "initializing…", "start failed", "stopped unexpectedly", "Start", "Stop", "Processing…", ": "),
+                "ja-JP" => ("スケジューラー", "実行中", "停止済み", "起動中…", "起動失敗", "異常停止", "実行", "中止", "処理中…", ": "),
+                _ => ("调度器", "运行中", "已停止", "启动中…", "启动失败", "异常停止", "启动", "停止", "处理中…", "："),
             };
         ControlLabels {
             scheduler: scheduler.into(),
@@ -503,6 +684,7 @@ mod tests {
             stopped: stopped.into(),
             initializing: initializing.into(),
             failed: failed.into(),
+            crashed: crashed.into(),
             start: start.into(),
             stop: stop.into(),
             processing: processing.into(),
