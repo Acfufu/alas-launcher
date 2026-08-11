@@ -388,6 +388,101 @@ pub fn control_labels(lang: &str, i18n: &serde_json::Value) -> ControlLabels {
     labels
 }
 
+/// Localized labels for the app-menu shell settings menu (macOS): the menu's
+/// own item texts plus the self-named language choices. Keyed by the same
+/// webui language ids as `builtin_labels`; any unknown or empty language
+/// falls back to zh-CN. `lang_names` lists the self-named choices in fixed
+/// order, matching the settings language ids zh-CN, zh-TW, en-US, ja-JP.
+#[allow(dead_code)] // wired by the todo-3 shell menu builder
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellMenuLabels {
+    pub settings: String,
+    pub language: String,
+    pub follow_alas: String,
+    pub check_update: String,
+    pub auto_start: String,
+    pub check_failed: String,
+    pub up_to_date: String,
+    pub update_available: String,
+    pub lang_names: Vec<String>,
+}
+
+/// Built-in shell-settings label table, keyed by webui language; unknown or
+/// empty language falls back to zh-CN. Pure — no file I/O, no tauri types.
+#[allow(dead_code)] // wired by the todo-3 shell menu builder
+pub fn shell_menu_labels(lang: &str) -> ShellMenuLabels {
+    let (
+        settings,
+        language,
+        follow_alas,
+        check_update,
+        auto_start,
+        check_failed,
+        up_to_date,
+        update_available,
+    ) = match lang {
+        "zh-TW" => (
+            "設定",
+            "語言",
+            "跟隨 ALAS",
+            "檢查更新",
+            "啟動時自動啟動後端",
+            "檢查失敗",
+            "已是最新",
+            "發現新版本，重啟後更新",
+        ),
+        "en-US" => (
+            "Settings",
+            "Language",
+            "Follow ALAS",
+            "Check Update",
+            "Auto-start backend at launch",
+            "Check failed",
+            "Up to date",
+            "Update available, restart to apply",
+        ),
+        "ja-JP" => (
+            "設定",
+            "言語",
+            "ALAS に従う",
+            "更新を確認",
+            "起動時にバックエンドを自動起動",
+            "確認失敗",
+            "最新です",
+            "新しいバージョンがあります、再起動後に更新",
+        ),
+        // zh-CN doubles as the fallback for any unknown or empty language.
+        _ => (
+            "设置",
+            "语言",
+            "跟随 ALAS",
+            "检查更新",
+            "启动时自动启动后端",
+            "检查失败",
+            "已是最新",
+            "发现新版本，重启后更新",
+        ),
+    };
+    ShellMenuLabels {
+        settings: settings.into(),
+        language: language.into(),
+        follow_alas: follow_alas.into(),
+        check_update: check_update.into(),
+        auto_start: auto_start.into(),
+        check_failed: check_failed.into(),
+        up_to_date: up_to_date.into(),
+        update_available: update_available.into(),
+        // Self-names in fixed order, mapping 1:1 to the settings language ids
+        // zh-CN, zh-TW, en-US, ja-JP — identical for every language.
+        lang_names: vec![
+            "简体中文".into(),
+            "繁體中文".into(),
+            "English".into(),
+            "日本語".into(),
+        ],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1210,5 +1305,44 @@ mod tests {
         let new = vec![task("Guild")];
         let outcome = poll_decision(BackendStatus::Running, Ok(new.clone()), TaskSection::Empty, &[]);
         assert_eq!(outcome.replace_cache, Some(new));
+    }
+
+    #[test]
+    fn shell_menu_labels_all_languages_have_nonempty_fields() {
+        for lang in ["zh-CN", "zh-TW", "en-US", "ja-JP"] {
+            let labels = shell_menu_labels(lang);
+            assert!(!labels.settings.is_empty(), "lang {lang}");
+            assert!(!labels.language.is_empty(), "lang {lang}");
+            assert!(!labels.follow_alas.is_empty(), "lang {lang}");
+            assert!(!labels.check_update.is_empty(), "lang {lang}");
+            assert!(!labels.auto_start.is_empty(), "lang {lang}");
+            assert!(!labels.check_failed.is_empty(), "lang {lang}");
+            assert!(!labels.up_to_date.is_empty(), "lang {lang}");
+            assert!(!labels.update_available.is_empty(), "lang {lang}");
+            assert_eq!(
+                labels.lang_names,
+                vec![
+                    "简体中文".to_string(),
+                    "繁體中文".to_string(),
+                    "English".to_string(),
+                    "日本語".to_string()
+                ],
+                "lang {lang}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_menu_labels_language_spot_checks() {
+        assert_eq!(shell_menu_labels("zh-CN").settings, "设置");
+        assert_eq!(shell_menu_labels("en-US").settings, "Settings");
+        assert_eq!(shell_menu_labels("ja-JP").check_update, "更新を確認");
+        assert_eq!(shell_menu_labels("zh-TW").follow_alas, "跟隨 ALAS");
+    }
+
+    #[test]
+    fn shell_menu_labels_unknown_language_falls_back_to_zh_cn() {
+        assert_eq!(shell_menu_labels("fr-FR"), shell_menu_labels("zh-CN"));
+        assert_eq!(shell_menu_labels(""), shell_menu_labels("zh-CN"));
     }
 }
