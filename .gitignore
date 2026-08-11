@@ -7,3 +7,6 @@
 /gen/schemas
 
 .DS_Store
+# Tooling state (local agent artifacts, not project files)
+/.omo/
+/.codegraph
