@@ -17,6 +17,10 @@ mod menu_model;
 mod pywebio;
 #[cfg(target_os = "macos")]
 mod tray;
+// Pure shell-settings persistence (no tauri); macOS-only until the settings
+// menu (shell_menu.rs) lands — win/linux builds must not compile it.
+#[cfg(target_os = "macos")]
+mod shell_settings;
 mod setup;
 mod window_util;
 
