@@ -24,7 +24,7 @@ use tauri::{
     tray::TrayIconBuilder,
     AppHandle, Manager, Url,
 };
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
     alas_tasks::{self, Task},
@@ -37,16 +37,11 @@ use crate::{
         status_line_for, task_section, task_section_items,
         toggle_enabled, toggle_label, ControlLabels, TaskMenuItem, TaskSection,
     },
-    pywebio::{check_pywebio_version, click_scheduler, pywebio_version, SchedulerAction},
 };
 
 /// Poll cadence for the task section; also bounds each idle wait of the poll
 /// thread (a refresh signal wakes it early, never later than this).
 const TRAY_POLL_INTERVAL_SECS: Duration = Duration::from_secs(3);
-
-/// Upper bound of one scheduler WS click session (the ~6s home quiesce
-/// dominates the budget; plan todo 5 default).
-const SCHEDULER_CLICK_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Everything the tray menu needs beyond the AppHandle: the backend state
 /// (shared with main.rs), the cached task list, the shared shell settings
@@ -323,19 +318,22 @@ fn stopped_page_url(labels: &ControlLabels) -> Url {
 
 /// Full Start/Stop toggle.
 ///
-/// Since todo 6 the toggle controls the ALAS SCHEDULER through the webui
-/// WebSocket (a short worker-thread session, never a long-lived connection):
-/// - `StartScheduler` / `StopScheduler`: scheduler-only click, NO window
+/// Since todo 5 the toggle controls the ALAS SCHEDULER through the control
+/// API (a short HTTP call on a worker thread, never a long-lived
+/// connection):
+/// - `StartScheduler` / `StopScheduler`: scheduler-only call, NO window
 ///   navigation — the webui stays alive.
 /// - `StartBackend`: backend down — bring the whole backend up (existing
 ///   ordering contract inside [`BackendLifecycle::start`]) on a worker
 ///   thread so the UI thread never blocks (MAJOR-2), navigate to the
-///   webui, then click Start over WS from the SAME worker.
-/// - `StopBackend` (degraded: webui password/SSL configured): legacy
-///   process-level stop.
+///   webui, then start the scheduler via the control API from the SAME
+///   worker.
+/// - `StopBackend` (degraded: control channel unavailable — webui
+///   password/SSL or control patch failure): legacy process-level stop.
 ///
-/// All WS I/O happens on a worker thread, outside every lock; the decision
-/// inputs (`scheduler_alive`, `ws_available`) are computed lock-free here.
+/// All control-API I/O happens on a worker thread, outside every lock; the
+/// decision inputs (`scheduler_alive`, `ws_available`) are computed
+/// lock-free here.
 fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
     // In-flight dedup (plan todo 6f): one scheduler session at a time. The
     // guard is created IMMEDIATELY after the successful compare_exchange and
@@ -346,14 +344,12 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
         return;
     };
 
-    // Password/SSL degradation guard (plan todo 6b): with a webui password or
-    // TLS configured the plain ws:// client cannot drive the scheduler, so
-    // the toggle falls back to process-level control.
-    let ws_available = crate::deploy_config::ws_control_available();
+    // 密码/SSL 或控制补丁未应用 → 控制 API 不可用，退回进程级控制。
+    let ws_available = crate::deploy_config::ws_control_available()
+        && !crate::patch::patch_failed();
     if !ws_available {
-        warn!("WebSocket scheduler control unavailable (webui password/SSL configured); falling back to process-level toggle");
+        warn!("scheduler control unavailable (webui password/SSL configured or control API patch failed); falling back to process-level toggle");
     }
-    warn_on_pywebio_mismatch();
 
     // Click-time scheduler liveness — a lock-free re-scan (never the poll
     // cache), plus a 100ms port probe: a dead port while the snapshot still
@@ -406,28 +402,23 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
             );
         }
         ToggleAction::StopScheduler | ToggleAction::StartScheduler => {
-            // Scheduler-only control: the click is delivered from a worker
-            // thread and the window is deliberately NOT navigated. A failed
-            // click only warns — the poll thread self-heals the status line
-            // and the toggle stays retryable. The intent arms BEFORE the
-            // click so a scheduler-dead window never flashes 异常停止 while
-            // the user's own stop/start is in flight (a failed click leaves
-            // the stale intent until the next toggle — accepted: the user is
-            // mid-interaction and the status line stays non-alarming).
+            // Scheduler-only control via the control API (HTTP): same ProcessManager
+            // the webui button drives. Intent arms BEFORE the call so a scheduler-
+            // dead window never flashes 异常停止 while the user's own stop/start is
+            // in flight. A failed call only warns — the poll thread self-heals.
             let scheduler_action = match action {
                 ToggleAction::StopScheduler => {
                     shared.backend.set_scheduler_intent(SchedulerIntent::Stop);
-                    SchedulerAction::Stop
+                    crate::control_api::SchedulerAction::Stop
                 }
                 _ => {
                     shared.backend.set_scheduler_intent(SchedulerIntent::Start);
-                    SchedulerAction::Start
+                    crate::control_api::SchedulerAction::Start
                 }
             };
-            spawn_scheduler_click(
+            spawn_scheduler_call(
                 port,
                 scheduler_action,
-                labels.clone(),
                 guard,
                 shared.refresh.clone(),
             );
@@ -470,48 +461,39 @@ fn try_acquire_in_flight(flag: &Arc<AtomicBool>) -> Option<InFlightGuard> {
         .map(|_| InFlightGuard(flag.clone()))
 }
 
-/// Spawn the scheduler click on a dedicated worker thread. All WS I/O runs
-/// there — off the UI (menu event) thread and outside every lock; the worker
-/// never touches `TrayShared` or tauri, only the pure
-/// [`click_scheduler`] channel. The in-flight guard moves into the closure.
-/// A click failure only warns (the poll thread self-heals the status line).
-/// On exit (Ok or Err) the guard clears first, then `refresh` wakes the poll
-/// thread so the 处理中… toggle is replaced by the real state immediately.
-fn spawn_scheduler_click(
-    port: u16,
-    action: SchedulerAction,
-    labels: ControlLabels,
-    guard: InFlightGuard,
-    refresh: mpsc::Sender<()>,
-) {
-    if let Err(e) = std::thread::Builder::new()
-        .name("scheduler-click".into())
-        .spawn(move || {
-            let guard = guard;
-            if let Err(e) = click_scheduler(port, action, &labels, SCHEDULER_CLICK_TIMEOUT) {
-                warn!("Scheduler control via WebSocket failed: {e:#}");
-            }
-            // Clear the in-flight flag BEFORE the wake, so the rebuild the
-            // poll thread runs on this signal already sees the finished state.
-            drop(guard);
-            let _ = refresh.send(());
-        })
-    {
-        warn!("Failed to spawn scheduler-click worker: {e}");
-    }
+/// Worker-thread scheduler control via the control API. The in-flight guard
+/// moves into the closure; the refresh wake forces a poll rebuild so the
+/// 处理中… toggle is replaced by the real state (same contract as the old
+/// WS click worker).
+fn spawn_scheduler_call(port: u16, action: crate::control_api::SchedulerAction, guard: InFlightGuard, refresh: mpsc::Sender<()>) {
+    std::thread::spawn(move || {
+        let result = match action {
+            crate::control_api::SchedulerAction::Start => crate::control_api::api_scheduler_start(port, "alas"),
+            crate::control_api::SchedulerAction::Stop => crate::control_api::api_scheduler_stop(port, "alas"),
+        };
+        match result {
+            Ok(state) => info!(target: "control_api", "scheduler {action:?} ok, state={}", state.state),
+            Err(e) => warn!("control API scheduler {action:?} failed: {e}"),
+        }
+        drop(guard);
+        let _ = refresh.send(());
+    });
 }
 
 /// Spawn the backend start on a dedicated worker thread (MAJOR-2): the
 /// up-to-60s spawn window must never block the menu-event (UI) thread.
 ///
-/// The worker owns ONE in-flight guard for the whole start → navigate → WS
-/// click sequence — never a second worker for the click, which would lack
-/// in_flight protection (a fast double-click could then repeat the Start
-/// click). On exit (Ok or Err) the guard clears first, then `refresh` wakes
-/// the poll thread: the tail rebuild runs before the worker finishes and
-/// renders Initializing, and a failed start trips none of the timed poll's
-/// diff gates (Degraded == Degraded, scheduler None → None), so without the
-/// wake the tray would stay on 启动中… with the toggle disabled forever.
+/// The worker owns ONE in-flight guard for the whole start → navigate →
+/// scheduler-start sequence. On exit (Ok or Err) the guard clears first,
+/// then `refresh` wakes the poll thread: the tail rebuild runs before the
+/// worker finishes and renders Initializing, and a failed start trips none
+/// of the timed poll's diff gates (Degraded == Degraded, scheduler
+/// None → None), so without the wake the tray would stay on 启动中… with
+/// the toggle disabled forever. When control is available, a bounded retry
+/// thread starts the scheduler through the control API after the backend is
+/// ready; the guard is released right after spawning it (the process-tree
+/// scan corrects the status within two polls, and the SchedulerIntent::Start
+/// TTL covers the window).
 fn spawn_start_worker(
     app: AppHandle,
     backend: Arc<BackendLifecycle>,
@@ -528,15 +510,29 @@ fn spawn_start_worker(
             match backend.start(port) {
                 Ok(()) => {
                     navigate_main(&app, main_page_url(BackendStatus::Running, port, &labels));
+                    // 后端就绪后，经控制 API 启动调度器（控制可用时）。有界重试（10×1.5s，
+                    // 镜像旧 SCHEDULER_CLICK_TIMEOUT 15s 预算）；耗尽仅 warn——用户可再点托盘开关。
                     if ws_available {
-                        if let Err(e) = click_scheduler(
-                            port,
-                            SchedulerAction::Start,
-                            &labels,
-                            SCHEDULER_CLICK_TIMEOUT,
-                        ) {
-                            warn!("Scheduler control via WebSocket failed: {e:#}");
-                        }
+                        let port = port;
+                        std::thread::spawn(move || {
+                            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                            loop {
+                                match crate::control_api::api_scheduler_start(port, "alas") {
+                                    Ok(state) => {
+                                        info!(target: "control_api", "scheduler start-after-backend ok, state={}", state.state);
+                                        break;
+                                    }
+                                    Err(e) if std::time::Instant::now() < deadline => {
+                                        warn!("control API start-after-backend retry: {e}");
+                                        std::thread::sleep(std::time::Duration::from_millis(1500));
+                                    }
+                                    Err(e) => {
+                                        warn!("control API start-after-backend failed after retries: {e}");
+                                        break;
+                                    }
+                                }
+                            }
+                        });
                     }
                 }
                 Err(e) => {
@@ -548,7 +544,7 @@ fn spawn_start_worker(
             }
             // Clear the in-flight flag BEFORE the wake, so the rebuild the
             // poll thread runs on this signal already sees the finished
-            // state (spawn_scheduler_click ordering).
+            // state (spawn_scheduler_call ordering).
             drop(guard);
             let _ = refresh.send(());
         })
@@ -697,19 +693,6 @@ fn poll_once(
     if poll_needs_rebuild(force_rebuild, outcome.changed, status_line_changed) {
         rebuild_menu(app, shared, outcome.section, scheduler);
         *last_section = outcome.section;
-    }
-}
-
-/// Runtime pywebio version guard: warn once per toggle when the payload pins
-/// a pywebio version other than the one this WS protocol was captured
-/// against (1.6.2). File-level best-effort — an unreadable or absent
-/// requirements.txt is silent.
-fn warn_on_pywebio_mismatch() {
-    let Ok(requirements) = std::fs::read_to_string("requirements.txt") else {
-        return;
-    };
-    if !check_pywebio_version(pywebio_version(&requirements).as_deref()) {
-        warn!("Payload pywebio version may drift from the WS protocol this launcher speaks (expected 1.6.2); scheduler control could fail");
     }
 }
 

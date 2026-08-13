@@ -57,9 +57,9 @@ use crate::{
     shell_settings::ShellSettings,
 };
 
-/// Git command timeout for the check-update worker, mirroring
-/// `SCHEDULER_CLICK_TIMEOUT` (tray.rs:46): a hung git (dead network, blocked
-/// DNS) must degrade to 检查失败, never hang the worker forever.
+/// Git command timeout for the check-update worker (mirrors the tray's 15s
+/// control-API retry budget): a hung git (dead network, blocked DNS) must
+/// degrade to 检查失败, never hang the worker forever.
 const CHECK_UPDATE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Settings language ids in the same fixed order as `labels.lang_names`

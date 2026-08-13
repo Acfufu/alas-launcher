@@ -19,10 +19,6 @@ mod child_process;
 // declaration would break win/linux builds.
 #[cfg(target_os = "macos")]
 mod menu_model;
-// PyWebIO WS protocol helpers for scheduler control; macOS-only because its
-// sole consumer is the tray.
-#[cfg(target_os = "macos")]
-mod pywebio;
 #[cfg(target_os = "macos")]
 mod tray;
 // Pure shell-settings persistence (no tauri); macOS-only until the settings

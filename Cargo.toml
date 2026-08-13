@@ -22,9 +22,6 @@ base64 = "0.22.1"
 tauri-plugin-dialog = "2"
 sysinfo = { version = "0.36.1", default-features = false, features = ["system"] }
 ctrlc = "3.5.0"
-# Synchronous WebSocket client for the PyWebIO control channel
-# (plain ws://localhost only; no TLS features on purpose).
-tungstenite = "0.30"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.30", features = ["signal"] }
