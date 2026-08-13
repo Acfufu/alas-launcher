@@ -36,6 +36,10 @@ mod control_api;
 // Control-API patch applier (anchor-verified, idempotent, fail-closed).
 // Cross-platform — setup.rs calls it ungated, so this module is too.
 mod patch;
+// Pure notification event detection (no tauri); macOS-only until the tray
+// wires it up — win/linux builds must not compile it.
+#[cfg(target_os = "macos")]
+mod notify;
 mod setup;
 mod window_util;
 
