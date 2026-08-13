@@ -1,0 +1,657 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ALAS 项目架构图解 — 初级开发者入门报告</title>
+<style>
+  :root {
+    --rust: #c2410c;        /* 启动器（Rust/Tauri） */
+    --rust-bg: #fff7ed;
+    --py: #1d4ed8;          /* ALAS 本体（Python） */
+    --py-bg: #eff6ff;
+    --cfg: #047857;         /* 配置文件 */
+    --cfg-bg: #ecfdf5;
+    --dev: #6d28d9;         /* 设备/ADB */
+    --dev-bg: #f5f3ff;
+    --game: #a16207;        /* 游戏 */
+    --game-bg: #fefce8;
+    --ink: #1f2937;
+    --muted: #6b7280;
+    --line: #e5e7eb;
+    --card: #ffffff;
+    --mono: "SF Mono", "Menlo", "Consolas", monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Segoe UI", sans-serif;
+    color: var(--ink);
+    background: #f8fafc;
+    line-height: 1.7;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 40px 24px 120px; }
+
+  header.hero {
+    background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
+    color: #fff;
+    border-radius: 16px;
+    padding: 40px 44px;
+    margin-bottom: 36px;
+  }
+  header.hero h1 { margin: 0 0 8px; font-size: 30px; letter-spacing: .5px; }
+  header.hero .sub { color: #cbd5e1; font-size: 15px; }
+  header.hero .tags { margin-top: 14px; display: flex; gap: 8px; flex-wrap: wrap; }
+  header.hero .tag {
+    background: rgba(255,255,255,.12); border: 1px solid rgba(255,255,255,.2);
+    border-radius: 999px; padding: 3px 12px; font-size: 12px; color: #e2e8f0;
+  }
+
+  section { margin-bottom: 44px; }
+  h2 {
+    font-size: 22px; margin: 0 0 6px; padding-left: 12px;
+    border-left: 4px solid var(--py);
+  }
+  h2.rust { border-left-color: var(--rust); }
+  h2.cfg  { border-left-color: var(--cfg); }
+  h2.dev  { border-left-color: var(--dev); }
+  .sec-intro { color: var(--muted); font-size: 14px; margin: 0 0 16px; padding-left: 12px; }
+
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 20px 24px; margin: 12px 0; box-shadow: 0 1px 2px rgba(16,24,40,.04);
+  }
+  .figure { padding: 12px 12px 4px; }
+  .figure .fig-cap {
+    font-size: 12.5px; color: var(--muted); text-align: center; padding: 8px 0 12px;
+  }
+  .figure svg { width: 100%; height: auto; display: block; }
+
+  .callout {
+    border-radius: 10px; padding: 14px 18px; margin: 14px 0; font-size: 14px;
+  }
+  .callout.key {
+    background: var(--py-bg); border: 1px solid #bfdbfe;
+  }
+  .callout.warn {
+    background: var(--game-bg); border: 1px solid #fde68a;
+  }
+  .callout b { font-weight: 600; }
+
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; margin: 12px 0; }
+  th {
+    text-align: left; background: #f1f5f9; padding: 8px 12px;
+    border: 1px solid var(--line); font-weight: 600; white-space: nowrap;
+  }
+  td { padding: 8px 12px; border: 1px solid var(--line); vertical-align: top; }
+  tr:nth-child(even) td { background: #fafbfc; }
+
+  code {
+    font-family: var(--mono); font-size: .88em;
+    background: #f1f5f9; border: 1px solid #e2e8f0; border-radius: 4px;
+    padding: 1px 6px; color: #0f172a;
+  }
+  pre {
+    background: #0f172a; color: #e2e8f0; border-radius: 10px;
+    padding: 16px 20px; overflow-x: auto; font-size: 13px; line-height: 1.6;
+  }
+  pre code { background: none; border: none; color: inherit; padding: 0; }
+  .c-com { color: #64748b; }
+  .c-str { color: #a5b4fc; }
+  .c-key { color: #7dd3fc; }
+  .c-num { color: #fca5a5; }
+
+  .steps { counter-reset: step; list-style: none; padding: 0; margin: 12px 0; }
+  .steps li {
+    position: relative; padding: 0 0 18px 46px; font-size: 14.5px;
+  }
+  .steps li::before {
+    counter-increment: step; content: counter(step);
+    position: absolute; left: 0; top: 0;
+    width: 30px; height: 30px; border-radius: 50%;
+    background: var(--py); color: #fff; font-weight: 700; font-size: 14px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .steps li:not(:last-child)::after {
+    content: ""; position: absolute; left: 14px; top: 34px; bottom: 2px;
+    border-left: 2px dashed #cbd5e1;
+  }
+  .steps li.rust::before { background: var(--rust); }
+  .steps li.cfg::before { background: var(--cfg); }
+  .steps li.dev::before { background: var(--dev); }
+  .steps li b { font-weight: 600; }
+
+  .chip {
+    display: inline-block; border-radius: 6px; padding: 1px 8px; font-size: 12px;
+    font-weight: 600; margin-right: 6px;
+  }
+  .chip.rust { background: var(--rust-bg); color: var(--rust); border: 1px solid #fed7aa; }
+  .chip.py   { background: var(--py-bg); color: var(--py); border: 1px solid #bfdbfe; }
+  .chip.cfg  { background: var(--cfg-bg); color: var(--cfg); border: 1px solid #a7f3d0; }
+  .chip.dev  { background: var(--dev-bg); color: var(--dev); border: 1px solid #ddd6fe; }
+  .chip.game { background: var(--game-bg); color: var(--game); border: 1px solid #fde68a; }
+
+  ul.plain { padding-left: 22px; font-size: 14.5px; }
+  ul.plain li { margin: 6px 0; }
+  .glossary dt { font-weight: 600; font-size: 14.5px; margin-top: 14px; }
+  .glossary dd { margin: 2px 0 0; font-size: 14px; color: #374151; }
+
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 760px) { .two-col { grid-template-columns: 1fr; } }
+
+  footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 60px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <h1>ALAS 项目架构图解报告</h1>
+  <div class="sub">面向初级开发者的图文解说：<b>alas-launcher</b>（Rust/Tauri 启动器）+ <b>AzurLaneAutoScript</b>（Python 本体）如何组装成一个自动玩游戏机器人</div>
+  <div class="tags">
+    <span class="tag">Tauri v2 / Rust</span>
+    <span class="tag">Python 3.7+</span>
+    <span class="tag">FastAPI / PyWebIO</span>
+    <span class="tag">ADB 自动化</span>
+    <span class="tag">多进程调度</span>
+    <span class="tag">全平台（Win / macOS / Linux）</span>
+  </div>
+</header>
+
+<!-- ============ 0. 怎么看这份报告 ============ -->
+<section>
+  <h2>0. 先看结论：这个项目是什么</h2>
+  <p class="sec-intro">30 秒速览，看完再往下走。</p>
+  <div class="card">
+    <p style="margin-top:0">项目由<b>两个仓库</b>组成，各司其职：</p>
+    <ul class="plain">
+      <li><span class="chip rust">Rust</span><b>alas-launcher</b>：一个用 <b>Tauri</b> 写的桌面「外壳」。它负责：找到 ALAS、更新 ALAS（并打上「控制 API」补丁）、启动 ALAS、把网页装进自家窗口、接管文件下载；macOS 上还提供托盘任务速览与原生通知。它本身<b>不含任何游戏逻辑</b>。</li>
+      <li><span class="chip py">Python</span><b>AzurLaneAutoScript（ALAS 本体）</b>：真正的机器人大脑。一个跑在本地 <code>http://127.0.0.1:22267</code> 的 Web 服务 + 调度器 + 一堆认图/点屏幕的模块。它<b>不知道自己被启动器包着</b>，它只认「有人用浏览器打开了我」。</li>
+      <li><span class="chip dev">设备层</span>：模拟器 / 手机通过 <b>ADB</b> 暴露给 ALAS。ALAS 截图、识别、点击，操作的是游戏画面。</li>
+    </ul>
+    <div class="callout key"><b>一句话总结工作路径：</b>用户双击启动器 → 启动器注入环境 + 拉起 Python Web 服务 → 启动器窗口变成「浏览器」访问这个服务 → 你在网页里点「开始」→ WebUI 开一个子进程跑调度器 → 调度器按配置挑任务 → 任务模块用 ADB 操作模拟器里的游戏。</div>
+  </div>
+</section>
+
+<!-- ============ 1. 全景图 ============ -->
+<section>
+  <h2>1. 全景图：ALAS 本体是一个方块，外面怎么「调用注入」</h2>
+  <p class="sec-intro">这张图是整个报告的地图。先看方块，再看箭头（箭头 = 调用/注入方向）。</p>
+
+  <div class="card figure">
+    <svg viewBox="0 0 1180 600" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, 'PingFang SC', sans-serif">
+      <defs>
+        <marker id="arr" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+          <path d="M0,0 L10,4 L0,8 z" fill="#475569"/>
+        </marker>
+        <marker id="arrR" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+          <path d="M0,0 L10,4 L0,8 z" fill="#c2410c"/>
+        </marker>
+        <marker id="arrB" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+          <path d="M0,0 L10,4 L0,8 z" fill="#1d4ed8"/>
+        </marker>
+        <marker id="arrG" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+          <path d="M0,0 L10,4 L0,8 z" fill="#047857"/>
+        </marker>
+        <marker id="arrP" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+          <path d="M0,0 L10,4 L0,8 z" fill="#6d28d9"/>
+        </marker>
+      </defs>
+
+      <!-- 用户 -->
+      <rect x="20" y="120" width="150" height="84" rx="12" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+      <text x="95" y="152" text-anchor="middle" font-size="14" font-weight="600" fill="#334155">用户</text>
+      <text x="95" y="172" text-anchor="middle" font-size="12" fill="#64748b">双击启动</text>
+      <text x="95" y="190" text-anchor="middle" font-size="12" fill="#64748b">alas-launcher</text>
+
+      <!-- 启动器方块 -->
+      <rect x="230" y="20" width="330" height="440" rx="16" fill="#fff7ed" stroke="#c2410c" stroke-width="2.5"/>
+      <text x="395" y="48" text-anchor="middle" font-size="15" font-weight="700" fill="#c2410c">alas-launcher（Rust / Tauri 外壳）</text>
+      <rect x="252" y="64" width="286" height="52" rx="8" fill="#ffffff" stroke="#fdba74"/>
+      <text x="395" y="85" text-anchor="middle" font-size="12.5" font-weight="600" fill="#9a3412">① 启动器主程序 main.rs</text>
+      <text x="395" y="104" text-anchor="middle" font-size="10.5" fill="#b45309">setup_environment · 读 deploy.yaml · 拉 git · 打控制补丁</text>
+      <rect x="252" y="128" width="286" height="52" rx="8" fill="#ffffff" stroke="#fdba74"/>
+      <text x="395" y="149" text-anchor="middle" font-size="12.5" font-weight="600" fill="#9a3412">② WebView 窗口（就是「浏览器」）</text>
+      <text x="395" y="168" text-anchor="middle" font-size="11.5" fill="#b45309">导航到 http://127.0.0.1:22267/</text>
+      <rect x="252" y="192" width="286" height="52" rx="8" fill="#ffffff" stroke="#fdba74"/>
+      <text x="395" y="213" text-anchor="middle" font-size="12.5" font-weight="600" fill="#9a3412">③ 页面注入 JS（关键！）</text>
+      <text x="395" y="232" text-anchor="middle" font-size="11.5" fill="#b45309">覆盖 window.saveAs → 走 Rust 存文件</text>
+      <rect x="252" y="256" width="286" height="52" rx="8" fill="#ffffff" stroke="#fdba74"/>
+      <text x="395" y="277" text-anchor="middle" font-size="12.5" font-weight="600" fill="#9a3412">④ 子进程管家 ManagedBackend</text>
+      <text x="395" y="296" text-anchor="middle" font-size="11.5" fill="#b45309">spawn python gui.py · 等端口 · 关时杀进程</text>
+      <rect x="252" y="320" width="286" height="60" rx="8" fill="#ffffff" stroke="#fdba74"/>
+      <text x="395" y="342" text-anchor="middle" font-size="12.5" font-weight="600" fill="#9a3412">⑤ 内置文件保存对话框</text>
+      <text x="395" y="360" text-anchor="middle" font-size="11.5" fill="#b45309">save_as 命令（Tauri IPC）</text>
+      <text x="395" y="374" text-anchor="middle" font-size="11.5" fill="#b45309">WebUI 里「导出配置」靠它落地</text>
+      <rect x="252" y="392" width="286" height="52" rx="8" fill="#ffffff" stroke="#059669" stroke-width="2"/>
+      <text x="395" y="413" text-anchor="middle" font-size="12.5" font-weight="600" fill="#047857">⑥ 托盘控制 + 通知（macOS）</text>
+      <text x="395" y="431" text-anchor="middle" font-size="11" fill="#059669">控制 API 客户端 · 3s 轮询 diff · 通知开关</text>
+
+      <!-- ALAS 方块 -->
+      <rect x="620" y="20" width="540" height="400" rx="16" fill="#eff6ff" stroke="#1d4ed8" stroke-width="2.5"/>
+      <text x="890" y="48" text-anchor="middle" font-size="15" font-weight="700" fill="#1d4ed8">ALAS 本体（AzurLaneAutoScript，Python 方块）</text>
+      <rect x="642" y="64" width="240" height="64" rx="8" fill="#ffffff" stroke="#93c5fd"/>
+      <text x="762" y="86" text-anchor="middle" font-size="12.5" font-weight="600" fill="#1e40af">A. gui.py（Web 服务入口）</text>
+      <text x="762" y="104" text-anchor="middle" font-size="11.5" fill="#3b82f6">uvicorn 启动 module.webui.app</text>
+      <text x="762" y="120" text-anchor="middle" font-size="11.5" fill="#3b82f6">默认端口 22267</text>
+      <rect x="898" y="64" width="240" height="64" rx="8" fill="#ffffff" stroke="#93c5fd"/>
+      <text x="1018" y="86" text-anchor="middle" font-size="12.5" font-weight="600" fill="#1e40af">B. WebUI（module/webui）</text>
+      <text x="1018" y="104" text-anchor="middle" font-size="11.5" fill="#3b82f6">PyWebIO 页面 + AlasGUI 控制器</text>
+      <text x="1018" y="120" text-anchor="middle" font-size="11.5" fill="#3b82f6">你看到的网页就是它</text>
+      <rect x="642" y="146" width="496" height="64" rx="8" fill="#ffffff" stroke="#93c5fd"/>
+      <text x="890" y="168" text-anchor="middle" font-size="12.5" font-weight="600" fill="#1e40af">C. 任务子进程（ProcessManager 每次点「开始」拉一个）</text>
+      <text x="890" y="186" text-anchor="middle" font-size="11.5" fill="#3b82f6">alas.py → AzurLaneAutoScript.loop()</text>
+      <text x="890" y="202" text-anchor="middle" font-size="11.5" fill="#3b82f6">调度器挑任务 → 调对应功能模块</text>
+      <rect x="642" y="228" width="496" height="64" rx="8" fill="#ffffff" stroke="#93c5fd"/>
+      <text x="890" y="250" text-anchor="middle" font-size="12.5" font-weight="600" fill="#1e40af">D. 功能模块层 module/</text>
+      <text x="890" y="268" text-anchor="middle" font-size="11.5" fill="#3b82f6">campaign（推图）· daily（日常）· event · device · ocr…</text>
+      <text x="890" y="284" text-anchor="middle" font-size="11.5" fill="#3b82f6">认图素材在 assets/（OCR + 模板匹配）</text>
+      <rect x="642" y="310" width="496" height="70" rx="8" fill="#ffffff" stroke="#93c5fd"/>
+      <text x="890" y="334" text-anchor="middle" font-size="12.5" font-weight="600" fill="#1e40af">E. 设备层 module/device</text>
+      <text x="890" y="352" text-anchor="middle" font-size="11.5" fill="#3b82f6">Device → detect_device → adb_connect</text>
+      <text x="890" y="368" text-anchor="middle" font-size="11.5" fill="#3b82f6">截图方法：Adb / Scrcpy / DroidCast…</text>
+
+      <!-- 设备 & 游戏 -->
+      <rect x="230" y="492" width="330" height="88" rx="12" fill="#f5f3ff" stroke="#6d28d9" stroke-width="2"/>
+      <text x="395" y="522" text-anchor="middle" font-size="13.5" font-weight="700" fill="#6d28d9">模拟器 / 手机（ADB 设备）</text>
+      <text x="395" y="542" text-anchor="middle" font-size="11.5" fill="#7c3aed">MuMu / 雷电 / LDPlayer / 真机</text>
+      <text x="395" y="558" text-anchor="middle" font-size="11.5" fill="#7c3aed">ALAS 通过 adbutils 连接（如 127.0.0.1:16384）</text>
+      <text x="395" y="574" text-anchor="middle" font-size="11.5" fill="#7c3aed">截图 + 点击都由这里代劳</text>
+      <rect x="620" y="492" width="540" height="88" rx="12" fill="#fefce8" stroke="#a16207" stroke-width="2"/>
+      <text x="890" y="522" text-anchor="middle" font-size="13.5" font-weight="700" fill="#a16207">游戏：碧蓝航线（Azur Lane）</text>
+      <text x="890" y="542" text-anchor="middle" font-size="11.5" fill="#b45309">手机游戏 App，跑在模拟器里</text>
+      <text x="890" y="558" text-anchor="middle" font-size="11.5" fill="#b45309">ALAS 完全靠「看画面 + 点屏幕」操作它</text>
+      <text x="890" y="574" text-anchor="middle" font-size="11.5" fill="#b45309">不注入游戏进程、不改游戏文件</text>
+
+      <!-- 配置文件 -->
+      <rect x="252" y="320" width="0" height="0" fill="none"/>
+      <rect x="230" y="0" width="0" height="0" fill="none"/>
+      <rect x="30" y="300" width="160" height="70" rx="10" fill="#ecfdf5" stroke="#047857" stroke-width="1.5"/>
+      <text x="110" y="326" text-anchor="middle" font-size="12" font-weight="600" fill="#047857">config/deploy.yaml</text>
+      <text x="110" y="344" text-anchor="middle" font-size="11" fill="#059669">部署配置：端口/分支/镜像…</text>
+      <text x="110" y="360" text-anchor="middle" font-size="11" fill="#059669">启动器和 Python 都读它</text>
+      <rect x="30" y="392" width="160" height="70" rx="10" fill="#ecfdf5" stroke="#047857" stroke-width="1.5"/>
+      <text x="110" y="418" text-anchor="middle" font-size="12" font-weight="600" fill="#047857">config/&lt;名字&gt;.json</text>
+      <text x="110" y="436" text-anchor="middle" font-size="11" fill="#059669">每个机器人实例一份</text>
+      <text x="110" y="452" text-anchor="middle" font-size="11" fill="#059669">含调度表（Scheduler）</text>
+
+      <!-- 箭头 -->
+      <!-- 用户->启动器 -->
+      <line x1="170" y1="162" x2="226" y2="162" stroke="#475569" stroke-width="2" marker-end="url(#arr)"/>
+      <!-- 启动器 -> ALAS: spawn gui.py -->
+      <path d="M 560 120 C 590 120, 590 96, 638 96" fill="none" stroke="#c2410c" stroke-width="2.2" marker-end="url(#arrR)"/>
+      <text x="600" y="82" text-anchor="middle" font-size="11" fill="#c2410c" font-weight="600">spawn 子进程</text>
+      <text x="600" y="96" text-anchor="middle" font-size="10.5" fill="#ea580c">python gui.py --host 127.0.0.1 --port 22267</text>
+      <!-- WebView -> WebUI: HTTP -->
+      <path d="M 560 155 C 590 155, 590 92, 636 92" fill="none" stroke="#1d4ed8" stroke-width="2.2" marker-end="url(#arrB)"/>
+      <text x="602" y="132" text-anchor="middle" font-size="11" fill="#1d4ed8" font-weight="600">HTTP 请求网页</text>
+      <text x="602" y="146" text-anchor="middle" font-size="10.5" fill="#3b82f6">http://127.0.0.1:22267/</text>
+      <!-- WebUI -> WebView: 返回 HTML/JS -->
+      <path d="M 636 108 C 590 108, 590 170, 560 170" fill="none" stroke="#1d4ed8" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#arrB)"/>
+      <text x="598" y="172" text-anchor="middle" font-size="10.5" fill="#3b82f6">返回页面/数据</text>
+      <!-- 内部 JS 注入（启动器内自己） -->
+      <path d="M 560 225 C 585 225, 585 275, 560 275" fill="none" stroke="#c2410c" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#arrR)"/>
+      <text x="596" y="252" text-anchor="middle" font-size="10.5" fill="#ea580c">注入 window.saveAs</text>
+      <!-- ALAS 内 WebUI -> 任务进程 -->
+      <line x1="890" y1="130" x2="890" y2="142" stroke="#1d4ed8" stroke-width="2" marker-end="url(#arrB)"/>
+      <!-- 任务进程 -> 模块层 -->
+      <line x1="890" y1="212" x2="890" y2="224" stroke="#1d4ed8" stroke-width="2" marker-end="url(#arrB)"/>
+      <!-- 模块层 -> 设备层 -->
+      <line x1="890" y1="294" x2="890" y2="306" stroke="#1d4ed8" stroke-width="2" marker-end="url(#arrB)"/>
+      <!-- 设备层 -> 模拟器 -->
+      <path d="M 890 384 C 890 450, 700 450, 570 488" fill="none" stroke="#6d28d9" stroke-width="2.2" marker-end="url(#arrP)"/>
+      <text x="760" y="450" text-anchor="middle" font-size="11" fill="#6d28d9" font-weight="600">ADB 连接（截图/点击/输入）</text>
+      <!-- 模拟器 -> 游戏 -->
+      <line x1="560" y1="536" x2="616" y2="536" stroke="#a16207" stroke-width="2.2" marker-end="url(#arrG)"/>
+      <text x="588" y="526" text-anchor="middle" font-size="10.5" fill="#b45309">运行游戏</text>
+      <!-- 启动器 -> deploy.yaml -->
+      <path d="M 250 300 C 200 300, 170 330, 130 366" fill="none" stroke="#047857" stroke-width="1.8" stroke-dasharray="5 4" marker-end="url(#arrG)"/>
+      <text x="186" y="300" text-anchor="middle" font-size="10.5" fill="#047857">读 WebuiPort</text>
+      <!-- 启动器⑥ -> WebUI: 控制 API -->
+      <path d="M 560 418 L 618 418" fill="none" stroke="#059669" stroke-width="2.2" marker-end="url(#arrG)"/>
+      <text x="588" y="410" text-anchor="middle" font-size="10.5" fill="#059669" font-weight="600">控制 API</text>
+      <text x="588" y="424" text-anchor="middle" font-size="9.5" fill="#059669">/api/alas/…</text>
+      <!-- ALAS -> config json -->
+      <path d="M 640 310 C 400 310, 200 380, 130 420" fill="none" stroke="#047857" stroke-width="1.8" stroke-dasharray="5 4" marker-end="url(#arrG)"/>
+      <text x="380" y="340" text-anchor="middle" font-size="10.5" fill="#047857">WebUI 读写配置</text>
+      <text x="380" y="354" text-anchor="middle" font-size="10.5" fill="#047857">任务进程读调度表</text>
+    </svg>
+    <div class="fig-cap">图 1：整体工作路径。橙色 = 启动器（外部），蓝色 = ALAS 本体（被调用方），绿色 = 配置，紫色 = 设备，黄色 = 游戏。</div>
+  </div>
+
+  <div class="callout key"><b>「ALAS 本体是一个方块」是什么意思：</b>ALAS 是一个<b>自包含的 Web 服务</b>。它不依赖启动器——单独开终端跑 <code>python gui.py</code>，再用任何浏览器打开 <code>127.0.0.1:22267</code> 也能完整使用。启动器只是「替你把浏览器、Python、Git、ADB 都准备好」的外部包装，另经一条 <b>控制 API</b>（更新后自动打的补丁）驱动调度器启停。这就是方块比喻：<b>方块内部自洽，外部通过固定接口（端口 + 子进程 + 环境变量 + 控制 API）进出。</b></div>
+</section>
+
+<!-- ============ 2. 启动时序 ============ -->
+<section>
+  <h2 class="rust">2. 双击启动器之后：8 步时序</h2>
+  <p class="sec-intro">跟着箭头走一遍启动流程。每一步都对应 alas-launcher 里的真实代码。</p>
+  <div class="card">
+    <ol class="steps">
+      <li class="rust"><b>启动器进程开始。</b>入口 <code>src/main.rs</code>。Windows 上先隐藏控制台窗口（<code>window_util.rs</code>）。</li>
+      <li class="rust"><b>注入环境变量</b>（<code>setup_environment()</code>，<code>setup.rs</code>）。把 <code>toolkit/bin</code>、<code>toolkit/libexec/git-core</code> 塞进 <code>PATH</code>，把 <code>toolkit/lib</code> 塞进 <code>LD_LIBRARY_PATH</code>，然后 <code>chdir</code> 到 ALAS 根目录。这样后面不管调 <code>python</code>、<code>git</code>、<code>adb</code> 都找得到——<b>绿色版工具链，不污染系统</b>。</li>
+      <li class="cfg"><b>读部署配置</b>：<code>get_deploy_config()</code> 解析 <code>config/deploy.yaml</code>，取出 <code>Deploy → Webui → WebuiPort</code>（默认 <code>22267</code>）。这个端口就是后面所有连接的「插座」。</li>
+      <li class="rust"><b>弹 splash 窗口，后台线程干活</b>（<code>setup_alas_repo()</code>）：先 <code>atomic_failure_cleanup</code> 清理上次中断写入的残留临时文件，再跑 <code>python -c "deploy.git.GitManager().git_install()"</code>——复用 ALAS 自带的 Git 更新逻辑，进度实时显示在 splash 上。<b>更新完成后打「控制 API」补丁</b>（<code>patch.rs</code>）：先校验锚点（<code>module/webui/fastapi.py</code> 的 <code>asgi_app()</code>，2022-04 起未动），校验通过才落地；失败则打降级标记——托盘调度器开关禁用，启动照常。</li>
+      <li class="rust"><b>拉起 Python 后端</b>（<code>ManagedBackend::new()</code>，<code>backend.rs</code>）：设置环境变量 <code>ALAS_LAUNCHER_PID=启动器进程号</code>，然后 <code>spawn("python", ["gui.py", "--host", "127.0.0.1", "--port", "22267"])</code>，并放进一个<b>进程组</b>（方便整组杀掉）。</li>
+      <li class="dev"><b>等端口就绪</b>：每 100ms 尝试 <code>TcpStream::connect</code> 连 <code>127.0.0.1:22267</code>，最多等 60 秒。连上了说明 uvicorn 起来了。</li>
+      <li class="rust"><b>主窗口登场</b>：销毁 splash，把主 WebView 导航到 <code>http://127.0.0.1:22267/</code>。启动器的窗口从此「变身」成浏览器，页面内容其实来自 Python。</li>
+      <li class="rust"><b>页面注入 JS</b>（<code>page_load_injector</code>）：页面加载完成后执行一段脚本——把 <code>window.saveAs</code> 换成「读取 Blob → base64 → 调 Tauri 的 <code>save_as</code> 命令 → 弹 Rust 原生保存对话框」的实现。同时拦截浏览器「后退」。这就是最典型的一处「外部注入」。用户看到的界面与原生程序无差别。</li>
+    </ol>
+    <div class="callout warn"><b>冷知识：</b>上游 ALAS 官方客户端是 <b>Electron</b>（<code>webapp/packages/main/src/index.ts</code>），干的事一模一样——用 PyShell 拉起 gui.py，再用窗口装网页。所以这个启动器 = 「用更轻的 Tauri 重写 Electron 的壳」。理解它，就理解了为什么启动器里几乎没有业务代码。</div>
+  </div>
+</section>
+
+<!-- ============ 3. ALAS 内部解剖 ============ -->
+<section>
+  <h2>3. ALAS 本体内部解剖：从网页到点屏幕</h2>
+  <p class="sec-intro">把一个方块拆开看：里面的进程层次，以及「点一下开始」之后数据怎么流动。</p>
+
+  <div class="card figure">
+    <svg viewBox="0 0 1180 520" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, 'PingFang SC', sans-serif">
+      <defs>
+        <marker id="a2" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+          <path d="M0,0 L10,4 L0,8 z" fill="#1d4ed8"/>
+        </marker>
+        <marker id="a2p" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+          <path d="M0,0 L10,4 L0,8 z" fill="#6d28d9"/>
+        </marker>
+      </defs>
+
+      <!-- 左列：外部 -->
+      <rect x="20" y="20" width="220" height="110" rx="12" fill="#fff7ed" stroke="#c2410c" stroke-width="2"/>
+      <text x="130" y="46" text-anchor="middle" font-size="13" font-weight="700" fill="#c2410c">外部调用方</text>
+      <text x="130" y="68" text-anchor="middle" font-size="11.5" fill="#9a3412">· 启动器 WebView（本项目）</text>
+      <text x="130" y="86" text-anchor="middle" font-size="11.5" fill="#9a3412">· 官方 Electron 客户端</text>
+      <text x="130" y="104" text-anchor="middle" font-size="11.5" fill="#9a3412">· 任何浏览器</text>
+      <rect x="20" y="150" width="220" height="52" rx="10" fill="#ecfdf5" stroke="#047857" stroke-width="1.5"/>
+      <text x="130" y="172" text-anchor="middle" font-size="12" font-weight="600" fill="#047857">config/&lt;名字&gt;.json</text>
+      <text x="130" y="190" text-anchor="middle" font-size="11" fill="#059669">机器人实例配置 + 调度表</text>
+
+      <!-- 主流程列 -->
+      <rect x="300" y="20" width="560" height="480" rx="16" fill="#eff6ff" stroke="#1d4ed8" stroke-width="2.5"/>
+      <text x="580" y="48" text-anchor="middle" font-size="15" font-weight="700" fill="#1d4ed8">ALAS 本体（一个进程组）</text>
+
+      <rect x="322" y="64" width="516" height="52" rx="8" fill="#ffffff" stroke="#93c5fd"/>
+      <text x="580" y="84" text-anchor="middle" font-size="12.5" font-weight="600" fill="#1e40af">L0  gui.py — 监督者（仅 EnableReload 时存在）</text>
+      <text x="580" y="102" text-anchor="middle" font-size="11.5" fill="#3b82f6">父进程监视子进程，收到 restart_event 就杀掉重启（更新后自动恢复）</text>
+
+      <rect x="322" y="128" width="516" height="52" rx="8" fill="#ffffff" stroke="#93c5fd"/>
+      <text x="580" y="148" text-anchor="middle" font-size="12.5" font-weight="600" fill="#1e40af">L1  module.webui.app — ASGI 服务（uvicorn 跑）</text>
+      <text x="580" y="166" text-anchor="middle" font-size="11.5" fill="#3b82f6">路由：/ → 主界面 index()（登录→AlasGUI），/manage → 配置导入导出页</text>
+
+      <rect x="322" y="192" width="516" height="52" rx="8" fill="#ffffff" stroke="#93c5fd"/>
+      <text x="580" y="212" text-anchor="middle" font-size="12.5" font-weight="600" fill="#1e40af">L2  AlasGUI — 每个浏览器会话一个 UI 控制器</text>
+      <text x="580" y="230" text-anchor="middle" font-size="11.5" fill="#3b82f6">渲染页面、收集配置修改（防抖 1 秒批量保存）、绑定开始/停止按钮</text>
+
+      <rect x="322" y="256" width="516" height="52" rx="8" fill="#ffffff" stroke="#93c5fd"/>
+      <text x="580" y="276" text-anchor="middle" font-size="12.5" font-weight="600" fill="#1e40af">L3  ProcessManager — 每个配置实例一个进程管家</text>
+      <text x="580" y="294" text-anchor="middle" font-size="11.5" fill="#3b82f6">点「开始」→ multiprocessing.Process 拉子进程；日志经 Manager Queue 回流 UI</text>
+
+      <rect x="322" y="320" width="516" height="64" rx="8" fill="#ffffff" stroke="#93c5fd"/>
+      <text x="580" y="342" text-anchor="middle" font-size="12.5" font-weight="600" fill="#1e40af">L4  任务子进程 — alas.py：AzurLaneAutoScript.loop()</text>
+      <text x="580" y="360" text-anchor="middle" font-size="11.5" fill="#3b82f6">死循环：get_next_task() 挑任务 → run(任务名) 执行 → 失败 3 次退出</text>
+      <text x="580" y="376" text-anchor="middle" font-size="11.5" fill="#3b82f6">任务名 → 方法名映射：Campaign → campaign()，Daily → daily()…</text>
+
+      <rect x="322" y="396" width="516" height="88" rx="8" fill="#ffffff" stroke="#93c5fd"/>
+      <text x="580" y="418" text-anchor="middle" font-size="12.5" font-weight="600" fill="#1e40af">L5  功能模块层</text>
+      <text x="580" y="436" text-anchor="middle" font-size="11.5" fill="#3b82f6">module/campaign（推图）· module/daily · module/event · module/shop…</text>
+      <text x="580" y="454" text-anchor="middle" font-size="11.5" fill="#3b82f6">推图任务：CampaignRun → importlib 加载 campaign/&lt;活动&gt;/&lt;关卡&gt;.py</text>
+      <text x="580" y="472" text-anchor="middle" font-size="11.5" fill="#3b82f6">→ CampaignBase.run() → execute_a_battle() → battle_1 / battle_boss…（关卡文件自己定义）</text>
+
+      <!-- 设备列 -->
+      <rect x="920" y="20" width="240" height="170" rx="12" fill="#f5f3ff" stroke="#6d28d9" stroke-width="2"/>
+      <text x="1040" y="46" text-anchor="middle" font-size="13" font-weight="700" fill="#6d28d9">设备层 module/device</text>
+      <text x="1040" y="70" text-anchor="middle" font-size="11.5" fill="#7c3aed">Device(Screenshot, Control,</text>
+      <text x="1040" y="86" text-anchor="middle" font-size="11.5" fill="#7c3aed">  AppControl) 多重继承门面</text>
+      <text x="1040" y="110" text-anchor="middle" font-size="11.5" fill="#7c3aed">Connection.detect_device()</text>
+      <text x="1040" y="126" text-anchor="middle" font-size="11.5" fill="#7c3aed">  → adb_connect()（adbutils）</text>
+      <text x="1040" y="142" text-anchor="middle" font-size="11.5" fill="#7c3aed">截图：Adb / Scrcpy / DroidCast</text>
+      <text x="1040" y="158" text-anchor="middle" font-size="11.5" fill="#7c3aed">点击：Minitouch / Hermit /</text>
+      <text x="1040" y="174" text-anchor="middle" font-size="11.5" fill="#7c3aed">  Scrcpy / MaaTouch</text>
+      <rect x="920" y="210" width="240" height="90" rx="12" fill="#fefce8" stroke="#a16207" stroke-width="2"/>
+      <text x="1040" y="238" text-anchor="middle" font-size="13" font-weight="700" fill="#a16207">模拟器里的游戏</text>
+      <text x="1040" y="260" text-anchor="middle" font-size="11.5" fill="#b45309">截图 → 识别（OCR/模板）</text>
+      <text x="1040" y="278" text-anchor="middle" font-size="11.5" fill="#b45309">→ 点屏幕 → 循环</text>
+
+      <rect x="920" y="320" width="240" height="180" rx="12" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5"/>
+      <text x="1040" y="346" text-anchor="middle" font-size="12.5" font-weight="600" fill="#334155">支撑资源</text>
+      <text x="1040" y="370" text-anchor="middle" font-size="11.5" fill="#64748b">assets/ 认图素材（模板+OCR）</text>
+      <text x="1040" y="388" text-anchor="middle" font-size="11.5" fill="#64748b">module/base/resource.py 加载</text>
+      <text x="1040" y="410" text-anchor="middle" font-size="11.5" fill="#64748b">campaign/ 关卡文件（自动生成</text>
+      <text x="1040" y="426" text-anchor="middle" font-size="11.5" fill="#64748b">+ 手写战斗钩子）</text>
+      <text x="1040" y="448" text-anchor="middle" font-size="11.5" fill="#64748b">module/config/ 配置与迁移</text>
+      <text x="1040" y="466" text-anchor="middle" font-size="11.5" fill="#64748b">log/ 日志</text>
+
+      <!-- 箭头 -->
+      <line x1="240" y1="75" x2="296" y2="90" stroke="#c2410c" stroke-width="2.2" marker-end="url(#a2)"/>
+      <text x="250" y="62" font-size="10.5" fill="#ea580c">HTTP 打开页面</text>
+      <line x1="240" y1="176" x2="296" y2="152" stroke="#047857" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#a2)"/>
+      <text x="236" y="150" font-size="10.5" fill="#047857">读写 JSON</text>
+      <line x1="580" y1="118" x2="580" y2="124" stroke="#1d4ed8" stroke-width="2" marker-end="url(#a2)"/>
+      <line x1="580" y1="182" x2="580" y2="188" stroke="#1d4ed8" stroke-width="2" marker-end="url(#a2)"/>
+      <line x1="580" y1="246" x2="580" y2="252" stroke="#1d4ed8" stroke-width="2" marker-end="url(#a2)"/>
+      <line x1="580" y1="310" x2="580" y2="316" stroke="#1d4ed8" stroke-width="2" marker-end="url(#a2)"/>
+      <line x1="580" y1="386" x2="580" y2="392" stroke="#1d4ed8" stroke-width="2" marker-end="url(#a2)"/>
+      <path d="M 838 340 C 870 340, 870 105, 916 105" fill="none" stroke="#6d28d9" stroke-width="2.2" marker-end="url(#a2p)"/>
+      <text x="862" y="70" text-anchor="middle" font-size="11" fill="#6d28d9" font-weight="600">连接 + 截图/点击</text>
+      <path d="M 1040 212 C 1040 240, 1040 255, 1040 255" fill="none" stroke="#a16207" stroke-width="2" marker-end="url(#a2p)"/>
+      <text x="1066" y="232" font-size="10.5" fill="#b45309">操作</text>
+    </svg>
+    <div class="fig-cap">图 2：ALAS 本体解剖。一个「开始」按钮背后，是 WebUI 进程拉起的独立任务子进程；任务子进程里才是完整的调度器循环。</div>
+  </div>
+
+  <div class="two-col">
+    <div class="card">
+      <p style="margin-top:0"><b>为什么用「子进程」而不是「子线程」跑任务？</b></p>
+      <ul class="plain" style="font-size:13.5px">
+        <li><b>隔离</b>：任务卡死、内存爆炸，杀掉子进程即可，WebUI 不受影响。</li>
+        <li><b>多开</b>：每个配置实例（alas、alas2…）一个进程，互不干扰。</li>
+        <li><b>更新</b>：更新 WebUI 后重启 uvicorn，任务进程可以保留继续跑。</li>
+        <li>代价：进程间通信（日志、停止信号）要用 multiprocessing 队列/事件，代码略绕。</li>
+      </ul>
+    </div>
+    <div class="card">
+      <p style="margin-top:0"><b>日志是怎么从子进程流回网页的？</b></p>
+      <ul class="plain" style="font-size:13.5px">
+        <li>子进程里 <code>set_func_logger(func=q.put)</code>：把日志包装成对象丢进 multiprocessing <code>Manager.Queue</code>。</li>
+        <li>WebUI 进程里 <code>_thread_log_queue_handler</code> 线程持续取队列。</li>
+        <li><code>RichLog.put_log()</code> 每 0.25 秒把新日志刷到页面控制台。</li>
+        <li>停止信号走 <code>threading.Event</code>（如更新前优雅退出），强杀走 <code>process.kill()</code>。</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 4. 调度器 ============ -->
+<section>
+  <h2 class="cfg">4. 机器人怎么决定「现在干什么」：调度器</h2>
+  <p class="sec-intro">ALAS 是任务驱动的：每个「任务」是一个配置键，带一张调度卡。看一个真实的配置片段就懂了。</p>
+  <div class="two-col">
+    <div class="card">
+      <pre style="margin-top:0"><code><span class="c-com"># config/alas.json（每个机器人实例一份）</span>
+{
+  <span class="c-key">"Campaign"</span>: {            <span class="c-com">// 推图任务</span>
+    <span class="c-key">"Scheduler"</span>: {
+      <span class="c-key">"Enable"</span>: <span class="c-num">true</span>,      <span class="c-com">// 开关</span>
+      <span class="c-key">"Command"</span>: <span class="c-str">"Campaign"</span>, <span class="c-com">// 对应 alas.py 方法名</span>
+      <span class="c-key">"NextRun"</span>: <span class="c-str">"2026-08-13 12:00:00"</span> <span class="c-com">// 下次执行时间</span>
+    },
+    <span class="c-key">"Campaign_Name"</span>: <span class="c-str">"12-4"</span>,
+    <span class="c-key">"Campaign_Mode"</span>: <span class="c-str">"normal"</span>
+  },
+  <span class="c-key">"Daily"</span>: { <span class="c-key">"Scheduler"</span>: { <span class="c-key">"Enable"</span>: <span class="c-num">true</span>, <span class="c-key">"Command"</span>: <span class="c-str">"Daily"</span>, <span class="c-key">"NextRun"</span>: <span class="c-str">"05:00"</span> } },
+  <span class="c-key">"Event"</span>:  { <span class="c-key">"Scheduler"</span>: { <span class="c-key">"Enable"</span>: <span class="c-num">true</span>, <span class="c-key">"Command"</span>: <span class="c-str">"Event"</span>,  <span class="c-key">"NextRun"</span>: <span class="c-str">"12:00"</span> } }
+}</code></pre>
+      <p style="font-size:13px;color:var(--muted);margin-bottom:0">你在 WebUI 的「调度」页改的就是这些字段。保存 = 写回这个 JSON。</p>
+    </div>
+    <div class="card">
+      <p style="margin-top:0"><b>调度循环（alas.py 的 loop()）</b></p>
+      <ol class="plain" style="font-size:13.5px;padding-left:20px">
+        <li>检查停止事件、服务器维护状态。</li>
+        <li><code>config.get_next()</code>：扫所有任务，<code>Enable=true</code> 且 <code>NextRun &lt;= now</code> 的进「待办」；还没到点的进「等待」。</li>
+        <li>用 <b>SCHEDULER_PRIORITY</b>（config_manual.py 里的优先级链：Restart &gt; 日常类 &gt; 推图类）排序。</li>
+        <li>没有待办 → 按 <code>Optimization_WhenTaskQueueEmpty</code> 挂机（回主界面 / 关游戏 / 原地等），期间监听配置改动，改了立刻重新挑任务。</li>
+        <li>挑到任务 → <code>run(inflection.underscore(Command))</code>：<code>Campaign</code> → <code>self.campaign()</code>。</li>
+        <li>任务方法内部：<code>模块类(config, device).run()</code>。推图走 CampaignRun → 关卡文件 → CampaignBase 战斗循环。</li>
+        <li>出问题：游戏没开/卡死/点错 → <code>config.task_call('Restart')</code> 强制重启游戏并回到循环；脚本级错误 → 记录失败次数，<b>连续 3 次失败 → 通知并退出</b>。</li>
+      </ol>
+    </div>
+  </div>
+  <div class="callout key"><b>「任务名 = 方法名」是 ALAS 的可扩展核心：</b>想加一个新任务，只需要写一个类并给它一个 <code>run()</code>，在 alas.py 加一个同名方法，然后在 WebUI 的配置里就会多出这个任务的调度卡。关卡内容（battle_1、battle_boss…）则由 <code>campaign/</code> 目录下的关卡文件按约定实现，无需改核心。</div>
+</section>
+
+<!-- ============ 5. 配置文件 ============ -->
+<section>
+  <h2 class="cfg">5. 配置都住在哪：两类文件、两套读写</h2>
+  <p class="sec-intro">新手最容易混淆的两份配置，分清它们就成功了一半。</p>
+  <div class="card">
+    <table>
+      <tr><th>文件</th><th>谁读</th><th>谁写</th><th>内容</th><th>特点</th></tr>
+      <tr>
+        <td><code>config/deploy.yaml</code></td>
+        <td>启动器（端口）、gui.py、部署工具</td>
+        <td>WebUI 的 <code>DeployConfig</code>（改属性即自动写回）</td>
+        <td>Deploy 段：Git（分支/镜像）、Python、Adb、Ocr、Update（自动更新）、RemoteAccess、<b>Webui（Host/Port/Password）</b></td>
+        <td>「这机器怎么跑」——安装、更新、网络相关</td>
+      </tr>
+      <tr>
+        <td><code>config/&lt;名字&gt;.json</code></td>
+        <td>任务子进程（AzurLaneConfig）</td>
+        <td>WebUI（AlasGUI 防抖批量保存，经 ConfigUpdater 迁移）</td>
+        <td>每个任务的参数 + <b>Scheduler 调度表</b>。如 alas.json、alas2.json</td>
+        <td>「机器人干什么」——每个实例一份，可多开</td>
+      </tr>
+    </table>
+    <p style="font-size:13px;color:var(--muted);margin-bottom:0">小坑：本仓库里 <code>config/deploy.yaml</code> 在 macOS 上是 Finder 别名（指向已安装的 App），别直接编辑它；真正的模板在 <code>deploy/template</code> 和 <code>deploy/Windows/template.yaml</code>。</p>
+  </div>
+</section>
+
+<!-- ============ 6. 注入点清单 ============ -->
+<section>
+  <h2 class="rust">6. 「外部调用注入」到底注入了什么：6 类注入点</h2>
+  <p class="sec-intro">回到最初的问题。外部（启动器）对 ALAS 本体的全部接触方式，一共六类。这张表是启动器的「接口文档」。</p>
+  <div class="card">
+    <table>
+      <tr><th>#</th><th>注入类型</th><th>方向</th><th>机制</th><th>作用</th></tr>
+      <tr>
+        <td>1</td><td><b>环境变量注入</b></td>
+        <td>启动器 → Python 子进程</td>
+        <td><code>setup_environment()</code> 把 <code>toolkit/bin</code>、<code>toolkit/libexec/git-core</code> 加入 <code>PATH</code>，<code>toolkit/lib</code> 加入 <code>LD_LIBRARY_PATH</code>；再设置 <code>ALAS_LAUNCHER_PID</code></td>
+        <td>让「绿色版」git/python 随处可用；<code>ALAS_LAUNCHER_PID</code> 是进程血缘标记，退出时按它清扫泄漏进程</td>
+      </tr>
+      <tr>
+        <td>2</td><td><b>子进程注入</b></td>
+        <td>启动器 → gui.py</td>
+        <td><code>ManagedBackend</code> 用 <code>Command::new("python").args(["gui.py","--host","127.0.0.1","--port","22267"])</code> 拉起，放入进程组；60 秒轮询 TCP 端口确认存活</td>
+        <td>把 Python Web 服务「装进」启动器生命周期：启动器关，Python 跟着死</td>
+      </tr>
+      <tr>
+        <td>3</td><td><b>网络调用</b></td>
+        <td>WebView ↔ gui.py（双向）</td>
+        <td>HTTP 访问 <code>http://127.0.0.1:22267/</code>；WebUI 是 ASGI 服务（uvicorn + PyWebIO），返回页面；页面里按钮再发请求控制任务</td>
+        <td>界面与逻辑解耦——换任何浏览器都能用，启动器只是恰好内嵌了一个</td>
+      </tr>
+      <tr>
+        <td>4</td><td><b>JS 注入</b></td>
+        <td>启动器 → WebView 页面</td>
+        <td><code>page_load_injector</code>：页面加载完成事件里 <code>webview.eval()</code> 一段脚本，覆盖 <code>window.saveAs</code>，把 Blob 转 base64 后调 Tauri <code>save_as</code> 命令，走 Rust 原生保存对话框；顺带拦截浏览器后退</td>
+        <td>让网页里的「导出配置/日志」落到用户真正想存的位置，体验和原生 App 一致</td>
+      </tr>
+      <tr>
+        <td>5</td><td><b>配置文件注入</b></td>
+        <td>双向</td>
+        <td>启动器读 <code>config/deploy.yaml</code>（端口）；WebUI 写 deploy.yaml 与 <code>config/*.json</code>；任务子进程读 JSON 的 Scheduler 段</td>
+        <td>唯一的「长期记忆」：重启后配置不丢，调度表决定今天干什么</td>
+      </tr>
+      <tr>
+        <td>6</td><td><b>控制 API 注入</b></td>
+        <td>启动器 → WebUI（HTTP）</td>
+        <td>补丁新增 <code>module/webui/control_api.py</code>（挂载于 4.3 年未动的 <code>fastapi.py</code>）；托盘调 <code>POST /api/alas/{name}/scheduler/start|stop</code>，与网页按钮调<b>同一个</b> <code>ProcessManager</code>；更新后自动应用，锚点校验失败即 fail-closed 降级</td>
+        <td>macOS 托盘启停调度器的稳定通道——替代早期「伪装浏览器点按钮」的脆弱方案（版本锁死、回调 1 秒时效）</td>
+      </tr>
+    </table>
+  </div>
+  <div class="callout warn"><b>刻意没有做的注入（也是它的卖点）：</b>不注入游戏进程、不改游戏文件、不 hook 内存。ALAS 是纯「读屏幕 → 判断 → 点屏幕」的外挂式自动化，因此换引擎（WebView/Electron/浏览器）都不影响本体——方块内外只靠上面的 6 类接口通信。</div>
+</section>
+
+<!-- ============ 7. 进程生命周期 ============ -->
+<section>
+  <h2 class="rust">7. 进程生命周期：从双击到退出</h2>
+  <p class="sec-intro">运行期间系统里同时活着的进程，以及它们怎么被优雅（或暴力）地收掉。</p>
+  <div class="card">
+    <table>
+      <tr><th>进程</th><th>谁创建</th><th>干什么</th><th>怎么退出</th></tr>
+      <tr>
+        <td><b>alas-launcher</b>（Rust）</td><td>用户双击</td>
+        <td>窗口、WebView、git 更新、进程管家</td>
+        <td>用户关窗口 → <code>RunEvent::ExitRequested</code> → 调 <code>backend.terminate()</code>；重复启动时 single-instance 插件只聚焦已有窗口</td>
+      </tr>
+      <tr>
+        <td><b>python gui.py 监督者</b></td><td>ManagedBackend</td>
+        <td>EnableReload 时监视 uvicorn 子进程，收到 restart_event 就重启</td>
+        <td>随启动器退出（SIGTERM 进程组 → 5 秒后 kill）</td>
+      </tr>
+      <tr>
+        <td><b>uvicorn（ASGI 服务）</b></td><td>gui.py</td>
+        <td>提供 WebUI 页面与接口</td>
+        <td>restart_event（更新后）/ 随进程组被杀</td>
+      </tr>
+      <tr>
+        <td><b>任务子进程</b></td><td>ProcessManager（每个实例一个）</td>
+        <td>跑 alas.py 调度循环，操作模拟器</td>
+        <td>点「停止」→ <code>process.kill()</code>；更新前 → 通过 Event 优雅退出；<b>兜底</b>：启动器 Drop 时扫所有进程环境变量，凡带 <code>ALAS_LAUNCHER_PID=当前启动器 pid</code> 的一律杀掉——防「孤儿」</td>
+      </tr>
+    </table>
+  </div>
+</section>
+
+<!-- ============ 8. 目录速查 ============ -->
+<section>
+  <h2>8. 目录速查表：找代码不迷路</h2>
+  <p class="sec-intro">两个仓库里最重要的路径，以及什么时候会打开它们。</p>
+  <div class="card">
+    <table>
+      <tr><th>路径</th><th>是什么</th><th>你想找的东西</th></tr>
+      <tr><td><code>alas-launcher/src/main.rs</code></td><td>启动器入口</td><td>窗口生命周期、JS 注入、退出清理</td></tr>
+      <tr><td><code>alas-launcher/src/backend.rs</code></td><td>Python 子进程管家</td><td>spawn/terminate/ALAS_LAUNCHER_PID 清扫</td></tr>
+      <tr><td><code>alas-launcher/src/setup.rs</code></td><td>环境与仓库准备</td><td>PATH 注入、git 更新、deploy.yaml 解析</td></tr>
+      <tr><td><code>alas-launcher/src/patch.rs</code></td><td>控制 API 补丁应用器（新增）</td><td>锚点校验、补丁应用、fail-closed 降级</td></tr>
+      <tr><td><code>AzurLaneAutoScript/gui.py</code></td><td>Web 服务入口</td><td>端口/参数、reload 监督循环</td></tr>
+      <tr><td><code>AzurLaneAutoScript/alas.py</code></td><td>机器人调度循环</td><td>loop()、get_next_task()、任务方法</td></tr>
+      <tr><td><code>AzurLaneAutoScript/module/webui/</code></td><td>网页界面</td><td>AlasGUI、ProcessManager、配置保存</td></tr>
+      <tr><td><code>AzurLaneAutoScript/module/webui/control_api.py</code></td><td>控制 API（补丁新增）</td><td>instances / scheduler start / stop</td></tr>
+      <tr><td><code>AzurLaneAutoScript/module/config/</code></td><td>配置系统</td><td>AzurLaneConfig、ConfigUpdater、SCHEDULER_PRIORITY</td></tr>
+      <tr><td><code>AzurLaneAutoScript/module/device/</code></td><td>设备层</td><td>ADB 连接、截图/点击方法</td></tr>
+      <tr><td><code>AzurLaneAutoScript/module/campaign/</code> + <code>campaign/</code></td><td>推图引擎 + 关卡文件</td><td>CampaignBase、battle_N 钩子、关卡注册表</td></tr>
+      <tr><td><code>AzurLaneAutoScript/deploy/</code></td><td>安装/更新工具</td><td>installer.py、git.py、atomic.py、模板</td></tr>
+      <tr><td><code>AzurLaneAutoScript/webapp/</code></td><td>官方 Electron 客户端（对照组）</td><td>理解「壳」的参考实现</td></tr>
+    </table>
+  </div>
+</section>
+
+<!-- ============ 9. 术语表 ============ -->
+<section>
+  <h2>9. 术语表：初级开发者速查</h2>
+  <div class="card glossary">
+    <dl>
+      <dt>Tauri</dt><dd>用系统自带 WebView + Rust 做桌面应用的框架。比 Electron 轻（没有打包整个 Chromium）。</dd>
+      <dt>WebView</dt><dd>系统级网页渲染组件。macOS 上是 WKWebView，Windows 上是 WebView2（Edge 内核）。启动器窗口 = 一个 WebView。</dd>
+      <dt>ASGI / uvicorn</dt><dd>Python 异步 Web 服务器标准/实现。gui.py 用 uvicorn 把 ALAS 的 WebUI 跑成本地 HTTP 服务。</dd>
+      <dt>PyWebIO</dt><dd>用 Python 写网页交互的库。ALAS 的整个管理界面都是它渲染的（FastAPI 适配版）。</dd>
+      <dt>multiprocessing.Process</dt><dd>Python 真·子进程（不是线程）。ALAS 每个机器人实例一个，崩溃隔离、可多开。</dd>
+      <dt>ADB（Android Debug Bridge）</dt><dd>安卓调试桥。ALAS 通过 adbutils 库驱动它完成截图、点击、输入——这是它对游戏唯一的「手」。</dd>
+      <dt>模板匹配 / OCR</dt><dd>ALAS 的「眼睛」：模板匹配 = 拿 assets/ 里的截图小图在屏幕上找位置；OCR = 把屏幕上的文字读出来（cnocr/MXNet）。</dd>
+      <dt>IPC</dt><dd>进程间通信。本项目的 IPC 有四套：启动器↔WebView 走 Tauri 命令（invoke）；启动器↔WebUI 走控制 API（HTTP）；WebUI↔任务进程走 multiprocessing 队列/事件；网页↔服务走 HTTP。</dd>
+      <dt>控制 API</dt><dd>启动器给 ALAS webui 打的补丁：把 <code>ProcessManager</code> 启停暴露成 HTTP 端点（<code>/api/alas/…</code>），托盘不再逆向网页 DOM。锚点 <code>fastapi.py</code> 4.3 年未动，锚点校验失败即降级禁用，不阻塞启动。</dd>
+      <dt>调度表（Scheduler）</dt><dd>config/*.json 里每个任务的 Enable/Command/NextRun 三件套，是「机器人几点干什么」的唯一依据。</dd>
+      <dt>防抖（debounce）</dt><dd>WebUI 收集 1 秒内的配置修改再批量写盘，避免你拖动一个滑块就写几十次文件。</dd>
+      <dt>进程组（process group）</dt><dd>backend.rs 用 command-group 把 gui.py 及其子孙捆成一串，一条 SIGTERM 全组收掉。</dd>
+    </dl>
+  </div>
+</section>
+
+<footer>本报告基于对 alas-launcher（Tauri v2）与 AzurLaneAutoScript（master 分支，HEAD 81ccf63b）实际源码梳理生成；启动器侧描述已对齐路线 C 改造目标架构（控制 API 补丁 + macOS 原生通知）。图中文件名/函数名均可在仓库中直接检索验证。</footer>
+
+</div>
+</body>
+</html>

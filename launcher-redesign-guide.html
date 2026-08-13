@@ -1,0 +1,581 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ALAS Launcher 新架构改造报告 — 前后对比图解（路线 C）</title>
+<style>
+  :root {
+    --rust: #c2410c;        /* 启动器（Rust/Tauri）主色 */
+    --rust-bg: #fff7ed;
+    --rust-strong: #9a3412;
+    --py: #1d4ed8;          /* ALAS 本体（Python） */
+    --py-bg: #eff6ff;
+    --cfg: #047857;         /* 配置文件 */
+    --cfg-bg: #ecfdf5;
+    --dev: #6d28d9;         /* 进程/系统层 */
+    --dev-bg: #f5f3ff;
+    --warn: #a16207;        /* 异常/降级 */
+    --warn-bg: #fefce8;
+    --add: #059669;         /* 新增 */
+    --add-bg: #ecfdf5;
+    --del: #dc2626;         /* 删除 */
+    --del-bg: #fef2f2;
+    --ink: #1f2937;
+    --muted: #6b7280;
+    --line: #e5e7eb;
+    --card: #ffffff;
+    --mono: "SF Mono", "Menlo", "Consolas", monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Segoe UI", sans-serif;
+    color: var(--ink);
+    background: #f8fafc;
+    line-height: 1.7;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 40px 24px 120px; }
+
+  header.hero {
+    background: linear-gradient(135deg, #431407 0%, #7c2d12 55%, #c2410c 100%);
+    color: #fff;
+    border-radius: 16px;
+    padding: 40px 44px;
+    margin-bottom: 36px;
+  }
+  header.hero h1 { margin: 0 0 8px; font-size: 30px; letter-spacing: .5px; }
+  header.hero .sub { color: #fed7aa; font-size: 15px; }
+  header.hero .sub b { color: #fff; }
+  header.hero .tags { margin-top: 14px; display: flex; gap: 8px; flex-wrap: wrap; }
+  header.hero .tag {
+    background: rgba(255,255,255,.14); border: 1px solid rgba(255,255,255,.25);
+    border-radius: 999px; padding: 3px 12px; font-size: 12px; color: #ffedd5;
+  }
+  header.hero .tag.add { background: rgba(16,185,129,.35); border-color: rgba(16,185,129,.6); color: #d1fae5; }
+  header.hero .tag.del { background: rgba(239,68,68,.35); border-color: rgba(239,68,68,.6); color: #fee2e2; text-decoration: line-through; }
+
+  section { margin-bottom: 44px; }
+  h2 {
+    font-size: 22px; margin: 0 0 6px; padding-left: 12px;
+    border-left: 4px solid var(--rust);
+  }
+  h2.py { border-left-color: var(--py); }
+  h2.cfg { border-left-color: var(--cfg); }
+  h2.dev { border-left-color: var(--dev); }
+  h2.warn { border-left-color: var(--warn); }
+  h2.add { border-left-color: var(--add); }
+  h2.del { border-left-color: var(--del); }
+  .sec-intro { color: var(--muted); font-size: 14px; margin: 0 0 16px; padding-left: 12px; }
+
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 20px 24px; margin: 12px 0; box-shadow: 0 1px 2px rgba(16,24,40,.04);
+  }
+  .figure { padding: 12px 12px 4px; }
+  .figure .fig-cap {
+    font-size: 12.5px; color: var(--muted); text-align: center; padding: 8px 0 12px;
+  }
+  .figure svg { width: 100%; height: auto; display: block; }
+
+  .callout {
+    border-radius: 10px; padding: 14px 18px; margin: 14px 0; font-size: 14px;
+  }
+  .callout.key { background: var(--rust-bg); border: 1px solid #fed7aa; }
+  .callout.info { background: var(--dev-bg); border: 1px solid #ddd6fe; }
+  .callout.warn { background: var(--warn-bg); border: 1px solid #fde68a; }
+  .callout.add { background: var(--add-bg); border: 1px solid #a7f3d0; }
+  .callout.del { background: var(--del-bg); border: 1px solid #fecaca; }
+  .callout b { font-weight: 600; }
+
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; margin: 12px 0; }
+  th {
+    text-align: left; background: #f1f5f9; padding: 8px 12px;
+    border: 1px solid var(--line); font-weight: 600; white-space: nowrap;
+  }
+  th.old { background: var(--del-bg); color: var(--del); }
+  th.new { background: var(--add-bg); color: var(--add); }
+  td { padding: 8px 12px; border: 1px solid var(--line); vertical-align: top; }
+  tr:nth-child(even) td { background: #fafbfc; }
+  td.old { background: #fef2f2; }
+  td.new { background: #ecfdf5; }
+  .del-text { color: var(--del); text-decoration: line-through; }
+  .add-text { color: var(--add); font-weight: 600; }
+
+  code {
+    font-family: var(--mono); font-size: .88em;
+    background: #f1f5f9; border: 1px solid #e2e8f0; border-radius: 4px;
+    padding: 1px 6px; color: #0f172a;
+  }
+  pre {
+    background: #0f172a; color: #e2e8f0; border-radius: 10px;
+    padding: 16px 20px; overflow-x: auto; font-size: 13px; line-height: 1.6;
+  }
+  pre code { background: none; border: none; color: inherit; padding: 0; }
+  .c-com { color: #64748b; }
+  .c-str { color: #a5b4fc; }
+  .c-key { color: #7dd3fc; }
+  .c-num { color: #fca5a5; }
+
+  .steps { counter-reset: step; list-style: none; padding: 0; margin: 12px 0; }
+  .steps li {
+    position: relative; padding: 0 0 18px 46px; font-size: 14.5px;
+  }
+  .steps li::before {
+    counter-increment: step; content: counter(step);
+    position: absolute; left: 0; top: 0;
+    width: 30px; height: 30px; border-radius: 50%;
+    background: var(--rust); color: #fff; font-weight: 700; font-size: 14px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .steps li:not(:last-child)::after {
+    content: ""; position: absolute; left: 14px; top: 34px; bottom: 2px;
+    border-left: 2px dashed #cbd5e1;
+  }
+  .steps li.rust::before { background: var(--rust); }
+  .steps li.cfg::before { background: var(--cfg); }
+  .steps li.dev::before { background: var(--dev); }
+  .steps li.py::before { background: var(--py); }
+  .steps li.add::before { background: var(--add); }
+  .steps li b { font-weight: 600; }
+
+  .chip {
+    display: inline-block; border-radius: 6px; padding: 1px 8px; font-size: 12px;
+    font-weight: 600; margin-right: 6px;
+  }
+  .chip.rust { background: var(--rust-bg); color: var(--rust); border: 1px solid #fed7aa; }
+  .chip.py   { background: var(--py-bg); color: var(--py); border: 1px solid #bfdbfe; }
+  .chip.cfg  { background: var(--cfg-bg); color: var(--cfg); border: 1px solid #a7f3d0; }
+  .chip.dev  { background: var(--dev-bg); color: var(--dev); border: 1px solid #ddd6fe; }
+  .chip.warn { background: var(--warn-bg); color: var(--warn); border: 1px solid #fde68a; }
+  .chip.add  { background: var(--add-bg); color: var(--add); border: 1px solid #a7f3d0; }
+  .chip.del  { background: var(--del-bg); color: var(--del); border: 1px solid #fecaca; }
+
+  ul.plain { padding-left: 22px; font-size: 14.5px; }
+  ul.plain li { margin: 6px 0; }
+  .glossary dt { font-weight: 600; font-size: 14.5px; margin-top: 14px; }
+  .glossary dd { margin: 2px 0 0; font-size: 14px; color: #374151; }
+
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 760px) { .two-col { grid-template-columns: 1fr; } }
+
+  footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 60px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <h1>ALAS Launcher 新架构改造报告</h1>
+  <div class="sub">目标改造后的<b>前后对比</b>图解（路线 C）—— 改了什么、删了什么、加了什么、哪里一根手指都没动</div>
+  <div class="tags">
+    <span class="tag">Tauri v2 / Rust</span>
+    <span class="tag del">PyWebIO DOM 控制通道</span>
+    <span class="tag add">控制 API 补丁</span>
+    <span class="tag add">macOS 原生通知</span>
+    <span class="tag">macOS 菜单栏</span>
+    <span class="tag">稳定面锚点</span>
+    <span class="tag">Win / macOS / Linux</span>
+  </div>
+</header>
+
+<!-- ============ 0. 先看结论 ============ -->
+<section>
+  <h2>0. 先看结论：这次改造到底改了什么</h2>
+  <p class="sec-intro">30 秒速览。对照《ALAS Launcher 内部执行图解》，本报告只回答一个问题：<b>目标架构下哪些模块变了、怎么变的。</b></p>
+  <div class="card">
+    <p style="margin-top:0">改造前，启动器里最重的一块是 <b>「伪装浏览器」控制通道</b>：托盘要启停调度器时，逆向 PyWebIO 的 WebSocket DOM 协议，找到网页上的「开始/停止」按钮并模拟点击。它全项目最脆弱——版本锁死 <code>pywebio==1.6.2</code>、按钮回调 ID 渲染后 1 秒内失效、点击重发会双开调度器，代码里塞满了 <code>HOME_QUIESCE</code>、<code>CONFIRM_WINDOW</code> 之类的竞态补丁。</p>
+    <p>改造后，这条通道被换成 <b>一条官方路径镜像的 HTTP 控制 API</b>：给 ALAS 打一个 60 行的小补丁（新增 <code>control_api.py</code> + 在 4.3 年没动过的 <code>fastapi.py</code> 里挂一行路由），托盘直接调 <code>ProcessManager.start()/stop()</code>——<b>和网页按钮调的是同一个函数</b>。同时新增 macOS 原生通知（带开关）。</p>
+    <div class="callout key"><b>一句话总结：</b>改动 = 三处：<span class="chip del">①</span>删掉「伪装浏览器」DOM 黑客（<span class="del-text">pywebio.rs ~750 行 + tungstenite</span>）；<span class="chip add">②</span>换成「控制 API 补丁 + 轻量 HTTP 客户端」（新增 ~160 行）；<span class="chip add">③</span>新增 macOS 原生通知（调度器异常死亡提醒默认开、任务完成默认静默）。<b>其余全部保持现状</b>——启动流程、环境注入、git 更新、进程组、WebView 嵌入、发布流程，一根手指都不动。</div>
+  </div>
+</section>
+
+<!-- ============ 1. 全景对比图 ============ -->
+<section>
+  <h2>1. 全景对比：改造前 → 改造后</h2>
+  <p class="sec-intro">红色 = 删除；绿色 = 新增；橙色/蓝色 = 保持现状。中间那条缝（启动器 ↔ ALAS 本体）是唯一被动的接口。</p>
+  <div class="card figure">
+    <svg viewBox="0 0 1180 790" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, 'PingFang SC', sans-serif">
+      <!-- ===== 左：改造前 ===== -->
+      <text x="60" y="36" font-size="17" font-weight="700" fill="#dc2626">改造前 · 现状</text>
+
+      <!-- 启动器 -->
+      <rect x="40" y="60" width="480" height="92" rx="12" fill="#fff7ed" stroke="#c2410c" stroke-width="2"/>
+      <text x="60" y="88" font-size="15" font-weight="700" fill="#9a3412">alas-launcher（Rust/Tauri）</text>
+      <text x="60" y="110" font-size="12.5" fill="#57534e">托盘调度器开关 · 任务列表(读文件) · 状态机 · 进程管家</text>
+      <text x="60" y="130" font-size="12.5" fill="#57534e">主窗口 WebView → 127.0.0.1:22267（网页不变）</text>
+
+      <!-- pywebio.rs：删除 -->
+      <rect x="40" y="180" width="480" height="120" rx="12" fill="#fef2f2" stroke="#dc2626" stroke-width="2.5" stroke-dasharray="7 4"/>
+      <text x="60" y="206" font-size="14" font-weight="700" fill="#dc2626" text-decoration="line-through">pywebio.rs · 伪装浏览器会话</text>
+      <text x="60" y="226" font-size="12" fill="#b91c1c">逆向 PyWebIO WS DOM 协议，模拟点击「开始/停止」按钮</text>
+      <text x="60" y="246" font-size="12" fill="#b91c1c">版本锁死 pywebio==1.6.2 · callback id &lt;1s 时效</text>
+      <text x="60" y="266" font-size="12" fill="#b91c1c">HOME_QUIESCE 6s · CONFIRM_WINDOW 1.5s · 重发双开竞态</text>
+      <rect x="420" y="186" width="88" height="26" rx="13" fill="#dc2626"/>
+      <text x="464" y="204" font-size="12.5" font-weight="700" fill="#fff" text-anchor="middle">删除</text>
+
+      <!-- webui -->
+      <rect x="40" y="330" width="480" height="92" rx="12" fill="#eff6ff" stroke="#1d4ed8" stroke-width="2"/>
+      <text x="60" y="358" font-size="15" font-weight="700" fill="#1d4ed8">webui 进程（uvicorn · pywebio 网页）</text>
+      <text x="60" y="380" font-size="12.5" fill="#475569">PyWebIO 页面（网页按钮 start/stop 直接调 ProcessManager）</text>
+      <text x="60" y="400" font-size="12.5" fill="#475569">module/webui/process_manager.py（调度器所有者）</text>
+
+      <!-- 调度器 -->
+      <rect x="40" y="450" width="480" height="76" rx="12" fill="#f5f3ff" stroke="#6d28d9" stroke-width="2"/>
+      <text x="60" y="478" font-size="14.5" font-weight="700" fill="#6d28d9">调度器子进程（multiprocessing.Process）</text>
+      <text x="60" y="500" font-size="12.5" fill="#57534e">AzurLaneAutoScript(config).loop()</text>
+
+      <!-- 箭头 -->
+      <path d="M 280 152 L 280 178" stroke="#dc2626" stroke-width="2.5" fill="none" marker-end="url(#arrowDel)"/>
+      <path d="M 280 300 L 280 328" stroke="#1d4ed8" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+      <path d="M 280 422 L 280 448" stroke="#6d28d9" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+      <path d="M 60 152 L 60 178" stroke="#9ca3af" stroke-width="1.5" stroke-dasharray="4 3" fill="none"/>
+      <text x="34" y="170" font-size="11" fill="#9ca3af">DOM</text>
+
+      <defs>
+        <marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+          <path d="M0,0 L10,4 L0,8 Z" fill="#1d4ed8"/>
+        </marker>
+        <marker id="arrowDel" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+          <path d="M0,0 L10,4 L0,8 Z" fill="#dc2626"/>
+        </marker>
+        <marker id="arrowAdd" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+          <path d="M0,0 L10,4 L0,8 Z" fill="#059669"/>
+        </marker>
+      </defs>
+
+      <!-- ===== 中间：改造箭头 ===== -->
+      <rect x="545" y="200" width="90" height="140" rx="45" fill="#431407"/>
+      <text x="590" y="258" font-size="16" font-weight="700" fill="#fff" text-anchor="middle">改</text>
+      <text x="590" y="282" font-size="16" font-weight="700" fill="#fff" text-anchor="middle">造</text>
+      <text x="590" y="306" font-size="11" fill="#fed7aa" text-anchor="middle">只动这一条缝</text>
+
+      <!-- ===== 右：改造后 ===== -->
+      <text x="690" y="36" font-size="17" font-weight="700" fill="#059669">改造后 · 目标</text>
+
+      <!-- 启动器 -->
+      <rect x="660" y="60" width="480" height="92" rx="12" fill="#fff7ed" stroke="#c2410c" stroke-width="2"/>
+      <text x="680" y="88" font-size="15" font-weight="700" fill="#9a3412">alas-launcher（Rust/Tauri）</text>
+      <text x="680" y="110" font-size="12.5" fill="#57534e">托盘调度器开关 · 任务列表(读文件) · 状态机 · 进程管家</text>
+      <text x="680" y="130" font-size="12.5" fill="#57534e">主窗口 WebView → 127.0.0.1:22267（网页不变）</text>
+
+      <!-- HTTP 客户端：新增 -->
+      <rect x="660" y="180" width="480" height="92" rx="12" fill="#ecfdf5" stroke="#059669" stroke-width="2.5"/>
+      <text x="680" y="206" font-size="14" font-weight="700" fill="#059669">HTTP 控制客户端（新增 ~100 行 Rust）</text>
+      <text x="680" y="226" font-size="12" fill="#047857">POST /api/alas/alas/scheduler/start|stop</text>
+      <text x="680" y="246" font-size="12" fill="#047857">GET /api/alas/instances（state 供通知检测）</text>
+      <rect x="1040" y="186" width="88" height="26" rx="13" fill="#059669"/>
+      <text x="1084" y="204" font-size="12.5" font-weight="700" fill="#fff" text-anchor="middle">新增</text>
+
+      <!-- control_api.py：新增 -->
+      <rect x="660" y="300" width="480" height="92" rx="12" fill="#ecfdf5" stroke="#059669" stroke-width="2.5"/>
+      <text x="680" y="326" font-size="14" font-weight="700" fill="#059669">control_api.py · 上游补丁（新增 ~60 行 Python）</text>
+      <text x="680" y="346" font-size="12" fill="#047857">逐字镜像官方 --run 路径：ProcessManager.get_manager(name).start/stop</text>
+      <text x="680" y="366" font-size="12" fill="#047857">锚点：module/webui/fastapi.py asgi_app()（4.3 年未动）</text>
+      <rect x="1040" y="306" width="88" height="26" rx="13" fill="#059669"/>
+      <text x="1084" y="324" font-size="12.5" font-weight="700" fill="#fff" text-anchor="middle">新增</text>
+
+      <!-- webui -->
+      <rect x="660" y="420" width="480" height="92" rx="12" fill="#eff6ff" stroke="#1d4ed8" stroke-width="2"/>
+      <text x="680" y="448" font-size="15" font-weight="700" fill="#1d4ed8">webui 进程（uvicorn · pywebio 网页）</text>
+      <text x="680" y="470" font-size="12.5" fill="#475569">网页按钮与 control_api 调同一个 ProcessManager</text>
+      <text x="680" y="490" font-size="12.5" fill="#475569">module/webui/process_manager.py（调度器所有者 · 17 个月未动）</text>
+
+      <!-- 调度器 -->
+      <rect x="660" y="540" width="480" height="76" rx="12" fill="#f5f3ff" stroke="#6d28d9" stroke-width="2"/>
+      <text x="680" y="568" font-size="14.5" font-weight="700" fill="#6d28d9">调度器子进程（multiprocessing.Process）</text>
+      <text x="680" y="590" font-size="12.5" fill="#57534e">AzurLaneAutoScript(config).loop()</text>
+
+      <path d="M 900 152 L 900 178" stroke="#059669" stroke-width="2.5" fill="none" marker-end="url(#arrowAdd)"/>
+      <path d="M 900 272 L 900 298" stroke="#059669" stroke-width="2.5" fill="none" marker-end="url(#arrowAdd)"/>
+      <path d="M 900 392 L 900 418" stroke="#1d4ed8" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+      <path d="M 900 512 L 900 538" stroke="#6d28d9" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+
+      <!-- 通知 -->
+      <rect x="660" y="640" width="480" height="76" rx="12" fill="#ecfdf5" stroke="#059669" stroke-width="2.5"/>
+      <text x="680" y="668" font-size="14.5" font-weight="700" fill="#059669">macOS 原生通知（新增 · 带开关）</text>
+      <text x="680" y="690" font-size="12" fill="#047857">3s 轮询 diff config/alas.json · 控制 API state 突变</text>
+      <rect x="1040" y="646" width="88" height="26" rx="13" fill="#059669"/>
+      <text x="1084" y="664" font-size="12.5" font-weight="700" fill="#fff" text-anchor="middle">新增</text>
+      <path d="M 760 680 L 700 680" stroke="#059669" stroke-width="2" fill="none" marker-end="url(#arrowAdd)"/>
+      <text x="726" y="672" font-size="11" fill="#047857">diff</text>
+
+      <!-- 底部注解 -->
+      <text x="60" y="575" font-size="11.5" fill="#9ca3af">左：调度器控制 = 逆向 DOM 点击（红框整块删除）</text>
+      <text x="660" y="760" font-size="11.5" fill="#9ca3af">右：调度器控制 = HTTP → 官方 ProcessManager（绿框整块新增）；通知 = 文件 diff + API state</text>
+      <text x="60" y="595" font-size="11.5" fill="#9ca3af">蓝色方块两侧完全相同——ALAS 本体没动，动的只是「怎么叫它」</text>
+    </svg>
+    <div class="fig-cap">图 1：改造前后全景。红色虚线框 = 删除（pywebio.rs DOM 黑客）；绿色实线框 = 新增（HTTP 客户端 + control_api.py 补丁 + 通知）；橙色/蓝色 = 保持现状。唯一的接口变化在「启动器 ↔ webui」之间。</div>
+  </div>
+</section>
+
+<!-- ============ 2. 三处改动 ============ -->
+<section>
+  <h2>2. 三处改动逐项对比</h2>
+  <p class="sec-intro">改动就三处。第一处是重头（删 + 换），第二、三处是纯新增/微调。逐项看。</p>
+
+  <h3 style="font-size:17px; margin:26px 0 4px"><span class="chip del">改动 1</span> 控制通道：DOM 黑客 → 控制 API 补丁</h3>
+  <div class="card">
+    <table>
+      <tr><th style="width:120px">维度</th><th class="old">改造前 · pywebio.rs 伪装浏览器</th><th class="new">改造后 · 控制 API 补丁</th></tr>
+      <tr>
+        <td><b>机制</b></td>
+        <td class="old">逆向 PyWebIO WebSocket DOM 协议，模拟点击网页按钮</td>
+        <td class="new">HTTP POST 调 <code>ProcessManager.start()/stop()</code>——<b>与网页按钮同一函数</b></td>
+      </tr>
+      <tr>
+        <td><b>协议依赖</b></td>
+        <td class="old">锁死 <code>pywebio==1.6.2</code>，版本漂移即失效（版本守卫告警）</td>
+        <td class="new">Starlette Route，与 pywebio 版本无关</td>
+      </tr>
+      <tr>
+        <td><b>竞态处理</b></td>
+        <td class="old"><code>HOME_QUIESCE</code> 6s、<code>CONFIRM_WINDOW</code> 1.5s、callback id &lt;1s 时效、<code>js_yield</code> 应答、重发双开</td>
+        <td class="new">普通 HTTP 请求/响应，天然无这些竞态</td>
+      </tr>
+      <tr>
+        <td><b>代码量</b></td>
+        <td class="old"><span class="del-text">pywebio.rs ~750 行 + tungstenite 依赖</span></td>
+        <td class="new">control_api.py ~60 行（上游补丁）+ Rust HTTP 客户端 ~100 行</td>
+      </tr>
+      <tr>
+        <td><b>对接锚点</b></td>
+        <td class="old">webui DOM 结构（活跃 churn，2026-04 还在改）</td>
+        <td class="new"><code>module/webui/fastapi.py</code>（2022-04-14 起 4.3 年未动）</td>
+      </tr>
+      <tr>
+        <td><b>失败语义</b></td>
+        <td class="old">告警日志后照点（可能静默失败）</td>
+        <td class="new">补丁应用失败 → fail-closed 降级禁用，不阻塞启动</td>
+      </tr>
+    </table>
+    <div class="callout key"><b>为什么敢这样换：</b>补丁不发明新机制——它把 ALAS 官方 <code>gui.py --run</code> 路径（<code>app() → args.run → on_startup → restart_processes</code>）原样暴露成 HTTP。改的是「怎么叫」，不是「叫什么」。</div>
+  </div>
+
+  <h3 style="font-size:17px; margin:26px 0 4px"><span class="chip add">改动 2</span> macOS 原生通知（纯新增）</h3>
+  <div class="card">
+    <table>
+      <tr><th style="width:140px">事件</th><th style="width:200px">检测方式</th><th>默认</th></tr>
+      <tr>
+        <td><b>调度器异常死亡</b></td>
+        <td>控制 API <code>state</code> 突变（API 不可用时退回现有 uvicorn 子进程观测）</td>
+        <td><span class="chip add">ON</span> 唯一默认打扰——调度器死了不跑任务，必须让用户知道</td>
+      </tr>
+      <tr>
+        <td><b>任务完成</b></td>
+        <td><code>config/alas.json</code> 的 <code>NextRun</code> 前移 diff + i18n 任务名</td>
+        <td><span class="chip cfg">OFF</span> 静默（绝大多数时候不需要打扰，用户可自行打开）</td>
+      </tr>
+      <tr>
+        <td><b>手动启停</b></td>
+        <td>—</td>
+        <td><span class="chip warn">不通知</span> 纯噪音</td>
+      </tr>
+    </table>
+    <ul class="plain" style="margin-top:10px">
+      <li><span class="chip cfg">开关</span>shell settings 新增：<b>全局开关</b> + <b>按事件类型开关</b>（调度器事件 / 任务完成）</li>
+      <li><span class="chip dev">检测</span>复用 macOS 托盘已有 3s 轮询循环做 diff，<b>零新依赖</b></li>
+      <li><span class="chip rust">平台</span><b>macOS-only</b>：通知依赖托盘常驻——Win/Linux 无托盘 = 关窗即退进程，通知无从谈起</li>
+    </ul>
+  </div>
+
+  <h3 style="font-size:17px; margin:26px 0 4px"><span class="chip rust">改动 3</span> macOS 托盘：唯一变化是控制走 API</h3>
+  <div class="card">
+    <table>
+      <tr><th style="width:140px">托盘部件</th><th>是否变化</th></tr>
+      <tr><td>任务列表（读 <code>config/alas.json</code> + i18n，3s 轮询）</td><td>不变</td></tr>
+      <tr><td>菜单结构 / i18n / 状态行</td><td>不变</td></tr>
+      <tr><td>调度器启停开关</td><td><span class="add-text">变化：</span>WS DOM 点击 → HTTP 调控制 API（改动 1 的消费方）</td></tr>
+      <tr><td>Win / Linux 门控（<code>cfg(target_os = "macos")</code>）</td><td>不变——Windows 放弃扩展，Linux 后议</td></tr>
+    </table>
+  </div>
+</section>
+
+<!-- ============ 3. 红线：不动的部分 ============ -->
+<section>
+  <h2 class="cfg">3. 一根手指都没动的部分</h2>
+  <p class="sec-intro">约束（用户明确）：不维护 ALAS 上游改动。所以改造被严格限制在「启动器 ↔ webui 之间的一条缝」里。</p>
+  <div class="card">
+    <div class="two-col">
+      <div>
+        <p style="margin:4px 0 6px; font-weight:600">启动器侧保持：</p>
+        <ul class="plain">
+          <li>环境注入（PATH / LD_LIBRARY_PATH / <code>ALAS_LAUNCHER_PID</code>）</li>
+          <li>git 更新流程（复用 ALAS 自身 <code>deploy.git.GitManager</code>）</li>
+          <li>进程组 / 端口所有权 / 退出注册表</li>
+          <li>后台状态机（Stopped / Initializing / Running）</li>
+          <li>主窗口 WebView 嵌入 + <code>saveAs</code> JS 注入</li>
+          <li>单实例 / splash / 退出清理</li>
+          <li>发布流程（手动 releases，CI 悬置）</li>
+        </ul>
+      </div>
+      <div>
+        <p style="margin:4px 0 6px; font-weight:600">ALAS 侧保持：</p>
+        <ul class="plain">
+          <li>pywebio 网页本体（WebView 内容原样）</li>
+          <li><code>ProcessManager</code> 语义（17 个月未动的 API）</li>
+          <li>调度器子进程模型（multiprocessing）</li>
+          <li>配置格式 <code>config/alas.json</code>（多年稳定，托盘已直读）</li>
+          <li>不做任务失败检测（日志解析，格式随上游 churn）</li>
+          <li>不做上游优化（cnocr/mxnet 换代、requests 升级——违背约束）</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout info"><b>原则：</b>只动「启动器怎么叫 ALAS」这一条缝。ALAS 本体作为一个自包含 Web 服务方块，前后完全一致。</div>
+  </div>
+</section>
+
+<!-- ============ 4. 稳定面锚点 ============ -->
+<section>
+  <h2 class="py">4. 为什么敢打补丁：稳定面实证</h2>
+  <p class="sec-intro">约束的落地方式：只对接 ALAS git 历史中<b>长时间未改动</b>的部分。以下为 2026-08-13 对真实 payload 的 <code>git log -1</code> 实证。</p>
+  <div class="card">
+    <table>
+      <tr><th>对接面</th><th>最后改动</th><th>稳定时长</th><th>结论</th></tr>
+      <tr><td><code>module/webui/fastapi.py</code></td><td>2022-04-14</td><td><b>4.3 年</b></td><td><span class="chip add">补丁锚点</span> vendored 自 pywebio.platform.fastapi，注入点一行</td></tr>
+      <tr><td><code>module/webui/setting.py</code></td><td>2023-02-08</td><td>3.5 年</td><td>State.manager / deploy_config</td></tr>
+      <tr><td><code>module/webui/process_manager.py</code></td><td>2025-03-17</td><td>17 个月</td><td>API 调用面（start/stop/get_manager/state）</td></tr>
+      <tr><td><code>gui.py</code></td><td>2025-06-05</td><td>14 个月</td><td>CLI 参数面（--host/--port/--run）</td></tr>
+      <tr><td><code>module/webui/app.py</code></td><td>2026-04-23</td><td>—</td><td><span class="chip del">避开</span> 活跃 churn</td></tr>
+      <tr><td><code>module/config/config_generated.py</code></td><td>2026-08-05</td><td>—</td><td><span class="chip del">只读</span> 天天重新生成</td></tr>
+    </table>
+    <div class="callout key"><b>维护承诺：</b>补丁锚点在 4.3 年内零改动；<code>app()</code> 工厂名 4.5 年；<code>ProcessManager</code> API 17 个月。补丁应用前自动校验锚点（上下文/checksum 匹配），锚点动了就 fail-closed——<b>「不维护上游」不是口头承诺，是工程约束。</b></div>
+  </div>
+</section>
+
+<!-- ============ 5. 降级语义 ============ -->
+<section>
+  <h2 class="warn">5. 降级与失败语义</h2>
+  <p class="sec-intro">新架构的每个失败路径都有明确的降级出口，原则：<b>宁可降级，不可破坏。</b></p>
+  <div class="card">
+    <table>
+      <tr><th style="width:220px">场景</th><th>行为</th></tr>
+      <tr><td>补丁锚点校验失败 / 应用失败</td><td><b>fail-closed</b>：托盘调度器开关禁用 + 提示；不阻塞启动、不损坏仓库</td></tr>
+      <tr><td>控制 API 不可达（密码 / SSL / 未打补丁）</td><td>降级为现有<b>进程级控制</b>（现状行为，托盘状态行已有「仅进程级控制」提示先例）</td></tr>
+      <tr><td>通知发送失败</td><td>静默，不 crash</td></tr>
+      <tr><td>调度器死亡检测误报</td><td>通知内容含降级文案；检测窗口对齐现有 uvicorn 子进程观测</td></tr>
+    </table>
+  </div>
+</section>
+
+<!-- ============ 6. 删除清单 ============ -->
+<section>
+  <h2 class="del">6. 删除清单与新增清单</h2>
+  <p class="sec-intro">账目要清楚：删了什么、加了什么、净变化多少。</p>
+  <div class="card">
+    <div class="two-col">
+      <div>
+        <p style="margin:4px 0 6px; font-weight:600; color:var(--del)">删除（改造前）</p>
+        <ul class="plain">
+          <li><span class="del-text">pywebio.rs ~750 行</span>：WS 连接、DOM 解析、按钮定位、js_yield 应答、竞态处理</li>
+          <li><span class="del-text">tungstenite 依赖</span>（Cargo.toml）</li>
+          <li><span class="del-text">pywebio 版本守卫</span>（requirements.txt 解析 + 1.6.2 校验）</li>
+          <li><span class="del-text">HOME_QUIESCE / CONFIRM_WINDOW / READ_POLL</span> 等时序常量与相关测试</li>
+        </ul>
+      </div>
+      <div>
+        <p style="margin:4px 0 6px; font-weight:600; color:var(--add)">新增（改造后）</p>
+        <ul class="plain">
+          <li><span class="add-text">module/webui/control_api.py ~60 行</span>（上游补丁，新文件永不冲突）</li>
+          <li><span class="add-text">Rust HTTP 控制客户端 ~100 行</span></li>
+          <li><span class="add-text">补丁应用器</span>：锚点校验 + 应用 + fail-closed（含单元测试）</li>
+          <li><span class="add-text">通知模块</span>：3s 轮询 diff + 事件分发 + shell settings 开关</li>
+        </ul>
+        <p style="margin:8px 0 0; font-size:13px; color:var(--muted)">净变化：Rust 约 <b>−650 行</b>；Python 上游补丁 +60 行（仅装入启动器二进制，不落地 payload 之外的任何地方）。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 7. 数据流对比 ============ -->
+<section>
+  <h2 class="dev">7. 数据流对比：一次「启停调度器」</h2>
+  <p class="sec-intro">同一次用户操作，改造前后的路径差异一目了然。</p>
+  <div class="card">
+    <div class="two-col">
+      <div>
+        <p style="margin:4px 0 6px; font-weight:600; color:var(--del)">改造前（7 步，每步都可能碎）</p>
+        <ol class="steps">
+          <li>托盘点击 → 读 <code>requirements.txt</code> 校验 pywebio==1.6.2</li>
+          <li>建立 WS 会话（<code>/?app=index</code>），等 6s quiesce</li>
+          <li>应答 <code>js_yield</code>（localStorage / visibilityState）否则 DOM 不渲染</li>
+          <li>定位 aside 实例按钮 → 点击</li>
+          <li>定位 menu Overview 按钮（<code>--menu-Overview--</code> 标记）→ 点击</li>
+          <li>定位 <code>scheduler_btn</code> 按钮（callback id &lt;1s 时效）→ 点击</li>
+          <li>观察 1.5s 标签翻转确认；<b>绝不重发</b>（会双开调度器）</li>
+        </ol>
+      </div>
+      <div>
+        <p style="margin:4px 0 6px; font-weight:600; color:var(--add)">改造后（2 步）</p>
+        <ol class="steps">
+          <li class="add">托盘点击 → <code>POST /api/alas/alas/scheduler/start</code></li>
+          <li class="add">control_api.py → <code>ProcessManager.get_manager("alas").start(None, updater.event)</code> → 子进程拉起</li>
+        </ol>
+        <div class="callout add"><b>同一函数：</b>网页上的「开始」按钮回调就是 <code>self.alas.start(None, updater.event)</code>——API 与网页殊途同归，行为 100% 一致。</div>
+      </div>
+    </div>
+    <div class="callout info" style="margin-top:16px"><b>通知数据流（新增）：</b>轮询循环 3s 读 <code>config/alas.json</code>（diff <code>NextRun</code> 前移）+ 控制 API <code>state</code> 突变 → 事件 → 查 shell settings 开关 → tauri-plugin-notification 弹通知。任务完成默认静默（OFF），调度器异常死亡默认打扰（ON）。</div>
+  </div>
+</section>
+
+<!-- ============ 8. 测试 ============ -->
+<section>
+  <h2>8. 测试策略</h2>
+  <p class="sec-intro">沿用仓库既有验证文化：单元测试 + 真实 payload 集成测试（隔离端口，绝不碰用户现场）。</p>
+  <div class="card">
+    <table>
+      <tr><th style="width:200px">测试</th><th>内容</th></tr>
+      <tr><td>补丁锚点校验</td><td>单元测试（fixture 文件）；对真实 payload 的 dry-run（<code>--ignored</code>，只校验不落地）</td></tr>
+      <tr><td>HTTP 客户端</td><td>单元测试（mock 服务：instances / start / stop / 401 降级）</td></tr>
+      <tr><td>通知 diff 检测</td><td>单元测试（<code>config/alas.json</code> fixture，复用 <code>alas_tasks.rs</code> 既有 fixture 风格）</td></tr>
+      <tr><td>端到端</td><td>真实 payload 上启停 roundtrip：现有 <code>ws_roundtrip_real_payload</code> 改造为走控制 API，隔离端口 22367，进程组守卫清理</td></tr>
+    </table>
+  </div>
+</section>
+
+<!-- ============ 9. 目录速查表 ============ -->
+<section>
+  <h2>9. 文件速查表：哪里变了</h2>
+  <p class="sec-intro">改造涉及的文件清单。上游补丁由启动器在 git 更新后自动应用，payload 目录只多一个文件。</p>
+  <div class="card">
+    <table>
+      <tr><th>文件</th><th>动作</th><th>说明</th></tr>
+      <tr><td><code>src/pywebio.rs</code></td><td><span class="chip del">删除</span></td><td>DOM 黑客整体移除</td></tr>
+      <tr><td><code>src/patch.rs</code>（新）</td><td><span class="chip add">新增</span></td><td>补丁文件（include_str!）+ 锚点校验 + 应用 + fail-closed</td></tr>
+      <tr><td><code>src/backend.rs</code> / <code>src/tray.rs</code></td><td><span class="chip rust">修改</span></td><td>控制调用从 WS 客户端切到 HTTP 客户端；通知轮询并入既有 3s 循环</td></tr>
+      <tr><td><code>src/shell_settings.rs</code></td><td><span class="chip rust">修改</span></td><td>新增通知开关（全局 + 分类型）</td></tr>
+      <tr><td><code>Cargo.toml</code></td><td><span class="chip rust">修改</span></td><td>删 tungstenite；加 tauri-plugin-notification</td></tr>
+      <tr><td><code>module/webui/control_api.py</code>（payload，补丁）</td><td><span class="chip add">新增</span></td><td>控制 API router（instances / scheduler start / stop）</td></tr>
+      <tr><td><code>module/webui/fastapi.py</code>（payload，补丁）</td><td><span class="chip add">注入 1 行</span></td><td>挂载 router（锚点 2022-04-14）</td></tr>
+    </table>
+  </div>
+</section>
+
+<!-- ============ 10. 术语表 ============ -->
+<section>
+  <h2>10. 术语表</h2>
+  <div class="card glossary">
+    <dl>
+      <dt>fail-closed</dt>
+      <dd>补丁锚点校验失败时，托盘调度器开关禁用 + 提示，而不是继续用旧方式硬试——宁可降级，不可破坏。</dd>
+      <dt>稳定面锚点</dt>
+      <dd>ALAS git 历史中长时间未改动的文件/API，是对接补丁的唯一允许位置。实证：fastapi.py 4.3 年。</dd>
+      <dt>官方路径镜像</dt>
+      <dd>补丁不发明新机制，只是把 ALAS 官方 <code>gui.py --run</code> 的 ProcessManager 调用链原样暴露成 HTTP。</dd>
+      <dt>控制 API 补丁</dt>
+      <dd>新增 control_api.py + fastapi.py 注入一行，启动器 git 更新后自动应用，锚点校验失败即降级。</dd>
+      <dt>调度器异常死亡</dt>
+      <dd>唯一默认打扰的通知事件：调度器进程非预期消失（控制 API state 突变 / uvicorn 子进程观测），意味着任务停摆。</dd>
+      <dt>NextRun diff</dt>
+      <dd>任务完成检测：<code>config/alas.json</code> 的 <code>Scheduler.NextRun</code> 前移 = 任务跑完，触发通知（默认静默）。</dd>
+    </dl>
+  </div>
+</section>
+
+<footer>
+  本报告基于 2026-08-13 对 alas-launcher 源码与真实 ALAS payload（HEAD 81ccf63b）的实证梳理。设计 spec：docs/superpowers/specs/2026-08-13-launcher-optimization-design.md
+</footer>
+
+</div>
+</body>
+</html>

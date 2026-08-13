@@ -1,0 +1,700 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ALAS Launcher 内部执行图解 — 启动器仓库工作报告</title>
+<style>
+  :root {
+    --rust: #c2410c;        /* 启动器（Rust/Tauri）主色 */
+    --rust-bg: #fff7ed;
+    --rust-strong: #9a3412;
+    --py: #1d4ed8;          /* ALAS 本体（仅作外部方块出现） */
+    --py-bg: #eff6ff;
+    --cfg: #047857;         /* 配置文件 */
+    --cfg-bg: #ecfdf5;
+    --dev: #6d28d9;         /* 进程/系统层 */
+    --dev-bg: #f5f3ff;
+    --warn: #a16207;        /* 异常/降级 */
+    --warn-bg: #fefce8;
+    --ink: #1f2937;
+    --muted: #6b7280;
+    --line: #e5e7eb;
+    --card: #ffffff;
+    --mono: "SF Mono", "Menlo", "Consolas", monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Segoe UI", sans-serif;
+    color: var(--ink);
+    background: #f8fafc;
+    line-height: 1.7;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 40px 24px 120px; }
+
+  header.hero {
+    background: linear-gradient(135deg, #431407 0%, #7c2d12 55%, #c2410c 100%);
+    color: #fff;
+    border-radius: 16px;
+    padding: 40px 44px;
+    margin-bottom: 36px;
+  }
+  header.hero h1 { margin: 0 0 8px; font-size: 30px; letter-spacing: .5px; }
+  header.hero .sub { color: #fed7aa; font-size: 15px; }
+  header.hero .sub b { color: #fff; }
+  header.hero .tags { margin-top: 14px; display: flex; gap: 8px; flex-wrap: wrap; }
+  header.hero .tag {
+    background: rgba(255,255,255,.14); border: 1px solid rgba(255,255,255,.25);
+    border-radius: 999px; padding: 3px 12px; font-size: 12px; color: #ffedd5;
+  }
+
+  section { margin-bottom: 44px; }
+  h2 {
+    font-size: 22px; margin: 0 0 6px; padding-left: 12px;
+    border-left: 4px solid var(--rust);
+  }
+  h2.py { border-left-color: var(--py); }
+  h2.cfg { border-left-color: var(--cfg); }
+  h2.dev { border-left-color: var(--dev); }
+  h2.warn { border-left-color: var(--warn); }
+  .sec-intro { color: var(--muted); font-size: 14px; margin: 0 0 16px; padding-left: 12px; }
+
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 20px 24px; margin: 12px 0; box-shadow: 0 1px 2px rgba(16,24,40,.04);
+  }
+  .figure { padding: 12px 12px 4px; }
+  .figure .fig-cap {
+    font-size: 12.5px; color: var(--muted); text-align: center; padding: 8px 0 12px;
+  }
+  .figure svg { width: 100%; height: auto; display: block; }
+
+  .callout {
+    border-radius: 10px; padding: 14px 18px; margin: 14px 0; font-size: 14px;
+  }
+  .callout.key { background: var(--rust-bg); border: 1px solid #fed7aa; }
+  .callout.info { background: var(--dev-bg); border: 1px solid #ddd6fe; }
+  .callout.warn { background: var(--warn-bg); border: 1px solid #fde68a; }
+  .callout b { font-weight: 600; }
+
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; margin: 12px 0; }
+  th {
+    text-align: left; background: #f1f5f9; padding: 8px 12px;
+    border: 1px solid var(--line); font-weight: 600; white-space: nowrap;
+  }
+  td { padding: 8px 12px; border: 1px solid var(--line); vertical-align: top; }
+  tr:nth-child(even) td { background: #fafbfc; }
+
+  code {
+    font-family: var(--mono); font-size: .88em;
+    background: #f1f5f9; border: 1px solid #e2e8f0; border-radius: 4px;
+    padding: 1px 6px; color: #0f172a;
+  }
+  pre {
+    background: #0f172a; color: #e2e8f0; border-radius: 10px;
+    padding: 16px 20px; overflow-x: auto; font-size: 13px; line-height: 1.6;
+  }
+  pre code { background: none; border: none; color: inherit; padding: 0; }
+  .c-com { color: #64748b; }
+  .c-str { color: #a5b4fc; }
+  .c-key { color: #7dd3fc; }
+  .c-num { color: #fca5a5; }
+
+  .steps { counter-reset: step; list-style: none; padding: 0; margin: 12px 0; }
+  .steps li {
+    position: relative; padding: 0 0 18px 46px; font-size: 14.5px;
+  }
+  .steps li::before {
+    counter-increment: step; content: counter(step);
+    position: absolute; left: 0; top: 0;
+    width: 30px; height: 30px; border-radius: 50%;
+    background: var(--rust); color: #fff; font-weight: 700; font-size: 14px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .steps li:not(:last-child)::after {
+    content: ""; position: absolute; left: 14px; top: 34px; bottom: 2px;
+    border-left: 2px dashed #cbd5e1;
+  }
+  .steps li.rust::before { background: var(--rust); }
+  .steps li.cfg::before { background: var(--cfg); }
+  .steps li.dev::before { background: var(--dev); }
+  .steps li.py::before { background: var(--py); }
+  .steps li b { font-weight: 600; }
+
+  .chip {
+    display: inline-block; border-radius: 6px; padding: 1px 8px; font-size: 12px;
+    font-weight: 600; margin-right: 6px;
+  }
+  .chip.rust { background: var(--rust-bg); color: var(--rust); border: 1px solid #fed7aa; }
+  .chip.py   { background: var(--py-bg); color: var(--py); border: 1px solid #bfdbfe; }
+  .chip.cfg  { background: var(--cfg-bg); color: var(--cfg); border: 1px solid #a7f3d0; }
+  .chip.dev  { background: var(--dev-bg); color: var(--dev); border: 1px solid #ddd6fe; }
+  .chip.warn { background: var(--warn-bg); color: var(--warn); border: 1px solid #fde68a; }
+
+  ul.plain { padding-left: 22px; font-size: 14.5px; }
+  ul.plain li { margin: 6px 0; }
+  .glossary dt { font-weight: 600; font-size: 14.5px; margin-top: 14px; }
+  .glossary dd { margin: 2px 0 0; font-size: 14px; color: #374151; }
+
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 760px) { .two-col { grid-template-columns: 1fr; } }
+
+  footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 60px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <h1>ALAS Launcher 内部执行图解报告</h1>
+  <div class="sub">面向初级开发者的图文解说：<b>这个仓库（alas-launcher）自己内部是怎么执行的</b> —— 进程怎么拉起、状态怎么流转、异常怎么兜底、macOS 菜单栏怎么控制调度器</div>
+  <div class="tags">
+    <span class="tag">Tauri v2 / Rust</span>
+    <span class="tag">后台状态机</span>
+    <span class="tag">进程组管理</span>
+    <span class="tag">PyWebIO WebSocket 控制</span>
+    <span class="tag">macOS 菜单栏</span>
+    <span class="tag">单实例</span>
+    <span class="tag">Win / macOS / Linux</span>
+  </div>
+</header>
+
+<!-- ============ 0. 先看结论 ============ -->
+<section>
+  <h2>0. 先看结论：这个仓库到底干了什么</h2>
+  <p class="sec-intro">30 秒速览。本报告是《ALAS 项目架构图解》的姊妹篇：那份报告讲「ALAS 本体 + 启动器」拼成机器人，这份只讲<b>启动器仓库内部</b>。</p>
+  <div class="card">
+    <p style="margin-top:0">这个仓库（<b>alas-launcher</b>，Rust + Tauri）不是一个「带按钮的浏览器壳」。它真正的工作是四件事：</p>
+    <ul class="plain">
+      <li><span class="chip rust">①</span><b>进程管家</b>：找到 ALAS 目录 → 注入绿色版工具链环境变量 → 清理配置残留 → 拉取仓库更新 → 拉起 <code>python gui.py</code> 子进程并<b>验证它真的活在了正确的端口上</b> → 退出时把整棵进程树收掉。</li>
+      <li><span class="chip dev">②</span><b>后台状态机</b>：一个三态（Stopped / Initializing / Running）生命周期，外加「用户意图」记录，用来区分<b>「调度器是自己死的」还是「用户让它停的」</b>——这是菜单栏状态行的语义基础。</li>
+      <li><span class="chip rust">③</span><b>双 UI 外壳</b>：主窗口 WebView（导航到 ALAS 网页 + 注入 <code>window.saveAs</code> 接管文件保存）+ macOS 菜单栏托盘（轮询真实任务列表、一键启停调度器）。</li>
+      <li><span class="chip dev">④</span><b>控制通道</b>：托盘启停调度器时，启动器会<b>伪装成一个浏览器会话</b>连上 ALAS 网页的 WebSocket，找到「开始/停止」按钮并点击它——不碰任何游戏逻辑，只操作网页按钮。</li>
+    </ul>
+    <div class="callout key"><b>一句话总结：</b>启动器 = 「准备环境 + 更新仓库 + 拉起并监护 Web 后端」的进程管家，外面套一层状态机，macOS 上再加一个能读任务列表、能点网页按钮的菜单栏。ALAS 本体在本报告中只作为右侧一个蓝色小方块出现——它的内部解剖请看《ALAS 项目架构图解》。</div>
+  </div>
+</section>
+
+<!-- ============ 1. 全景图 ============ -->
+<section>
+  <h2>1. 全景图：启动器内部模块怎么分工</h2>
+  <p class="sec-intro">这张图是整份报告的地图。橙色 = 启动器自己的模块，蓝色 = ALAS（只露必要的接口），绿色 = 配置。</p>
+
+  <div class="card figure">
+    <svg viewBox="0 0 1180 600" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, 'PingFang SC', sans-serif">
+      <defs>
+        <marker id="f1a" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+          <path d="M0,0 L10,4 L0,8 z" fill="#475569"/>
+        </marker>
+        <marker id="f1r" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+          <path d="M0,0 L10,4 L0,8 z" fill="#c2410c"/>
+        </marker>
+        <marker id="f1b" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+          <path d="M0,0 L10,4 L0,8 z" fill="#1d4ed8"/>
+        </marker>
+        <marker id="f1g" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+          <path d="M0,0 L10,4 L0,8 z" fill="#047857"/>
+        </marker>
+        <marker id="f1p" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+          <path d="M0,0 L10,4 L0,8 z" fill="#6d28d9"/>
+        </marker>
+      </defs>
+
+      <!-- 用户 -->
+      <rect x="20" y="110" width="150" height="84" rx="12" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+      <text x="95" y="142" text-anchor="middle" font-size="14" font-weight="600" fill="#334155">用户</text>
+      <text x="95" y="162" text-anchor="middle" font-size="12" fill="#64748b">双击启动 / 关窗口</text>
+      <text x="95" y="180" text-anchor="middle" font-size="12" fill="#64748b">菜单栏操作</text>
+
+      <!-- 启动器大块 -->
+      <rect x="230" y="20" width="580" height="420" rx="16" fill="#fff7ed" stroke="#c2410c" stroke-width="2.5"/>
+      <text x="520" y="48" text-anchor="middle" font-size="15" font-weight="700" fill="#c2410c">alas-launcher（本仓库，Rust / Tauri 进程）</text>
+
+      <!-- main.rs -->
+      <rect x="252" y="64" width="256" height="88" rx="8" fill="#ffffff" stroke="#fdba74"/>
+      <text x="380" y="84" text-anchor="middle" font-size="12.5" font-weight="600" fill="#9a3412">① main.rs — 编排中枢</text>
+      <text x="380" y="102" text-anchor="middle" font-size="11" fill="#b45309">setup() 建窗口/托盘/菜单</text>
+      <text x="380" y="118" text-anchor="middle" font-size="11" fill="#b45309">run()：Ready 线程 + 退出清理</text>
+      <text x="380" y="134" text-anchor="middle" font-size="11" fill="#b45309">save_as 命令 + JS 注入</text>
+
+      <!-- backend.rs -->
+      <rect x="528" y="64" width="260" height="88" rx="8" fill="#ffffff" stroke="#fdba74"/>
+      <text x="658" y="84" text-anchor="middle" font-size="12.5" font-weight="600" fill="#9a3412">② backend.rs — 生命周期状态机</text>
+      <text x="658" y="102" text-anchor="middle" font-size="11" fill="#b45309">Stopped / Initializing / Running</text>
+      <text x="658" y="118" text-anchor="middle" font-size="11" fill="#b45309">SchedulerIntent + epoch 退出竞态</text>
+      <text x="658" y="134" text-anchor="middle" font-size="11" fill="#b45309">toggle_decision 决策矩阵</text>
+
+      <!-- child_process.rs -->
+      <rect x="252" y="164" width="256" height="88" rx="8" fill="#ffffff" stroke="#fdba74"/>
+      <text x="380" y="184" text-anchor="middle" font-size="12.5" font-weight="600" fill="#9a3412">③ child_process.rs — 进程组管家</text>
+      <text x="380" y="202" text-anchor="middle" font-size="11" fill="#b45309">spawn_with_group / kill_group</text>
+      <text x="380" y="218" text-anchor="middle" font-size="11" fill="#b45309">wait_with_timeout / 退出注册表</text>
+      <text x="380" y="234" text-anchor="middle" font-size="11" fill="#b45309">port.rs：端口所有权探测</text>
+
+      <!-- setup.rs -->
+      <rect x="528" y="164" width="260" height="88" rx="8" fill="#ffffff" stroke="#fdba74"/>
+      <text x="658" y="184" text-anchor="middle" font-size="12.5" font-weight="600" fill="#9a3412">④ setup.rs — 环境与仓库准备</text>
+      <text x="658" y="202" text-anchor="middle" font-size="11" fill="#b45309">setup_environment：PATH 注入</text>
+      <text x="658" y="218" text-anchor="middle" font-size="11" fill="#b45309">setup_alas_repo：清理 + git 更新</text>
+      <text x="658" y="234" text-anchor="middle" font-size="11" fill="#b45309">git 进度解析 → splash</text>
+
+      <!-- deploy_config.rs -->
+      <rect x="252" y="264" width="256" height="60" rx="8" fill="#ffffff" stroke="#fdba74"/>
+      <text x="380" y="284" text-anchor="middle" font-size="12.5" font-weight="600" fill="#9a3412">⑤ deploy_config.rs — 配置读取</text>
+      <text x="380" y="304" text-anchor="middle" font-size="11" fill="#b45309">WebuiPort / Language / EnableReload / WS 可用性</text>
+
+      <!-- macOS 块 -->
+      <rect x="528" y="264" width="260" height="60" rx="8" fill="#ffffff" stroke="#fdba74"/>
+      <text x="658" y="284" text-anchor="middle" font-size="12.5" font-weight="600" fill="#9a3412">⑥ macOS 专属（cfg 门控）</text>
+      <text x="658" y="304" text-anchor="middle" font-size="11" fill="#b45309">tray.rs · pywebio.rs · menu_model.rs</text>
+
+      <!-- 两个窗口 -->
+      <rect x="252" y="336" width="536" height="88" rx="8" fill="#ffffff" stroke="#fdba74"/>
+      <text x="520" y="356" text-anchor="middle" font-size="12.5" font-weight="600" fill="#9a3412">⑦ 两个窗口（tauri.conf.json）</text>
+      <text x="352" y="378" text-anchor="middle" font-size="11" fill="#b45309">splash（640×180，先出现）</text>
+      <text x="352" y="394" text-anchor="middle" font-size="11" fill="#b45309">加载中/错误 → data: URL 页面</text>
+      <text x="676" y="378" text-anchor="middle" font-size="11" fill="#b45309">main（1280×880，先隐藏）</text>
+      <text x="676" y="394" text-anchor="middle" font-size="11" fill="#b45309">就绪后导航到 ALAS 网页</text>
+
+      <!-- ALAS 方块（小） -->
+      <rect x="860" y="20" width="300" height="300" rx="16" fill="#eff6ff" stroke="#1d4ed8" stroke-width="2.5"/>
+      <text x="1010" y="48" text-anchor="middle" font-size="14" font-weight="700" fill="#1d4ed8">ALAS 本体（外部方块）</text>
+      <text x="1010" y="66" text-anchor="middle" font-size="10.5" fill="#3b82f6">内部解剖见《ALAS 架构图解》</text>
+      <rect x="882" y="82" width="256" height="56" rx="8" fill="#ffffff" stroke="#93c5fd"/>
+      <text x="1010" y="104" text-anchor="middle" font-size="12" font-weight="600" fill="#1e40af">python gui.py 子进程</text>
+      <text x="1010" y="122" text-anchor="middle" font-size="10.5" fill="#3b82f6">uvicorn 起 WebUI，监听 22267</text>
+      <rect x="882" y="150" width="256" height="56" rx="8" fill="#ffffff" stroke="#93c5fd"/>
+      <text x="1010" y="172" text-anchor="middle" font-size="12" font-weight="600" fill="#1e40af">WebUI（PyWebIO）</text>
+      <text x="1010" y="190" text-anchor="middle" font-size="10.5" fill="#3b82f6">网页 + 调度器按钮 + WS 协议</text>
+      <rect x="882" y="218" width="256" height="56" rx="8" fill="#ffffff" stroke="#93c5fd"/>
+      <text x="1010" y="240" text-anchor="middle" font-size="12" font-weight="600" fill="#1e40af">调度器（alas.py 任务进程）</text>
+      <text x="1010" y="258" text-anchor="middle" font-size="10.5" fill="#3b82f6">托盘检测它：按进程树识别</text>
+
+      <!-- 配置文件 -->
+      <rect x="860" y="340" width="300" height="52" rx="10" fill="#ecfdf5" stroke="#047857" stroke-width="1.5"/>
+      <text x="1010" y="362" text-anchor="middle" font-size="11.5" font-weight="600" fill="#047857">config/deploy.yaml + config/alas.json</text>
+      <text x="1010" y="380" text-anchor="middle" font-size="10.5" fill="#059669">启动器读前者（端口/语言），托盘读后者（任务）</text>
+      <rect x="860" y="404" width="300" height="36" rx="10" fill="#f5f3ff" stroke="#6d28d9" stroke-width="1.5"/>
+      <text x="1010" y="427" text-anchor="middle" font-size="11" fill="#7c3aed">进程组 + ALAS_LAUNCHER_PID 环境变量血缘标记</text>
+
+      <!-- 箭头 -->
+      <!-- 用户->启动器 -->
+      <line x1="170" y1="152" x2="226" y2="152" stroke="#475569" stroke-width="2" marker-end="url(#f1a)"/>
+      <!-- main -> backend -->
+      <line x1="508" y1="108" x2="524" y2="108" stroke="#c2410c" stroke-width="2" marker-end="url(#f1r)"/>
+      <!-- main/backend -> child_process -->
+      <line x1="380" y1="152" x2="380" y2="160" stroke="#c2410c" stroke-width="2" marker-end="url(#f1r)"/>
+      <!-- backend -> spawn gui.py -->
+      <path d="M 788 108 C 820 108, 820 110, 856 110" fill="none" stroke="#c2410c" stroke-width="2.2" marker-end="url(#f1r)"/>
+      <text x="824" y="96" text-anchor="middle" font-size="10.5" fill="#c2410c" font-weight="600">spawn 进程组</text>
+      <text x="824" y="132" text-anchor="middle" font-size="10" fill="#ea580c">python gui.py</text>
+      <text x="824" y="144" text-anchor="middle" font-size="10" fill="#ea580c">--port 22267</text>
+      <!-- setup -> ALAS 更新 -->
+      <path d="M 658 252 C 700 270, 760 290, 856 250" fill="none" stroke="#c2410c" stroke-width="1.8" stroke-dasharray="5 4" marker-end="url(#f1r)"/>
+      <text x="790" y="286" text-anchor="middle" font-size="10" fill="#ea580c">git 更新（deploy.git）</text>
+      <!-- WebView -> WebUI HTTP -->
+      <path d="M 788 380 C 830 380, 830 150, 856 150" fill="none" stroke="#1d4ed8" stroke-width="2.2" marker-end="url(#f1b)"/>
+      <text x="862" y="300" text-anchor="middle" font-size="10.5" fill="#1d4ed8" font-weight="600">HTTP 打开网页</text>
+      <text x="862" y="314" text-anchor="middle" font-size="10" fill="#3b82f6">127.0.0.1:22267/</text>
+      <!-- 托盘 WS 控制 -->
+      <path d="M 658 300 C 700 320, 760 340, 856 190" fill="none" stroke="#6d28d9" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#f1p)"/>
+      <text x="788" y="352" text-anchor="middle" font-size="10.5" fill="#6d28d9" font-weight="600">WS 伪装浏览器点按钮</text>
+      <!-- 启动器 -> deploy.yaml -->
+      <path d="M 508 294 C 560 320, 640 350, 856 366" fill="none" stroke="#047857" stroke-width="1.8" stroke-dasharray="5 4" marker-end="url(#f1g)"/>
+      <text x="650" y="376" text-anchor="middle" font-size="10" fill="#047857">读 WebuiPort</text>
+      <!-- 托盘 -> alas.json -->
+      <path d="M 788 290 C 830 310, 830 340, 856 366" fill="none" stroke="#047857" stroke-width="1.8" stroke-dasharray="5 4" marker-end="url(#f1g)"/>
+      <text x="856" y="336" text-anchor="middle" font-size="10" fill="#047857">读任务列表</text>
+    </svg>
+    <div class="fig-cap">图 1：启动器内部全景。橙色方块全部是本仓库的模块；蓝色方块是 ALAS（本报告不展开）；所有虚线是「读配置/探测」类弱耦合。</div>
+  </div>
+
+  <div class="two-col">
+    <div class="card">
+      <p style="margin-top:0"><b>模块分层原则</b></p>
+      <ul class="plain" style="font-size:13.5px">
+        <li><b>决策纯函数化</b>：<code>toggle_decision</code>、<code>poll_decision</code>、<code>scheduler_intent_after_scan</code>、<code>classify</code> 都是「输入 → 输出」的纯函数，文件 I/O 和锁全部留在调用侧——所以核心逻辑可以被大量单元测试锁死。</li>
+        <li><b>锁内部化</b>：<code>BackendLifecycle</code> 的 <code>Mutex</code> 不对外暴露，调用方永远拿不到锁，纪律（不长持锁、不在锁里做 I/O）不会泄漏出去。</li>
+        <li><b>平台门控</b>：macOS 专属模块（tray / pywebio / menu_model / shell_settings / shell_menu / alas_tasks）全部 <code>#[cfg(target_os = "macos")]</code>，Windows/Linux 构建连编译都不编译它们。</li>
+      </ul>
+    </div>
+    <div class="card">
+      <p style="margin-top:0"><b>它刻意没做的事</b></p>
+      <ul class="plain" style="font-size:13.5px">
+        <li>不包含任何游戏逻辑、认图、调度（那是 ALAS 的事）。</li>
+        <li>不注入游戏进程、不改 ALAS 代码。</li>
+        <li>不做 pip 自动更新、不重启 adb（与官方 Electron 版的行为差异，见 README）。</li>
+        <li>对 ALAS 的全部接触 = 5 类：环境变量、子进程、HTTP、JS 注入、配置文件。</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 2. 启动时序 ============ -->
+<section>
+  <h2>2. 双击启动器之后：内部 9 步时序</h2>
+  <p class="sec-intro">这是启动器「内部怎么执行」的主线。每一步都对应真实代码。</p>
+  <div class="card">
+    <ol class="steps">
+      <li class="rust"><b>进程入口 <code>main.rs</code>。</b>Windows 上先探测是否挂在父控制台（<code>AttachConsole</code> → <code>HAS_CONSOLE</code> 标记），后面所有子进程据此决定要不要 <code>CREATE_NO_WINDOW</code>（避免弹黑窗）。初始化 tracing 日志。</li>
+      <li class="dev"><b><code>setup_environment()</code> 注入环境</b>（<code>setup.rs</code>）。先定位 ALAS 根目录：可移植版（exe 旁有 <code>deploy/installer.py</code>）→ exe 目录；macOS 包 → <code>Contents/AzurLaneAutoScript</code>。然后 <code>chdir</code> 进去，把 <code>toolkit/bin</code>、<code>toolkit/libexec/git-core</code> 塞进 <code>PATH</code>（Unix 还加 <code>toolkit/lib</code> 到 <code>LD_LIBRARY_PATH</code>；Windows 是 <code>toolkit</code>、<code>toolkit/Scripts</code>、<code>toolkit/git/cmd</code>）。<b>绿色版工具链，不污染系统</b>——之后所有 <code>python</code> / <code>git</code> 命令都靠这里找得到。</li>
+      <li class="cfg"><b>读部署配置</b>：<code>deploy_config::webui_port()</code> 解析 <code>config/deploy.yaml</code>，取 <code>Deploy.Webui.WebuiPort</code>（缺省 22267，只告警一次）。这个端口是后面所有连接的「插座」。</li>
+      <li class="rust"><b>Tauri 装配（setup 闭包）</b>：注册 <code>save_as</code> 命令 + 对话框插件 + 单实例插件；按 <code>tauri.conf.json</code> 建 main 窗口（<b>先隐藏</b>）并挂 <code>on_page_load</code> 注入器；macOS 上再建托盘（含轮询线程）和「外壳设置」菜单。</li>
+      <li class="rust"><b>Ready 事件 → 后台线程接管</b>：注册 Ctrl-C 处理器；然后立即 <code>backend.begin_start()</code>——把状态机置为 <b>Initializing</b>。这一步在任何模式下都先做，保证初始化窗口期内托盘开关是禁用的，用户不可能在 <code>./config</code> 被清理的中途点出第二个后端。</li>
+      <li class="cfg"><b>读「自动启动」门闩</b>（macOS）：<code>ShellSettings.auto_start_backend</code>（默认开）；非 macOS 恒为开。决定 Ready 线程走「自动启动」还是「只准备不启动」分支。</li>
+      <li class="rust"><b>splash 窗口当进度条</b>：<code>text_to_splash()</code> 把文本包成一个自包含 HTML 再 base64 成 <code>data:</code> URL，<code>splash.navigate()</code> 即可换页——不需要静态资源服务器。然后 <code>setup_alas_repo()</code>：先跑 <code>python -c "deploy.atomic.atomic_failure_cleanup('./config')"</code> 清掉上次中断的残留（详见 §5），再跑 git 更新，进度实时刷到 splash。</li>
+      <li class="py"><b>拉起后端（<code>backend.start(port)</code>）</b>：置环境变量 <code>ALAS_LAUNCHER_PID=启动器pid</code>，<code>spawn("python", ["gui.py","--host","127.0.0.1","--port",port])</code> 放进<b>独立进程组</b>；然后每 100ms 试连 <code>127.0.0.1:端口</code>，最多 60 秒。连上后还要<b>验证端口主人是自己人</b>（§4 端口所有权探测）——防止一个陈旧服务器占了端口还假装启动成功。</li>
+      <li class="rust"><b>收尾分支</b>：成功 → 销毁 splash、main 窗口导航到 <code>http://127.0.0.1:端口/</code>、显示。失败 → splash 保留错误文本（<code>mark_stopped</code> 置回 Stopped，但不置 start_failed——这是「没启动成」不是「启动失败」），并唤醒托盘刷新。自动启动关闭时 → 更新完仓库后同样 <code>mark_stopped</code>，把 main 窗口导航到<b>本地化「已停止」页</b>（也是 data: URL），托盘开关保持可用。</li>
+    </ol>
+    <div class="callout warn"><b>两个关键时序细节：</b>① <code>begin_start()</code> 必须早于 splash 之后的一切 I/O——初始化窗口内托盘开关禁用，是「绝不双开后端」的第一道保险；② 任何 <code>mark_stopped</code> 之后都要显式唤醒托盘轮询线程，因为轮询的「差异门控」不把状态迁移当变化，不唤醒就会卡在「启动中…」的假渲染上。</div>
+  </div>
+</section>
+
+<!-- ============ 3. 后台状态机 ============ -->
+<section>
+  <h2 class="dev">3. 后台状态机：Stopped / Initializing / Running + 用户意图</h2>
+  <p class="sec-intro">启动器对 ALAS 后端的全部认知，浓缩成一个三态机（<code>BackendLifecycle</code>，backend.rs）。它把「进程管理」包装成几个带语义的动作：begin_start / start / stop / mark_stopped / mark_stopped_crashed。</p>
+
+  <div class="card figure">
+    <svg viewBox="0 0 1180 330" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, 'PingFang SC', sans-serif">
+      <defs>
+        <marker id="f2a" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+          <path d="M0,0 L10,4 L0,8 z" fill="#475569"/>
+        </marker>
+      </defs>
+      <!-- Stopped -->
+      <rect x="40" y="110" width="280" height="110" rx="14" fill="#f1f5f9" stroke="#94a3b8" stroke-width="2"/>
+      <text x="180" y="146" text-anchor="middle" font-size="14" font-weight="700" fill="#334155">Stopped（停止）</text>
+      <text x="180" y="168" text-anchor="middle" font-size="11" fill="#64748b">无后端进程</text>
+      <text x="180" y="184" text-anchor="middle" font-size="11" fill="#64748b">start_failed / crashed 区分原因</text>
+      <text x="180" y="200" text-anchor="middle" font-size="11" fill="#64748b">托盘开关：可点（启动）</text>
+      <!-- Initializing -->
+      <rect x="450" y="110" width="280" height="110" rx="14" fill="#fff7ed" stroke="#c2410c" stroke-width="2"/>
+      <text x="590" y="146" text-anchor="middle" font-size="14" font-weight="700" fill="#9a3412">Initializing（启动中）</text>
+      <text x="590" y="168" text-anchor="middle" font-size="11" fill="#b45309">begin_start() 进入，最长 60s</text>
+      <text x="590" y="184" text-anchor="middle" font-size="11" fill="#b45309">托盘开关：禁用（防双开）</text>
+      <text x="590" y="200" text-anchor="middle" font-size="11" fill="#b45309">意图 = Start，TTL 90s 计时开始</text>
+      <!-- Running -->
+      <rect x="860" y="110" width="280" height="110" rx="14" fill="#ecfdf5" stroke="#047857" stroke-width="2"/>
+      <text x="1000" y="146" text-anchor="middle" font-size="14" font-weight="700" fill="#047857">Running（运行中）</text>
+      <text x="1000" y="168" text-anchor="middle" font-size="11" fill="#059669">gui.py 活着且端口可连</text>
+      <text x="1000" y="184" text-anchor="middle" font-size="11" fill="#059669">托盘开关：按调度器状态切换</text>
+      <text x="1000" y="200" text-anchor="middle" font-size="11" fill="#059669">意图 Start 在确认调度器存活后解除</text>
+      <!-- arrows -->
+      <line x1="320" y1="165" x2="446" y2="165" stroke="#475569" stroke-width="2.2" marker-end="url(#f2a)"/>
+      <text x="383" y="150" text-anchor="middle" font-size="10.5" fill="#475569">begin_start() / start()</text>
+      <text x="383" y="163" text-anchor="middle" font-size="10" fill="#94a3b8">（Ready 线程或托盘）</text>
+      <line x1="730" y1="165" x2="856" y2="165" stroke="#047857" stroke-width="2.2" marker-end="url(#f2a)"/>
+      <text x="793" y="150" text-anchor="middle" font-size="10.5" fill="#047857">spawn 成功 + 端口就绪</text>
+      <path d="M 1000 220 C 1000 260, 590 270, 590 224" fill="none" stroke="#c2410c" stroke-width="2" marker-end="url(#f2a)"/>
+      <text x="790" y="268" text-anchor="middle" font-size="10.5" fill="#c2410c">stop() / 端口探测失败×2 → mark_stopped_crashed()</text>
+      <path d="M 590 220 C 590 250, 240 250, 180 224" fill="none" stroke="#c2410c" stroke-width="2" marker-end="url(#f2a)"/>
+      <text x="380" y="252" text-anchor="middle" font-size="10.5" fill="#c2410c">启动失败 → Stopped + start_failed=true</text>
+      <!-- intent note -->
+      <rect x="40" y="270" width="1100" height="44" rx="10" fill="#f5f3ff" stroke="#ddd6fe"/>
+      <text x="590" y="290" text-anchor="middle" font-size="11.5" fill="#6d28d9" font-weight="600">SchedulerIntent（None / Stop / Start）：记录用户最后一次调度器请求——调度器死了但用户没让它停 → 显示「异常停止」，不是「正常停止」</text>
+    </svg>
+    <div class="fig-cap">图 2：后端生命周期状态机。红色回边 = 失败/异常路径，绿色 = 正常路径。</div>
+  </div>
+
+  <div class="card">
+    <table>
+      <tr><th>动作</th><th>状态效果</th><th>关键约束</th></tr>
+      <tr>
+        <td><code>begin_start()</code></td>
+        <td>→ Initializing；清 start_failed/crashed；意图 = Start；启动 TTL 时钟；记 pending_start_epoch</td>
+        <td>必须在可能很长的 spawn <b>之前</b>调用——让菜单显示「启动中…」且并发点击成为 no-op（绝不双开后端）</td>
+      </tr>
+      <tr>
+        <td><code>start(port)</code></td>
+        <td>成功 → Running；失败 → Stopped + <code>start_failed=true</code></td>
+        <td><b>排序契约</b>：旧后端必须<b>先 terminate + drop 再 spawn</b>——因为 Drop 里的 ALAS_LAUNCHER_PID 残留清扫会杀掉任何带此标记的新进程。且全程不持锁（spawn 可等 60s，托盘轮询不能被堵）</td>
+      </tr>
+      <tr>
+        <td><code>stop()</code></td>
+        <td>→ Stopped；清所有标记；<code>epoch += 1</code>；进程在锁外终止</td>
+        <td>epoch 是<b>退出竞态</b>的解药：stop 落在 spawn 进行中时，迟到的 start 重锁后发现自己 epoch 过期，会丢弃晚产出的子进程并报 <code>STOP_INTERVENED</code>，绝不把退出路径覆盖成 Running</td>
+      </tr>
+      <tr>
+        <td><code>mark_stopped()</code></td>
+        <td>→ Stopped（不碰 start_failed）</td>
+        <td>用于「设置失败」路径——设置失败 ≠ 启动失败，托盘不显示 start-failed 文案</td>
+      </tr>
+      <tr>
+        <td><code>mark_stopped_crashed()</code></td>
+        <td>→ Stopped + <code>crashed=true</code></td>
+        <td>后端自己死了（端口探测失败）或外部被杀死 → 显示「异常停止」</td>
+      </tr>
+      <tr>
+        <td><code>set_scheduler_intent()</code> / <code>advance_intent_if_changed()</code></td>
+        <td>记录/演进用户意图</td>
+        <td>演进必须原子（一次锁内完成读-算-写，MINOR-1）；Start 意图 90 秒未获确认（调度器一直没起来）自动解除 → 恢复「异常停止」语义</td>
+      </tr>
+    </table>
+    <div class="callout key"><b>调度器存活的判定（backend.rs 固定规则）：</b>数 <code>uvicorn 进程的存活子进程数</code>——multiprocessing 的 Manager 是常驻基线（+1），调度器是第二个（+1）。<b>存活子进程数 &gt; 1 = 调度器活着</b>；僵尸进程和 resource_tracker 不计。EnableReload 开时还要先找到 uvicorn 子进程本身（它在 gui.py 监督者之下），再数它的孩子。</div>
+  </div>
+</section>
+
+<!-- ============ 4. 进程管理 ============ -->
+<section>
+  <h2 class="dev">4. 进程管理：进程组、退出注册表、端口所有权</h2>
+  <p class="sec-intro">child_process.rs + port.rs。启动器里所有子进程都走这一层——它的核心承诺是：<b>不管怎么退出，不留孤儿进程</b>。</p>
+
+  <div class="card">
+    <table>
+      <tr><th>机制</th><th>实现</th><th>防的是什么</th></tr>
+      <tr>
+        <td><b>进程组包装</b><br><code>spawn_with_group</code></td>
+        <td>基于 <code>command-group</code>：Unix 上子进程 exec 前先 <code>setpgid</code> 自成组长；Windows 上建 kill-on-close 任务对象。返回 <code>ManagedChild</code>，外面永远见不到裸 child</td>
+        <td><code>kill_group()</code> 一条信号收掉整棵树（python + 它的 git/pip 孙进程），而不是只杀组长留孤儿</td>
+      </tr>
+      <tr>
+        <td><b>超时等待</b><br><code>wait_with_timeout</code></td>
+        <td>100ms 轮询 <code>try_wait</code>，到截止时间就 <code>kill_group</code> + reap，返回 Err</td>
+        <td>卡死的子进程变成响亮失败，而不是 splash 永远转圈。git 更新上限 600s（fetch + pip 装 wheels 冷启动可能很久），只防「卡死」不防「慢」</td>
+      </tr>
+      <tr>
+        <td><b>退出注册表</b><br><code>register_for_exit</code></td>
+        <td>静态 <code>Mutex&lt;Vec&lt;pid&gt;&gt;</code>。Ready 线程 spawn 的进程先登记；<code>ExitRequested</code> 时 <code>kill_registered_groups()</code> 逐个杀；完成即注销（<code>ExitGuard</code> Drop）</td>
+        <td>用户更新进行中关窗口 → git/pip 树被整组杀掉；注销防止 pid 回收后被误杀（pid 复用安全）</td>
+      </tr>
+      <tr>
+        <td><b>杀组重试</b><br><code>kill_process_group</code></td>
+        <td>2 秒内循环：进程已消失 → 直接返回；否则 SIGKILL 组 + 组长，100ms 后返回；失败 20ms 重试</td>
+        <td>spawn 握手窗口期（exec 完成前 setpgid 还没跑）单发信号可能静默丢失——实测 macOS 上信号 t0 接受、t+50ms 才死透，所以退出清理不能赌时序运气</td>
+      </tr>
+      <tr>
+        <td><b>端口所有权探测</b><br><code>port_owner_pid</code></td>
+        <td>平台命令：macOS <code>lsof -tiTCP:port -sTCP:LISTEN</code>；Linux <code>ss -ltnp</code>；Windows <code>netstat -ano</code>。拿到监听者 pid 后与 spawn 的组长比对进程组（Unix 比 pgid；Windows 沿祖先链上溯 64 层）</td>
+        <td>端口可能被<b>上一个启动器实例的陈旧服务器</b>占着——连上不一定是自己的 gui.py 活了。不同组 → 拒绝启动（"refusing to start over a stale server"）。探测工具缺失 → <b>fail-open</b>（跳过检查但不阻塞启动，靠 Drop 残留清扫兜底）</td>
+      </tr>
+      <tr>
+        <td><b>残留清扫</b><br><code>ManagedBackend::drop</code></td>
+        <td>先杀自己的进程组；再用 sysinfo 扫全系统进程环境变量，凡带 <code>ALAS_LAUNCHER_PID=自己pid</code> 的一律 kill</td>
+        <td>任何漏网的泄漏进程（比如 gui.py 又 fork 了别的东西）都会因为「环境变量血缘标记」被兜底回收——这就是为什么排序契约要求「旧 Drop 先于新 spawn」</td>
+      </tr>
+    </table>
+  </div>
+
+  <div class="two-col">
+    <div class="card">
+      <p style="margin-top:0"><b>优雅终止序列（terminate()）</b></p>
+      <ol class="plain" style="font-size:13.5px;padding-left:20px">
+        <li>Unix：向整组发 <code>SIGTERM</code>（给 gui.py 优雅退出的机会）。</li>
+        <li>500ms 内每 100ms 轮询 <code>try_wait</code>，提前退出则直接收尾。</li>
+        <li>没退 → 告警「gui.py didn't exit, killing it...」→ <code>kill_group()</code>（SIGKILL 级）。</li>
+      </ol>
+    </div>
+    <div class="card">
+      <p style="margin-top:0"><b>Windows 特判</b></p>
+      <ul class="plain" style="font-size:13.5px">
+        <li><code>window_util.rs</code>：启动时 <code>AttachConsole(ATTACH_PARENT_PROCESS)</code> 探测是否从终端启动；没有终端 → 所有子进程加 <code>CREATE_NO_WINDOW</code>（不弹黑窗）；从终端启动 → 保留子进程输出可被看到。</li>
+        <li>Windows 上没有可查询的组 id → 端口归属用「祖先链」近似：监听者沿 parent 上溯，命中组长即自己人。</li>
+        <li>退出注册表在 Windows 上只杀组长（无 job 句柄可查），但 <code>ManagedBackend::drop</code> 的 ALAS_LAUNCHER_PID 扫描仍兜底。</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 5. 仓库更新 ============ -->
+<section>
+  <h2 class="cfg">5. 仓库更新：复用 ALAS 自己的 git 逻辑 + 进度偷看</h2>
+  <p class="sec-intro">setup.rs 的 <code>git_update</code> 是本仓库最「取巧」的一段：它不重写更新逻辑，而是<b>复用一个 Python 类，并偷看它的输出做进度条</b>。</p>
+  <div class="card">
+    <ol class="steps">
+      <li class="rust"><b>构造一段 Python 脚本</b>：<code>import deploy.git</code> → 用装饰器包一层 <code>GitManager.execute</code>，凡是包含 <code>' fetch '</code> 且没有 <code>--progress</code> 的参数，就自动替换成 <code>' fetch --progress '</code>——逼 git 输出进度。</li>
+      <li class="rust"><b>spawn + 登记</b>：<code>python -c &lt;脚本&gt;</code> 走 <code>spawn_with_group</code>（独立进程组），并 <code>register_for_exit</code> 登记进退出注册表；用 <code>ExitGuard</code> 保证结束即注销。</li>
+      <li class="rust"><b>偷看输出</b>：stdout/stderr 各起一个读线程（<code>pipe_lines</code>），按字节流切行（含奇怪的处理：把 <code>xx:xx</code> 形式的进度行切出来），经 mpsc 通道送回主循环。</li>
+      <li class="rust"><b>解析进度</b>：含 <code>=====</code> 的行 → 替换成空格显示阶段名；含 <code>objects:</code> / <code>deltas:</code> / <code>files:</code> 的行 → <code>find_percentage</code> 抠出百分比，画 50 格进度条 <code>[==== ...]</code>，实时推给 splash 的 status_updater。</li>
+      <li class="dev"><b>总时限</b>：600 秒「总」deadline（不是每行超时）——一个话多但卡死的 fetch 也会准时炸掉。超时 → <code>kill_group</code> + 报错「Repository update timed out」。</li>
+      <li class="cfg"><b>前置清理</b>：更新前先跑 <code>python -c "deploy.atomic.atomic_failure_cleanup('./config')"</code>——复用 ALAS 自己的原子写失败清理（同样进程组 + 超时包裹），清掉上次中断留下的临时文件。</li>
+    </ol>
+    <div class="callout info"><b>Linux 特判：</b><code>setup_git_ca_bundle()</code> 用 openssl-probe 找到系统证书，<code>git config --local http.sslCAInfo</code> 指过去——绿色版 git 在 Linux 上默认找不到 CA 证书会 https 失败。</div>
+  </div>
+</section>
+
+<!-- ============ 6. 配置读取 ============ -->
+<section>
+  <h2 class="cfg">6. 配置读取：deploy.yaml 的五个字段</h2>
+  <p class="sec-intro">deploy_config.rs 把原先在 main.rs / tray.rs 里手写五遍的 YAML 遍历收敛成一个类型化模块，每个字段的缺省语义都和旧行为一一对应。</p>
+  <div class="card">
+    <table>
+      <tr><th>字段</th><th>路径</th><th>缺省 / 语义</th><th>谁在用</th></tr>
+      <tr><td><code>webui_port</code></td><td><code>Deploy.Webui.WebuiPort</code></td><td>22267；非整数/浮点/字符串都回落缺省（只告警一次）</td><td>所有 URL、spawn、探测</td></tr>
+      <tr><td><code>language</code></td><td><code>Gui.Language</code></td><td><code>None</code>（空串保留为 <code>Some("")</code>，下游再做 zh-CN 回落）</td><td>托盘/菜单文案、任务显示名</td></tr>
+      <tr><td><code>enable_reload</code></td><td><code>Deploy.Update.EnableReload</code></td><td>true（ALAS 默认）</td><td>调度器存活探测的进程树形态</td></tr>
+      <tr><td><code>ws_control_available</code></td><td><code>Deploy.Webui.Password / WebuiSSLKey / WebuiSSLCert</code></td><td>三处都无<b>非空字符串</b>才算可用；null/缺失/空串都不算配了凭据</td><td>托盘开关的降级判定（配了密码/SSL → 无法用 WS 控制 → 退回进程级控制）</td></tr>
+    </table>
+    <p style="font-size:13px;color:var(--muted);margin-bottom:0">解析核心是纯函数 <code>DeployConfig::from_value(Option&lt;Value&gt;)</code>——不碰文件，所以「缺字段/空值/坏类型」的缺省矩阵可以拿手工构造的 JSON 做单元测试全覆盖。</p>
+  </div>
+</section>
+
+<!-- ============ 7. 托盘 ============ -->
+<section>
+  <h2 class="rust">7. macOS 托盘：3 秒轮询 + 差异门控 + 任务列表</h2>
+  <p class="sec-intro">tray.rs + menu_model.rs + alas_tasks.rs。这是本仓库最大的独立功能：菜单栏里直接看 ALAS 任务、一键启停调度器。</p>
+
+  <div class="card">
+    <p style="margin-top:0"><b>轮询线程的每一圈（poll_once）做了什么：</b></p>
+    <ol class="plain" style="font-size:13.5px;padding-left:20px">
+      <li><b>状态快照</b>：读 <code>BackendLifecycle</code>（锁内部化，只拿拷贝）。</li>
+      <li><b>端口复活检查</b>：状态是 Running 但端口 100ms 连不上 → 两连败才 <code>mark_stopped_crashed()</code>（一次失败可能是瞬时抖动，成功一次就清零连败计数）。</li>
+      <li><b>任务获取（仅 Running 时）</b>：<code>alas_tasks::fetch_tasks()</code> 直接读文件——<b>ALAS 网页没有 JSON API</b>（探测过 /api/tasks 等全 404，PyWebIO 是 WebSocket 服务端渲染），所以托盘是「文件读取器」：<code>config/alas.json</code>（调度数据）+ <code>module/config/i18n/&lt;语言&gt;.json</code>（显示名）。时间用 <code>date +"%F %T"</code> 取（格式与 ALAS 的 NextRun 字符串一致，字典序 == 时间序，直接字符串比较分类）。</li>
+      <li><b>调度器存活探测</b>：从后端 pid 出发做进程树扫描（§3 的 &gt;1 规则）。</li>
+      <li><b>决策 + 门控</b>：<code>poll_decision</code>（纯函数）算出任务区要渲染成 Degraded / Empty / Tasks 以及是否变化；只有「变化了」或「被显式唤醒」才真的 <code>set_menu</code> 重建——避免菜单闪烁。</li>
+    </ol>
+    <p style="font-size:13px;color:var(--muted);margin-bottom:0"><b>任务分类规则</b>（镜像 ALAS WebUI 的概览页）：启用的任务按 NextRun 升序排；<b>第一个到期 = 运行中</b>，其余到期 = 队列中，未到期 = 等待中；每组最多显示 3 条。注意这是有文档的近似——启动器没有调度器实时通道，永远把第一个到期任务当「运行中」。</p>
+  </div>
+
+  <div class="card">
+    <p style="margin-top:0"><b>开关点击（handle_toggle）的完整决策链：</b></p>
+    <ol class="plain" style="font-size:13.5px;padding-left:20px">
+      <li><b>去重</b>：<code>try_acquire_in_flight</code>（compare_exchange 抢一个 AtomicBool）。抢不到 → 忽略并告警「上一次点击还在进行中」。守卫对象随 worker 闭包移动，所有退出路径都释放。</li>
+      <li><b>降级检查</b>：<code>ws_control_available</code> 为假（配了密码/SSL）→ 告警并走进程级控制。</li>
+      <li><b>点击时刻重新扫描</b>（不用轮询缓存）：端口探测 + 调度器进程树扫描，得到此刻的真相；端口死了 → 先 <code>mark_stopped_crashed</code> 再决策。</li>
+      <li><b>查矩阵 <code>toggle_decision</code></b>：</li>
+    </ol>
+    <table>
+      <tr><th>状态</th><th>调度器存活</th><th>WS 可用</th><th>动作</th></tr>
+      <tr><td>Initializing</td><td>任意</td><td>任意</td><td><b>NoOp</b>（开关本来就禁用；60s 启动窗口内的二次点击直接无效——防双开第二道保险）</td></tr>
+      <tr><td>Stopped</td><td>任意</td><td>任意</td><td><b>StartBackend</b>（整组拉起来，再视 WS 可用性决定要不要顺带点「开始调度」）</td></tr>
+      <tr><td>Running</td><td>任意</td><td>否</td><td><b>StopBackend</b>（降级模式：进程级停止，传统语义）</td></tr>
+      <tr><td>Running</td><td>是</td><td>是</td><td><b>StopScheduler</b>（只停调度器，WebUI 保持存活）</td></tr>
+      <tr><td>Running</td><td>否</td><td>是</td><td><b>StartScheduler</b>（只启调度器）</td></tr>
+    </table>
+    <ul class="plain" style="font-size:13.5px">
+      <li><b>StartBackend</b> → <code>begin_start()</code> + <code>spawn_start_worker</code>（专用 worker 线程跑最长 60s 的 spawn——UI 线程绝不阻塞；完成/失败后唤醒轮询，把「处理中…」替换成真实状态）。</li>
+      <li><b>Stop/StartScheduler</b> → 先写意图（<code>set_scheduler_intent</code>，避免「调度器还没死透」的空窗闪出异常停止），再 <code>spawn_scheduler_click</code> 交给 §8 的 WS 通道，15 秒超时；失败只告警，轮询自愈。</li>
+      <li><b>StopBackend</b> → <code>backend.stop()</code> + 主窗口导航到「已停止」页。</li>
+    </ul>
+  </div>
+  <div class="callout warn"><b>版本漂移告警：</b>点击前 <code>warn_on_pywebio_mismatch()</code> 会读 payload 的 <code>requirements.txt</code>，若 pywebio 不是协议捕获时锁定的 <code>1.6.2</code>，打一条告警日志（WS 控制可能失效）——这是对外部依赖的「软锁」。</div>
+</section>
+
+<!-- ============ 8. PyWebIO 控制通道 ============ -->
+<section>
+  <h2 class="py">8. 伪装浏览器：PyWebIO WebSocket 控制通道</h2>
+  <p class="sec-intro">pywebio.rs。整个仓库最「黑客」的部分：为了在菜单栏启停调度器，启动器<b>假扮成一个浏览器标签页</b>，走完 PyWebIO 的握手协议，找到按钮并点下去。</p>
+  <div class="card">
+    <ol class="steps">
+      <li class="py"><b>连接</b>：<code>connect(port, deadline)</code> 建立 TCP（100ms 读超时、5s 写超时），发 <code>ws://127.0.0.1:端口/?app=index</code> 握手，并带 <code>Origin: http://127.0.0.1:端口</code> 头——模仿同源浏览器。</li>
+      <li class="py"><b>读帧</b>：服务端下发的每个 JSON 帧解析成 <code>ServerMessage { command, spec, task_id }</code>。常见命令：<code>output</code>（渲染控件）、<code>run_script</code>（要浏览器执行 JS）。</li>
+      <li class="py"><b>应答 JS</b>：<code>js_yield_reply</code> 处理 <code>run_script</code>——查 <code>visibilityState</code> 答 <code>"visible"</code>（这个客户端是一个「无头窗口」），其它一律回 <code>null</code>（对齐捕获的真实浏览器行为）。PyWebIO 的会话初始化要求这些应答，缺了服务端回调线程会崩（捕获到 <code>AttributeError: 'AlasGUI' object has no attribute 'state_switch'</code>）。</li>
+      <li class="py"><b>等页面安定</b>：<code>HOME_QUIESCE = 6s</code>——先等首页渲染完，否则点早了服务端会崩。</li>
+      <li class="py"><b>找按钮</b>：<code>locate_buttons</code> 在 <code>output</code> 帧的 spec 里按 PyWebIO 的 scope / style 标记找：菜单按钮（<code>--menu-Overview--</code> 样式）和调度器按钮（scope <code>#pywebio-scope-scheduler_btn</code> 或 label 匹配「开始/停止」）。<b>不依赖 label 文案</b>——语言漂移（比如日文「実行」）也能定位，这是刻意设计。</li>
+      <li class="py"><b>点击</b>：发 <code>{"event":"callback","task_id":&lt;按钮callback_id&gt;,"data":0}</code>——<code>data</code> 是按钮<b>索引</b>（0）不是 label，pywebio 服务端会把索引映射回按钮再调回调。</li>
+      <li class="py"><b>确认窗口</b>：<code>CONFIRM_WINDOW = 1.5s</code> 观察按钮是否重渲染（label 翻转 = 点击落地）。<b>绝不重复点击</b>——ALAS 调度器启动要 2-5 秒，翻转等不到；重发一次会双份回调、双份拉起调度器。</li>
+    </ol>
+    <div class="callout key"><b>为什么敢这么干：</b>PyWebIO 是「服务端渲染 + WebSocket 事件」的协议，客户端本质上只是「渲染指令的执行器 + 事件的转发器」——所以一个无头客户端可以完整扮演浏览器而不碰任何 ALAS 逻辑。代价是协议对版本敏感（所以有 §7 的 1.6.2 漂移告警），且整套机制被 <code>cfg(target_os = "macos")</code> 门控在 macOS。</div>
+  </div>
+</section>
+
+<!-- ============ 9. 外壳设置 ============ -->
+<section>
+  <h2 class="cfg">9. 外壳设置与语言：settings.json + 原地改菜单</h2>
+  <p class="sec-intro">shell_settings.rs + shell_menu.rs。macOS 应用菜单栏里追加的「外壳设置」子菜单：检查更新 / 自动启动后端 / 语言。</p>
+
+  <div class="card">
+    <table>
+      <tr><th>项</th><th>行为</th><th>实现要点</th></tr>
+      <tr>
+        <td><b>持久化</b></td>
+        <td><code>ShellSettings { language, auto_start_backend }</code> 存到 <code>dirs::config_dir()/alas-launcher/settings.json</code></td>
+        <td><b>刻意不放进 payload 的 <code>./config</code></b>——那个目录每次启动都会被 atomic_failure_cleanup 清掉。写入是原子写：先写同目录 <code>.tmp</code> + fsync，再 rename。读入是宽容解析：文件缺失 → 缺省；损坏 → 告警 + 缺省，绝不让菜单挂掉</td>
+      </tr>
+      <tr>
+        <td><b>语言生效规则</b></td>
+        <td><code>resolved_language</code>：显式设置 &gt; ALAS 的 deploy.yaml <code>Gui.Language</code> &gt; zh-CN</td>
+        <td>语言切换<b>只改启动器自己的 UI</b>（应用菜单、托盘、停止页）；ALAS 网页语言永远跟 deploy.yaml——两边可能不同步，<b>这是设计语义不是 bug</b>（模块文档 MINOR-6 写明）</td>
+      </tr>
+      <tr>
+        <td><b>检查更新</b></td>
+        <td>worker 线程跑只读 git 序列：<code>rev-parse --abbrev-ref HEAD</code> 取本地分支 → <code>git ls-remote origin &lt;该分支&gt;</code> 取远端头 → 对比本地 HEAD → 弹原生对话框（有更新 / 已最新 / 检查失败）</td>
+        <td>对比的是<b>同一个分支</b>（MINOR-3：绝不用 <code>ls-remote origin HEAD</code>，那会拿远端默认分支比，非默认检出时误报）。15s 超时；对话框用异步 <code>show()</code>——文档明确警告：<code>blocking_show()</code> 在 worker 线程里会死锁主线程（观察过：点「检查更新」整个 UI 卡死）</td>
+      </tr>
+      <tr>
+        <td><b>自动启动开关</b></td>
+        <td>翻转 + 持久化 <code>auto_start_backend</code>，只影响<b>下次启动</b>（Ready 线程的门闩），点击当下不动后端</td>
+        <td>原生 CheckMenuItem 用 muda 句柄原地 re-check（<code>apply_auto_start</code>）</td>
+      </tr>
+      <tr>
+        <td><b>语言切换</b></td>
+        <td>点 <code>settings-lang-*</code> → 改共享设置 + 持久化 → <b>原地</b>改已安装菜单的文字和勾选 → 唤醒托盘重建 → 重新导航停止页</td>
+        <td>tauri 2.5.1 的 <code>AppHandle</code> 没有 <code>set_menu</code>，所以菜单<b>启动时建一次</b>、持有 muda 的 Arc 原生项句柄，之后 <code>set_text/set_checked</code> 实时改 macOS 菜单栏（模块文档里的 Strategy A）</td>
+      </tr>
+    </table>
+  </div>
+</section>
+
+<!-- ============ 10. 退出与清理 ============ -->
+<section>
+  <h2 class="rust">10. 退出与清理：一条不剩</h2>
+  <p class="sec-intro">ExitRequested 是启动器执行链的最后一环，也是它「管家」身份的最高体现。</p>
+  <div class="card">
+    <table>
+      <tr><th>触发方式</th><th>路径</th></tr>
+      <tr><td>关主窗口</td><td><code>WindowEvent::CloseRequested</code> → <code>app.exit(0)</code> → 走 ExitRequested</td></tr>
+      <tr><td>托盘「退出」</td><td><code>tray-quit</code> → <code>app.exit(0)</code> → 同上</td></tr>
+      <tr><td>Ctrl-C</td><td>Ready 时注册的 <code>ctrlc::set_handler</code> → <code>exit(0)</code>（终端里跑启动器时可用）</td></tr>
+      <tr><td>二次启动</td><td>单实例插件：不建新进程，只把已有窗口 <code>set_focus</code>（不抢端口、不双后端）</td></tr>
+    </table>
+    <p style="margin-top:14px"><b>ExitRequested 内部顺序（有讲究）：</b></p>
+    <ol class="plain" style="font-size:13.5px;padding-left:20px">
+      <li>先置 <code>tray_stop=true</code>——轮询线程下一圈就退出，<b>绝不允许对已销毁的托盘调 <code>set_menu</code></b>（那是崩溃源）。</li>
+      <li><code>kill_registered_groups()</code>——杀掉更新/清理阶段登记的进程组（用户更新到一半关窗口，git/pip 树不孤儿）。</li>
+      <li><code>backend.stop()</code>——状态置 Stopped + epoch 自增（打断任何在途 spawn），进程组 SIGTERM → 500ms → SIGKILL；随后 ManagedBackend Drop 跑 ALAS_LAUNCHER_PID 全系统残留清扫。</li>
+    </ol>
+  </div>
+</section>
+
+<!-- ============ 11. 目录速查 ============ -->
+<section>
+  <h2>11. 目录速查表：找代码不迷路</h2>
+  <p class="sec-intro">本仓库全部源码都在 <code>src/</code>（约 1.5 万行），没有一个文件是凑数的。</p>
+  <div class="card">
+    <table>
+      <tr><th>文件</th><th>行数</th><th>是什么</th><th>你想找的东西</th></tr>
+      <tr><td><code>src/main.rs</code></td><td>511</td><td>入口 + 编排</td><td>Ready 线程、JS 注入、退出清理、save_as 命令</td></tr>
+      <tr><td><code>src/backend.rs</code></td><td>1062</td><td>后端生命周期状态机</td><td>三态流转、epoch 竞态、toggle_decision 矩阵、调度器存活规则</td></tr>
+      <tr><td><code>src/child_process.rs</code> + <code>port.rs</code></td><td>514</td><td>进程组管家 + 端口探测</td><td>spawn/kill/wait 语义、退出注册表、lsof/ss/netstat 解析</td></tr>
+      <tr><td><code>src/setup.rs</code></td><td>300</td><td>环境 + 仓库准备</td><td>PATH 注入、git 进度解析、atomic 清理</td></tr>
+      <tr><td><code>src/deploy_config.rs</code></td><td>252</td><td>deploy.yaml 类型化读取</td><td>端口/语言/EnableReload/WS 可用性 + 缺省矩阵测试</td></tr>
+      <tr><td><code>src/tray.rs</code></td><td>1053</td><td>macOS 托盘</td><td>3 秒轮询、两连败崩溃判定、开关决策链、in-flight 去重</td></tr>
+      <tr><td><code>src/pywebio.rs</code></td><td>1136</td><td>PyWebIO WS 客户端协议</td><td>握手、帧解析、按钮定位、callback/js_yield 编码</td></tr>
+      <tr><td><code>src/menu_model.rs</code></td><td>1398</td><td>纯菜单模型</td><td>poll_decision、分组渲染、双语 label 表（含 i18n 覆盖）</td></tr>
+      <tr><td><code>src/alas_tasks.rs</code></td><td>490</td><td>任务列表文件读取</td><td>alas.json 解析、Running/Queued/Waiting 分类</td></tr>
+      <tr><td><code>src/shell_settings.rs</code></td><td>353</td><td>外壳设置持久化</td><td>settings.json 原子写、resolved_language</td></tr>
+      <tr><td><code>src/shell_menu.rs</code></td><td>680</td><td>外壳设置菜单</td><td>检查更新 git 序列、muda 句柄原地改菜单</td></tr>
+      <tr><td><code>src/window_util.rs</code></td><td>45</td><td>Windows 无控制台窗口</td><td>CREATE_NO_WINDOW 门控</td></tr>
+      <tr><td><code>tauri.conf.json</code></td><td>—</td><td>窗口/打包配置</td><td>splash 与 main 两个窗口、withGlobalTauri</td></tr>
+    </table>
+  </div>
+</section>
+
+<!-- ============ 12. 术语表 ============ -->
+<section>
+  <h2>12. 术语表：初级开发者速查</h2>
+  <div class="card glossary">
+    <dl>
+      <dt>进程组（process group）</dt><dd>Unix 概念：一组进程共享一个组长。启动器用 command-group 保证每个子进程自成一组，kill 整组 = 杀组长 + 所有子孙。Windows 对应物是任务对象（job object）。</dd>
+      <dt>epoch</dt><dd>后端状态机里的代数计数器。每次 stop() 加一；在途的 start() 完成后发现代数变了，就知道自己已被打断，丢弃迟到的子进程。</dd>
+      <dt>SchedulerIntent（调度器意图）</dt><dd>启动器记录的用户最后一次调度器启停请求（None/Stop/Start）。用来区分「调度器自己死了」（异常停止）和「用户让它停的」（正常停止）。Start 意图 90 秒未获确认会自动解除。</dd>
+      <dt>TTL（存活时间）</dt><dd>这里指 Start 意图的 90 秒时钟：用户点了启动但调度器一直没起来，90 秒后意图过期，状态行恢复「异常停止」语义，不会永远显示「启动中」。</dd>
+      <dt>fail-open / fail-closed</dt><dd>安全策略术语。fail-open = 检查失败时放行（本仓库端口探测工具缺失时采用）；fail-closed = 检查失败时拒绝。选 fail-open 是因为探测工具缺失时拒绝启动比放行更糟。</dd>
+      <dt>two-strike（两连败）</dt><dd>端口探测连续失败两次才判定后端崩溃，防止单次瞬时失败误报。</dd>
+      <dt>PyWebIO</dt><dd>Python 的「用代码写网页交互」库。ALAS 的整个 WebUI 是它服务端渲染的；启动器的 WS 客户端复刻了它的线协议。</dd>
+      <dt>js_yield</dt><dd>PyWebIO 协议里服务端让客户端执行 JS 的机制。无头客户端必须应答（visibilityState → "visible"），否则服务端会话初始化会崩。</dd>
+      <dt>muda</dt><dd>Tauri 2 的菜单库。其菜单项句柄是 Arc 包装的原生项——这正是「菜单建一次、之后原地改文字/勾选」可行的原因。</dd>
+      <dt>data: URL</dt><dd>把整个 HTML 页面 base64 编码后塞进 URL 的协议。启动器的 splash 和停止页都是这么渲染的——不需要任何静态资源服务器。</dd>
+      <dt>resource_tracker</dt><dd>Python multiprocessing 的辅助进程。进程树扫描时它被排除，否则会被误当成调度器（基线 +1 就变 +2）。</dd>
+      <dt>差异门控（diff gate）</dt><dd>托盘轮询只在检测到变化时才重建菜单，避免每 3 秒闪一次。代价是「状态迁移不算变化」，所以任何状态迁移后都要显式唤醒轮询。</dd>
+    </dl>
+  </div>
+</section>
+
+<footer>本报告基于 alas-launcher 仓库当前源码（master 分支）逐文件梳理生成，与《alas-architecture-guide.html》互为姊妹篇：那份报告展开 ALAS 本体，这份只讲启动器仓库内部执行。图中文件名/函数名/常量名均可直接在仓库中检索验证。</footer>
+
+</div>
+</body>
+</html>
