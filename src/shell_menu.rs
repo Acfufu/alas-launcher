@@ -556,10 +556,12 @@ mod tests {
         let on = ShellSettings {
             language: None,
             auto_start_backend: true,
+            ..Default::default()
         };
         let off = ShellSettings {
             language: None,
             auto_start_backend: false,
+            ..Default::default()
         };
         assert!(should_auto_start(&on));
         assert!(!should_auto_start(&off));
@@ -597,6 +599,7 @@ mod tests {
         let settings = Arc::new(Mutex::new(ShellSettings {
             language: None,
             auto_start_backend: true,
+            ..Default::default()
         }));
         let updated = handle_auto_start_click(&settings);
         // In-memory: both the returned snapshot and the shared settings flipped.

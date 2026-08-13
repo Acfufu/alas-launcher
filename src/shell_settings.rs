@@ -39,6 +39,15 @@ pub struct ShellSettings {
     /// launch. Defaults ON — identical to today's behavior.
     #[serde(default = "default_true")]
     pub auto_start_backend: bool,
+    /// Master switch for all launcher notifications. Default ON.
+    #[serde(default = "default_true")]
+    pub notify_enabled: bool,
+    /// Notify when the ALAS scheduler dies abnormally (state 3). Default ON.
+    #[serde(default = "default_true")]
+    pub notify_scheduler_death: bool,
+    /// Notify when a task completes (NextRun bump). Default OFF (silent).
+    #[serde(default = "default_false_notify")]
+    pub notify_task_complete: bool,
 }
 
 /// Serde fallback for `auto_start_backend` when the field is missing from an
@@ -47,11 +56,18 @@ fn default_true() -> bool {
     true
 }
 
+fn default_false_notify() -> bool {
+    false
+}
+
 impl Default for ShellSettings {
     fn default() -> Self {
         Self {
             language: None,
             auto_start_backend: true,
+            notify_enabled: true,
+            notify_scheduler_death: true,
+            notify_task_complete: false,
         }
     }
 }
@@ -191,10 +207,7 @@ mod tests {
     }
 
     fn defaults() -> ShellSettings {
-        ShellSettings {
-            language: None,
-            auto_start_backend: true,
-        }
+        ShellSettings::default()
     }
 
     /// Write raw file content into the isolated test dir (creates parents).
@@ -223,6 +236,7 @@ mod tests {
         let settings = ShellSettings {
             language: Some("en-US".to_string()),
             auto_start_backend: false,
+            ..Default::default()
         };
         settings.save_to(&path).unwrap();
         assert_eq!(load_from(&path), settings);
@@ -267,6 +281,7 @@ mod tests {
         let settings = ShellSettings {
             language: Some("ja-JP".to_string()),
             auto_start_backend: true,
+            ..Default::default()
         };
         assert_eq!(settings.resolved_language(Some("en-US")), "ja-JP");
     }
@@ -296,11 +311,34 @@ mod tests {
     }
 
     #[test]
+    fn old_settings_file_without_notify_fields_defaults() {
+        let s: ShellSettings = serde_json::from_str(r#"{"language": "zh-CN", "auto_start_backend": false}"#).unwrap();
+        assert!(s.notify_enabled);
+        assert!(s.notify_scheduler_death);
+        assert!(!s.notify_task_complete);
+    }
+
+    #[test]
+    fn explicit_notify_values_roundtrip() {
+        let s = ShellSettings {
+            language: None,
+            auto_start_backend: true,
+            notify_enabled: false,
+            notify_scheduler_death: false,
+            notify_task_complete: true,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: ShellSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
     fn atomic_save_leaves_no_tmp_residue() {
         let path = temp_settings_path("atomic");
         let settings = ShellSettings {
             language: Some("en-US".to_string()),
             auto_start_backend: false,
+            ..Default::default()
         };
         settings.save_to(&path).unwrap();
         // Content is readable via the tolerant load path.
