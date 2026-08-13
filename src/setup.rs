@@ -92,7 +92,23 @@ pub fn setup_alas_repo(mut status_updater: impl FnMut(&str)) -> Result<()> {
     status_updater("Cleaning up config files");
     atomic_failure_cleanup("./config")?;
     status_updater("Updating ALAS");
-    git_update(status_updater)?;
+    git_update(&mut status_updater)?;
+    status_updater("Applying control API patch");
+    match crate::patch::apply_patch(&alas_repo_dir()) {
+        Ok(crate::patch::PatchOutcome::Applied) => {
+            status_updater("Control API patch applied");
+        }
+        Ok(crate::patch::PatchOutcome::AlreadyApplied) => {
+            status_updater("Control API patch already applied");
+        }
+        Ok(crate::patch::PatchOutcome::AnchorMismatch) => {
+            status_updater("Control API patch skipped (anchor mismatch; degraded mode)");
+        }
+        Err(e) => {
+            warn!("control API patch failed: {e:#}; continuing in degraded mode");
+            status_updater("Control API patch failed (degraded mode)");
+        }
+    }
     Ok(())
 }
 
