@@ -33,6 +33,9 @@ mod shell_settings;
 // ShellSettings + ShellMenuLabels); gated so win/linux builds stay untouched.
 #[cfg(target_os = "macos")]
 mod shell_menu;
+// Control-API patch applier (anchor-verified, idempotent, fail-closed).
+// Cross-platform — setup.rs calls it ungated, so this module is too.
+mod patch;
 mod setup;
 mod window_util;
 
