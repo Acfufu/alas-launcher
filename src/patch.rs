@@ -66,8 +66,8 @@ fn inject_fastapi(content: &str) -> Result<String> {
         1,
     );
     let with_extend = with_import.replacen(ANCHOR_RETURN, &format!("{INJECT_EXTEND}{ANCHOR_RETURN}"), 1);
-    if with_extend == content {
-        bail!("injection produced no change");
+    if with_extend == with_import {
+        bail!("extend injection produced no change");
     }
     Ok(with_extend)
 }
@@ -190,5 +190,35 @@ def asgi_app(
         assert_eq!(apply_patch(&tmp).unwrap(), PatchOutcome::AnchorMismatch);
         assert!(patch_failed());
         assert!(!webui.join("control_api.py").exists());
+    }
+
+    #[test]
+    fn apply_patch_write_failure_is_fail_closed() {
+        let tmp = std::env::temp_dir().join(format!("patch-writefail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let webui = tmp.join("module").join("webui");
+        std::fs::create_dir_all(&webui).unwrap();
+        std::fs::write(webui.join("fastapi.py"), PRISTINE).unwrap();
+        // control_api.py exists as a DIRECTORY: rename(tmp, path) fails on Unix.
+        std::fs::create_dir(webui.join("control_api.py")).unwrap();
+
+        let result = apply_patch(&tmp);
+        assert!(result.is_err());
+        assert!(patch_failed());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn apply_patch_read_failure_is_fail_closed() {
+        let tmp = std::env::temp_dir().join(format!("patch-readfail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("module").join("webui")).unwrap();
+
+        let result = apply_patch(&tmp);
+        assert!(result.is_err());
+        assert!(patch_failed());
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
