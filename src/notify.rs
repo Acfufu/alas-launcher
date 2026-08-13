@@ -70,6 +70,51 @@ pub fn should_notify(event: &NotifyEvent, settings: &ShellSettings) -> bool {
     }
 }
 
+/// Episode latch for the scheduler-death notification (round-1 F-MEDIUM fix):
+/// once either channel has fired for one death episode, both channels stay
+/// suppressed until the scheduler is seen alive again (`now_alive ==
+/// Some(true)`) or the backend stops running (crash-mark or a user stop) — a
+/// later real episode then fires anew. Returns whether a death notification
+/// is allowed THIS cycle; the cycle that observes revival/restart resets the
+/// latch but still returns false (the observing cycle never fires).
+fn death_notify_allowed(now_alive: Option<bool>, backend_running: bool, fired: &mut bool) -> bool {
+    if *fired {
+        if now_alive == Some(true) || !backend_running {
+            *fired = false;
+        }
+        return false;
+    }
+    true
+}
+
+/// Pure composition of the two scheduler-death channels with the gates and
+/// the episode latch (round-1 F-LOW: the poll_once wiring is embedded, so the
+/// decision lives here as a tested pure function).
+///
+/// `gates_ok` = backend Running + scheduler intent == None (the user Start
+/// window must never count as death); `backend_running` gates ONLY the latch
+/// reset — an intent change must not re-arm a latched episode (a Stop click
+/// on an already-dead scheduler would otherwise re-fire one cycle later).
+/// `state_died` is injected: the `api_instances` read is I/O, done at the
+/// call site, which also owns the state-baseline update.
+pub fn death_notify_decision(
+    prev_alive: Option<bool>,
+    now_alive: Option<bool>,
+    gates_ok: bool,
+    backend_running: bool,
+    state_died: bool,
+    dead_streak: &mut u8,
+    death_notified: &mut bool,
+) -> bool {
+    let allowed = death_notify_allowed(now_alive, backend_running, death_notified);
+    let liveness_died = allowed && gates_ok && liveness_death(prev_alive, now_alive, dead_streak);
+    let died = liveness_died || (allowed && state_died);
+    if died {
+        *death_notified = true;
+    }
+    died
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,5 +204,133 @@ mod tests {
         assert!(!should_notify(&NotifyEvent::TaskComplete { name: "日常".into(), command: "Daily".into(), next_time: "x".into() }, &s));
         let off = ShellSettings { notify_enabled: false, ..Default::default() };
         assert!(!should_notify(&NotifyEvent::SchedulerDeath { name: "alas".into() }, &off));
+    }
+
+    // ---- death_notify_decision (round-1 F-MEDIUM latch + F-LOW composition) --
+
+    #[test]
+    fn death_notify_decision_scheduler_child_death_fires_via_liveness() {
+        // Headline scenario (F-HIGH trace): only the scheduler CHILD dies —
+        // the uvicorn web server (the port owner) stays alive, so the backend
+        // stays Running, gates stay open, and the liveness streak completes.
+        let mut streak = 0u8;
+        let mut fired = false;
+        // cycle 1: alive → dead, streak=1, no fire yet
+        assert!(!death_notify_decision(
+            Some(true), Some(false), true, true, false, &mut streak, &mut fired
+        ));
+        assert_eq!(streak, 1);
+        assert!(!fired);
+        // cycle 2: still dead → streak=2 → fires exactly once
+        assert!(death_notify_decision(
+            Some(false), Some(false), true, true, false, &mut streak, &mut fired
+        ));
+        assert!(fired);
+        // cycle 3: still dead → latched, no duplicate
+        assert!(!death_notify_decision(
+            Some(false), Some(false), true, true, false, &mut streak, &mut fired
+        ));
+        assert!(fired, "latch stays set while the episode continues");
+    }
+
+    #[test]
+    fn death_notify_decision_state_channel_fire_suppresses_liveness_duplicate() {
+        // F-MEDIUM repro: state 1→3 fires on cycle 1 (API reachable on the
+        // still-live uvicorn port), liveness streak completes on cycle 2 —
+        // one notification for the episode, not two.
+        let mut streak = 0u8;
+        let mut fired = false;
+        assert!(death_notify_decision(
+            Some(true), Some(false), true, true, true, &mut streak, &mut fired
+        ));
+        assert!(fired);
+        assert!(!death_notify_decision(
+            Some(false), Some(false), true, true, false, &mut streak, &mut fired
+        ));
+        assert!(fired);
+    }
+
+    #[test]
+    fn death_notify_decision_whole_backend_death_never_fires() {
+        // Whole-backend death: port dies → the 2-strike crash-mark flips
+        // status to Stopped on the cycle the liveness streak would complete →
+        // gates closed → no fire (that path is the tray's 异常停止 status
+        // line, not a notification).
+        let mut streak = 0u8;
+        let mut fired = false;
+        // cycle 1: alive → dead, streak=1 (crash-mark strike 1 only)
+        assert!(!death_notify_decision(
+            Some(true), Some(false), true, true, false, &mut streak, &mut fired
+        ));
+        // cycle 2: crash-marked → backend not running, scan unknown
+        assert!(!death_notify_decision(
+            Some(false), None, false, false, false, &mut streak, &mut fired
+        ));
+        assert!(!fired);
+    }
+
+    #[test]
+    fn death_notify_decision_revival_resets_latch_and_reenables() {
+        let mut streak = 0u8;
+        let mut fired = false;
+        assert!(death_notify_decision(
+            Some(true), Some(false), true, true, true, &mut streak, &mut fired
+        ));
+        // revival: no fire this cycle, latch reset (liveness_death is skipped
+        // while latched, so the streak reset lands on the NEXT cycle)
+        assert!(!death_notify_decision(
+            Some(false), Some(true), true, true, false, &mut streak, &mut fired
+        ));
+        assert_eq!(streak, 1, "streak reset deferred while the latch suppresses");
+        assert!(!death_notify_decision(
+            Some(true), Some(true), true, true, false, &mut streak, &mut fired
+        ));
+        assert_eq!(streak, 0, "alive scan resets the streak");
+        // a new death episode fires again
+        assert!(!death_notify_decision(
+            Some(true), Some(false), true, true, false, &mut streak, &mut fired
+        ));
+        assert!(death_notify_decision(
+            Some(false), Some(false), true, true, false, &mut streak, &mut fired
+        ));
+    }
+
+    #[test]
+    fn death_notify_decision_backend_restart_resets_latch() {
+        let mut streak = 0u8;
+        let mut fired = false;
+        assert!(death_notify_decision(
+            Some(true), Some(false), true, true, true, &mut streak, &mut fired
+        ));
+        // backend stops (crash-mark / user stop) → latch reset
+        assert!(!death_notify_decision(
+            Some(false), None, false, false, false, &mut streak, &mut fired
+        ));
+        // fresh backend, scheduler never scanned alive → no fire (no baseline)
+        assert!(!death_notify_decision(
+            None, Some(false), true, true, false, &mut streak, &mut fired
+        ));
+        assert!(!fired);
+    }
+
+    #[test]
+    fn death_notify_decision_intent_change_does_not_reatm_latched_episode() {
+        // A user Stop click (intent != None → gates_ok false) while the
+        // episode is latched must NOT re-arm the notification one cycle later.
+        let mut streak = 0u8;
+        let mut fired = false;
+        assert!(death_notify_decision(
+            Some(true), Some(false), true, true, true, &mut streak, &mut fired
+        ));
+        // Stop click: gates close, backend still running → still latched
+        assert!(!death_notify_decision(
+            Some(false), Some(false), false, true, false, &mut streak, &mut fired
+        ));
+        assert!(fired, "latch survives the intent change");
+        // gates back open (intent cleared) → still suppressed
+        assert!(!death_notify_decision(
+            Some(false), Some(false), true, true, false, &mut streak, &mut fired
+        ));
+        assert!(fired);
     }
 }

@@ -75,6 +75,10 @@ struct PollNotifState {
     last_tasks: Option<Vec<Task>>,
     last_instance_state: Option<u8>,
     dead_streak: u8, // 存活翻转持久化计数（Round-2：2 次连续判死才触发）
+    // 剧集锁存（Round-1 F-MEDIUM）：同一次死亡只通知一次——state 1→3 与
+    // liveness streak=2 落在相邻两个 poll 周期时，第二个通道不再补发；
+    // 复活（now_alive == Some(true)）或后端停止运行才复位。
+    death_notified: bool,
 }
 
 /// Build the macOS menu-bar tray icon with its native menu.
@@ -737,7 +741,6 @@ fn poll_once(
     // 解除）；Stop 时调度器已死无意义。
     let gates_ok = shared.backend.status() == BackendStatus::Running
         && matches!(shared.backend.snapshot().scheduler_intent, SchedulerIntent::None);
-    let liveness_died = gates_ok && crate::notify::liveness_death(prev_alive, now_alive, &mut notif.dead_streak);
     // 附加信号：API 可用时 state 1→3（renderables 无残留污染时也权威）。仅更新基线。
     // state 通道有意不加 gates——1→3 语义无歧义（用户 Stop → 追加 Manual stop → 2，
     // 后端下线 → api 调用失败 → false），加闸反而会漏掉 Start 引导期的真实崩溃。
@@ -749,7 +752,19 @@ fn poll_once(
     } else {
         false
     };
-    if liveness_died || state_died {
+    // 纯决策（notify::death_notify_decision）：双通道 + 闸门 + 剧集锁存
+    // （Round-1 F-MEDIUM：state 1→3 与 liveness streak=2 相邻周期各自触发时
+    // 只发一次；复活或后端停止运行才复位）。
+    let died = crate::notify::death_notify_decision(
+        prev_alive,
+        now_alive,
+        gates_ok,
+        status == BackendStatus::Running,
+        state_died,
+        &mut notif.dead_streak,
+        &mut notif.death_notified,
+    );
+    if died {
         let ev = crate::notify::NotifyEvent::SchedulerDeath { name: "alas".into() };
         if crate::notify::should_notify(&ev, &settings) {
             let _ = app.notification().builder()
