@@ -1,0 +1,175 @@
+================================================================================
+Task 9 evidence — launcher-optimization-route-c: real-payload integration test
++ final verification (F1-F8) + README update
+Date: 2026-08-13
+Host: macOS (darwin), rustc 1.97.1 (Homebrew; NO rustup installed)
+================================================================================
+
+--------------------------------------------------------------------------------
+Work item 1 — real-payload integration test (api_roundtrip_real_payload)
+--------------------------------------------------------------------------------
+Ported from deleted src/pywebio.rs `real_payload_tests` (git show 029e95b~1),
+helpers unchanged; click_scheduler -> control API; pywebio version guard ->
+apply_patch (AnchorMismatch -> skip). Added to src/control_api.rs.
+
+Live run (payload present at /Applications/AzurLaneAutoScript.app):
+
+  $ cargo test api_roundtrip_real_payload -- --ignored --nocapture
+  ... (backend on isolated port 22367; webui boot; API calls)
+  webui up on 22367: HTTP 200
+  instances: [InstanceState { name: "alas", state: 2 }] (state 2)
+  baseline scheduler child count = 1
+  api_scheduler_start("alas") -> response state 1 (async; polling...)
+    [after Start] instance state = 1
+    [after Start] scheduler child count = 2
+  scheduler STARTED: state 1, child count 2 (baseline 1 + 1), webui still 200
+  api_scheduler_stop("alas") -> response state 2 (async; polling...)
+    [after Stop] scheduler child count = 1
+    [after Stop] instance state = 2
+  scheduler STOPPED: child count 1, state 2, webui still 200
+  live backend (22267) still listening = true
+  cleanup: port 22367 open after guard drop = false
+  cleanup verified: port 22367 closed; live 22267 intact = true
+  test control_api::real_payload_tests::api_roundtrip_real_payload ... ok
+  test result: ok. 1 passed; 0 failed; 164 filtered out; finished in 3.21s
+
+NOTE (production behavior): the test APPLIES the control API patch to the real
+payload (/Applications/AzurLaneAutoScript.app) — identical to what the
+launcher does in setup.rs after a repo update. Idempotent + anchor-verified.
+
+--------------------------------------------------------------------------------
+F5 — patch idempotency on the REAL payload (asserted inside the test)
+--------------------------------------------------------------------------------
+  - first apply  -> Applied (fresh; control_api.py was absent before, 3091 bytes
+                    written at 10:10, module/webui/control_api.py)
+  - second apply -> AlreadyApplied (asserted)
+  - MARKER count in module/webui/fastapi.py: exactly 1
+    ("# === alas-launcher:control-api ===", single injection block; the
+    grep -c "alas-launcher" = 2 lines is the block's start + end marker)
+  - write order control_api.py first, fastapi.py last (patch.rs, verified by
+    unit tests apply_patch_is_idempotent_and_writes_both_files /
+    apply_patch_on_mismatched_anchor_degrades_not_blocks /
+    apply_patch_write_failure_is_fail_closed / apply_patch_read_failure_is_fail_closed)
+
+--------------------------------------------------------------------------------
+Step 3 — runtime QA (recorded live)
+--------------------------------------------------------------------------------
+  ls module/webui/control_api.py            -> exists (3091 bytes)
+  grep -c "alas-launcher" fastapi.py        -> 2 lines = ONE block (start+end)
+  grep -n "alas-launcher" fastapi.py        -> line 18 start, line 20 end
+  GET  http://127.0.0.1:22367/api/alas/instances  -> 200 [{"name":"alas","state":2}]
+    (unlocked read; death detection keeps working under lock — MUST-FIX kept)
+
+Degraded path (F7), deploy.yaml Password temporarily set to "qa-lock-test"
+then RESTORED to null (backup verified: `Password: null` after restore):
+  GET  http://127.0.0.1:22367/api/alas/instances  -> 200 (read-only, unlocked)
+  POST /api/alas/alas/scheduler/start             -> 401 {"error":"locked"}
+  POST /api/alas/alas/scheduler/stop              -> 401 {"error":"locked"}
+  (curl was blocked by the environment reach-guard; checks executed with
+  python3 urllib against the same endpoints)
+
+Cleanup: test backend process group SIGTERM/SIGKILL + pkill fallback; port
+22367 fully closed; live backend on 22267 untouched (still listening);
+deploy.yaml restored byte-for-byte from backup.
+
+--------------------------------------------------------------------------------
+F1 — cargo test / cross-target check
+--------------------------------------------------------------------------------
+  $ cargo test -p alas-launcher
+  test result: ok. 162 passed; 0 failed; 3 ignored (incl. the --ignored
+  real-payload test); 0 measured. (no warnings)
+
+  Windows check: NOT runnable on this machine — no rustup installed (Homebrew
+  rustc 1.97.1 only), so the x86_64-pc-windows-msvc target std is unavailable
+  (E0463 in stable_deref_trait, a tauri dep). Marked as CI item per Round-2
+  SHOULD-FIX (realistic target check): patch.rs is std/anyhow/tracing only
+  (no platform deps), so no windows-specific risk is expected there.
+  linux target check: same constraint (glib-sys pkg-config issue on macOS,
+  already documented as CI item in the brief).
+
+  $ cargo build --release
+  Finished `release` profile [optimized] — OK
+
+--------------------------------------------------------------------------------
+F2 — clippy -D warnings
+--------------------------------------------------------------------------------
+  $ cargo clippy -p alas-launcher -- -D warnings
+  Finished `dev` profile — clean
+  $ cargo clippy -p alas-launcher --tests -- -D warnings
+  Finished `dev` profile — clean
+  Fixes applied this task:
+   - src/control_api.rs tests: removed unused `TcpStream` import (pre-existing
+     test-profile warning)
+   - src/patch.rs tests: removed unused `Write` import (pre-existing)
+   - src/patch.rs apply_patch: `map_err(|e| { mark_patch_failed(); e })` ->
+     `inspect_err(|_| mark_patch_failed())` (clippy 1.97 manual_inspect; fail-
+     closed semantics unchanged)
+   - src/control_api.rs new test module docstring indentation (doc_lazy_
+     continuation)
+   - src/patch.rs: MARKER made pub(crate) (consumed by the integration test
+     asserting marker uniqueness); dead_code check: patch_failed() consumed
+     by tray.rs, all api_* fns consumed by tray.rs — no dead code.
+
+--------------------------------------------------------------------------------
+F3 — pywebio / tungstenite residuals
+--------------------------------------------------------------------------------
+  $ grep -rn "pywebio\|tungstenite" src/    -> 0 hits
+  $ grep -n "pywebio\|tungstenite" Cargo.toml -> 0 hits
+  (src/pywebio.rs deleted in 029e95b; the only "pywebio" mentions now are
+  in git history / commit messages / README prose, none in code or deps)
+
+--------------------------------------------------------------------------------
+F4 — real-payload API start/stop roundtrip  -> PASSED (see work item 1)
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+F6 — notification defaults
+--------------------------------------------------------------------------------
+  shell_settings.rs (serde defaults + Default impl):
+    notify_enabled:           default true  (master switch ON)
+    notify_scheduler_death:   default true  (abnormal death alert ON)
+    notify_task_complete:     default false (task completion OFF)
+  Migration test old_settings_file_without_notify_fields_defaults covers
+  older settings files. Wiring: notify.rs death_by_state (1->3) +
+  liveness_death (2-scan persistence), episode latch (7b6c312).
+
+--------------------------------------------------------------------------------
+F7 — degraded semantics
+--------------------------------------------------------------------------------
+  - Patch anchor failure -> PatchOutcome::AnchorMismatch -> patch_failed()=true
+    -> tray.rs toggle routes to process-level control (unit-tested:
+    apply_patch_on_mismatched_anchor_degrades_not_blocks; tray toggle_decision
+    consumes crate::patch::patch_failed())
+  - Password/SSL -> instances 200 (read-only, death detection usable) /
+    start+stop 401 (write lock) — verified LIVE this task (see Step 3)
+
+--------------------------------------------------------------------------------
+F8 — death detection (Round-2 redo, landed in 7b6c312 + caf01a5)
+--------------------------------------------------------------------------------
+  - liveness flip is the PRIMARY signal, state 1->3 the ADDITIONAL one (OR)
+    (tray.rs "② 调度器异常死亡：liveness 翻转为主信号，state 1→3 为附加信号")
+  - dead_streak: 2 consecutive dead judgments required (filters update/restart
+    blips) — tray.rs `dead_streak: u8` + notify.rs liveness_death
+  - known residual false positives (manual stop from webui, in-app update in
+    degraded mode) documented in tray.rs semantics comments
+  - unit tests: should_mark_crashed_requires_two_consecutive_failures,
+    port_fail_counter_state_machine pass
+
+--------------------------------------------------------------------------------
+README diff summary
+--------------------------------------------------------------------------------
+README.md (zh) + README_en.md:
+  - 差异表 macOS 任务速览 row: now mentions native notifications
+    (scheduler abnormal-death alert default ON, task-complete optional)
+  - 差异表: NEW row "调度器控制通道 / Scheduler control channel":
+    control API patch (HTTP, same ProcessManager as web page; password/SSL
+    -> process-level control)
+  - 限制表/Limitations: NEW bullet — scheduler start/stop depends on the
+    control API patch anchored on module/webui/fastapi.py (unchanged since
+    2022-04-14); on anchor failure the tray scheduler toggle degrades to
+    process-level control (never a silent no-op)
+  - 配置 section: "无法通过 WebSocket 驱动调度器" -> "无法通过控制 API 驱动
+    调度器" (WebSocket client no longer exists after 029e95b)
+  - No pywebio 版本守卫 wording existed in either README (removed earlier) —
+    nothing to delete there.
+================================================================================

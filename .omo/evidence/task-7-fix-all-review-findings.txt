@@ -1,0 +1,111 @@
+Task 7 — child_process deep module + MAJOR-3/5 wiring (plan todo 7)
+====================================================================
+Date:      2026-08-12
+Commit:    (see git log — single commit "feat(process): managed child process module with timeout and port ownership")
+Files:
+  - src/child_process.rs        (new, lifecycle: ManagedChild / spawn_with_group /
+                                 kill_group / wait_with_timeout / exit registry)
+  - src/child_process/port.rs   (new, port-ownership probes: port_owner_pid +
+                                 per-platform parsers + is_same_process_group)
+  - src/setup.rs                (git_update + atomic_failure_cleanup wired)
+  - src/backend.rs              (ManagedBackend via module + MAJOR-3 port check)
+  - src/main.rs                 (mod child_process; + ExitRequested kill_registered_groups)
+
+Interface (as planned; two justified additions marked *)
+  spawn_with_group(cmd: &mut Command) -> Result<ManagedChild>        (* returns Result —
+    spawn can fail; all three call sites already use `?` today)
+  wait_with_timeout(child, timeout) -> Result<ExitStatus>            (kill group on timeout)
+  kill_group(child) -> io::Result<()>
+  register_for_exit(child) / unregister_for_exit(pid) / kill_registered_groups()
+    (* unregister + kill_registered_groups added: registry would otherwise hold dead
+    pids until exit, letting a recycled pid be killed on exit)
+  ManagedChild: id / try_wait / wait / take_stdout / take_stderr / signal_group(unix)
+  port_owner_pid(port) -> Option<u32>   + parse_lsof_owner / parse_ss_owner /
+    parse_netstat_owner (pure) + is_same_process_group
+  GIT_UPDATE_TIMEOUT: Duration = 600s
+
+RED -> GREEN trace
+  RED:   tests-only child_process.rs (9 tests) + `mod child_process;` in main.rs.
+         `cargo test child_process` -> E0425 "cannot find type ManagedChild /
+         function spawn_with_group / parse_lsof_owner ..." (interface missing).
+  GREEN: full module implementation; 9/9 pass. Two iteration fixes:
+         (1) nix kill returns Errno, not io::Error -> .map_err(io::Error::from).
+         (2) exit_registry test failed: SIGKILL sent within µs of spawn is
+             delayed/lost inside the posix_spawn/vfork handshake (child-side
+             setpgid in std's process_group(0) runs after the parent's spawn()
+             returns; measured on macOS: kills accepted at t0, process still
+             alive, dead by t+50ms, reaped by t+250ms). Fix: kill_process_group
+             retries (dual kill: group + leader) until accepted, then settles
+             100ms for delivery; bails early when kill(pid,0) says ESRCH.
+             Verified stable across 5 consecutive runs.
+  Full `cargo test`: 154 passed, 3 ignored. `cargo check` 0 warnings.
+  `cargo clippy --all-targets -- -D warnings` exit 0.
+
+GIT_UPDATE_TIMEOUT = 600s justification
+  The update script runs gm.git_install() = ALAS-history fetch + pip wheel
+  install. On a cold cache / slow link that exceeds 300s; the timeout only
+  converts a wedged child into a loud Err instead of a splash hang, so a
+  generous ceiling costs nothing (Momus ADVISORY-2). The git_update wait is a
+  TOTAL deadline (recv_timeout with remaining = deadline - now), not per-line:
+  a chatty but wedged fetch still fires.
+
+Fail-open justification (port_owner_pid)
+  Tool missing/unparseable -> None -> that start SKIPS the ownership check.
+  Acceptable because: the existing ALAS_LAUNCHER_PID residue scan in
+  ManagedBackend::Drop still reaps same-launcher stale processes; only a
+  server left by ANOTHER launcher instance slips through on that rare path;
+  lsof is near-universal on macOS (primary target). Fail-closed would break
+  startup on machines without the tool — worse than the hole it plugs. One
+  warn! per failed probe.
+
+Wiring summary
+  (a) setup.rs git_update: python -c spawn now goes through
+      child_process::spawn_with_group (one group layer, replaces inline
+      .create_no_window() chain); register_for_exit immediately; ExitGuard
+      unregisters on every return path (pid-reuse safety); stdout/stderr
+      reader threads unchanged via ManagedChild::take_stdout/stderr; receive
+      loop switched to deadline-based recv_timeout (run_git_capture pattern)
+      with the existing "=====" / objects: progress parsing preserved
+      verbatim; on Timeout: only kill the group when try_wait proves the
+      child still runs (readers may be draining buffered output), then Err.
+  (b) setup.rs atomic_failure_cleanup: same spawn path + wait_with_timeout
+      with GIT_UPDATE_TIMEOUT; exit status still unchecked (spawn/timeout
+      errors propagate, non-zero exit ignored — behavior preserved).
+  (c) backend.rs ManagedBackend::new: spawn via module; after connect
+      success + existing try_wait survival check, NEW MAJOR-3 check —
+      port_owner_pid(port) must be our spawned pid or a member of its
+      process group (is_same_process_group: getpgid equality on Unix,
+      ancestor-chain walk via sysinfo on Windows); mismatch -> Err
+      "Port N is occupied by pid M ..." instead of misjudging Running.
+      None -> fail-open, ALAS_LAUNCHER_PID scan still backstops.
+      ManagedBackend now holds Option<ManagedChild>; terminate()/Drop use
+      signal_group(SIGTERM) + kill_group; from_child test seam wraps
+      GroupChild -> ManagedChild (existing backend tests untouched).
+  main.rs ExitRequested: crate::child_process::kill_registered_groups()
+      before backend.stop().
+  shell_menu.rs run_git_capture: untouched (out of scope, per plan).
+
+Deviations (justified)
+  1. spawn_with_group returns Result (plan wrote `-> ManagedChild`).
+  2. Registry: unregister_for_exit + kill_registered_groups added to the
+     planned register_for_exit (pid-recycle safety; ExitRequested hook).
+  3. Port-ownership split into src/child_process/port.rs (250-LOC ceiling:
+     combined file was 353 pure LOC; lifecycle 218 + port 143, both clean).
+  4. kill_process_group retries briefly + settles 100ms (measured macOS
+     spawn-handshake signal race — see RED->GREEN trace).
+  5. Windows exit-kill kills the registered leader via sysinfo (no queryable
+     job handle from a pid); launcher exiting anyway; backend children
+     covered by the ALAS_LAUNCHER_PID Drop scan. Documented in module.
+  6. Linux/Windows cfg paths compile-checked only on macOS (no cross
+     targets installed); APIs used (nix getpgid/kill, sysinfo process/
+     parent/kill, command_group) are platform-stable across the crate set.
+  7. Tray uvicorn count tests are timing-sensitive (3s poll, kill -9 race,
+     pre-existing design); observed 2 flaky failures in one parallel run out
+     of 7 full runs, pass in isolation and in 5 consecutive full runs. My
+     tests spawn only sleep/sh (no python), counted per parent-pid, so they
+     cannot be counted by tray's scan; residual flake is pre-existing load
+     sensitivity, not a logic regression.
+
+No runtime QA performed (todo 10 owns it): app not launched, no real git
+update, no live port-occupancy run. Zero new dependencies (command_group
+already in Cargo.toml; lsof/ss/netstat are system tools, not crates).

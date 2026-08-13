@@ -4,12 +4,16 @@ use std::env::set_current_dir;
 use std::fs;
 use std::io::{BufReader, Read};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, Sender};
+use std::process::Command;
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
+use std::time::Instant;
 use tracing::{info, warn};
 
-use crate::window_util::CreateNoWindow as _;
+use crate::child_process::{
+    kill_group, register_for_exit, spawn_with_group, unregister_for_exit, wait_with_timeout,
+    GIT_UPDATE_TIMEOUT,
+};
 
 fn alas_repo_dir() -> PathBuf {
     // Always check if this is a typical same-folder portable distribution
@@ -88,7 +92,23 @@ pub fn setup_alas_repo(mut status_updater: impl FnMut(&str)) -> Result<()> {
     status_updater("Cleaning up config files");
     atomic_failure_cleanup("./config")?;
     status_updater("Updating ALAS");
-    git_update(status_updater)?;
+    git_update(&mut status_updater)?;
+    status_updater("Applying control API patch");
+    match crate::patch::apply_patch(&alas_repo_dir()) {
+        Ok(crate::patch::PatchOutcome::Applied) => {
+            status_updater("Control API patch applied");
+        }
+        Ok(crate::patch::PatchOutcome::AlreadyApplied) => {
+            status_updater("Control API patch already applied");
+        }
+        Ok(crate::patch::PatchOutcome::AnchorMismatch) => {
+            status_updater("Control API patch skipped (anchor mismatch; degraded mode)");
+        }
+        Err(e) => {
+            warn!("control API patch failed: {e:#}; continuing in degraded mode");
+            status_updater("Control API patch failed (degraded mode)");
+        }
+    }
     Ok(())
 }
 
@@ -153,24 +173,39 @@ gm = deploy.git.GitManager()
 gm.execute = decorate_execute(gm.execute)
 gm.git_install()
 "#;
-    // Spawn the child with piped stdout/stderr so we can tee them.
-    let mut child = Command::new("python")
-        .args(["-c", script])
-        .create_no_window()
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    // Spawn the child with piped stdout/stderr so we can tee them. The
+    // child_process module wraps it in its own process group (job object on
+    // Windows), so a timeout or app exit can kill the whole tree — python
+    // plus its git/pip grandchildren — instead of leaving orphans.
+    let mut cmd = Command::new("python");
+    cmd.args(["-c", script])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = spawn_with_group(&mut cmd)?;
+    // Register with the exit registry: if the user closes the window mid-
+    // update, ExitRequested group-kills this child.
+    register_for_exit(&child);
+
+    // Unregister once the update is done — a recycled pid must never be
+    // killed on a later exit.
+    struct ExitGuard(u32);
+    impl Drop for ExitGuard {
+        fn drop(&mut self) {
+            unregister_for_exit(self.0);
+        }
+    }
+    let _guard = ExitGuard(child.id());
 
     // Channels to receive lines from reader threads. (is_err, line)
     let (tx, rx) = mpsc::channel::<(bool, String)>();
 
     // Spawn a reader thread for stdout
-    if let Some(stdout) = child.stdout.take() {
+    if let Some(stdout) = child.take_stdout() {
         pipe_lines(stdout, tx.clone(), false);
     }
 
     // Spawn a reader thread for stderr
-    if let Some(stderr) = child.stderr.take() {
+    if let Some(stderr) = child.take_stderr() {
         pipe_lines(stderr, tx.clone(), true);
     }
 
@@ -179,25 +214,51 @@ gm.git_install()
 
     let mut last_err = "".to_owned();
 
+    // Deadline-based recv_timeout (the run_git_capture pattern): the timeout
+    // is TOTAL, not per line — a chatty but wedged fetch still fires.
+    let deadline = Instant::now() + GIT_UPDATE_TIMEOUT;
+
     // Receive lines and tee them to stdout/stderr and the status_updater callback.
-    while let Ok((is_err, line)) = rx.recv() {
-        if line.contains("=====") {
-            let sanitized = line.replace("=", " ").trim().to_owned();
-            status_updater(&format!("Updating ALAS: {sanitized}"));
-        } else if line.contains("objects:") || line.contains("deltas:") || line.contains("files:") {
-            let sanitized = line.trim().to_owned();
-            let mut n = 0usize;
-            if let Some(precentage) = find_percentage(&sanitized) {
-                n = (precentage / 2) as usize;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok((is_err, line)) => {
+                if line.contains("=====") {
+                    let sanitized = line.replace("=", " ").trim().to_owned();
+                    status_updater(&format!("Updating ALAS: {sanitized}"));
+                } else if line.contains("objects:")
+                    || line.contains("deltas:")
+                    || line.contains("files:")
+                {
+                    let sanitized = line.trim().to_owned();
+                    let mut n = 0usize;
+                    if let Some(precentage) = find_percentage(&sanitized) {
+                        n = (precentage / 2) as usize;
+                    }
+                    let bar = "=".repeat(n) + &" ".repeat(50 - n);
+                    status_updater(&format!("Updating ALAS: {sanitized}\n[{bar}]"));
+                }
+                if is_err {
+                    warn!("{line}");
+                    last_err = line;
+                } else {
+                    info!("{line}");
+                }
             }
-            let bar = "=".repeat(n) + &" ".repeat(50 - n);
-            status_updater(&format!("Updating ALAS: {sanitized}\n[{bar}]"));
-        }
-        if is_err {
-            warn!("{line}");
-            last_err = line;
-        } else {
-            info!("{line}");
+            Err(RecvTimeoutError::Timeout) => {
+                // Silent past the deadline. The child may have just exited
+                // (readers still draining buffered output): only kill the
+                // group when it is genuinely still running.
+                if child.try_wait()?.is_some() {
+                    break;
+                }
+                let _ = kill_group(&mut child);
+                let _ = child.wait();
+                return Err(anyhow!(
+                    "Repository update timed out after {GIT_UPDATE_TIMEOUT:?}"
+                ));
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
         }
     }
 
@@ -213,14 +274,17 @@ gm.git_install()
 }
 
 fn atomic_failure_cleanup(path: &str) -> Result<()> {
-    let _ = Command::new("python")
-        .args([
-            "-c",
-            "import sys; from deploy.atomic import atomic_failure_cleanup; atomic_failure_cleanup(sys.argv[1])",
-            path,
-        ])
-        .create_no_window()
-        .status()?;
+    let mut cmd = Command::new("python");
+    cmd.args([
+        "-c",
+        "import sys; from deploy.atomic import atomic_failure_cleanup; atomic_failure_cleanup(sys.argv[1])",
+        path,
+    ]);
+    // Same group + timeout treatment as git_update: a wedged cleanup script
+    // must fail the setup loudly, not hang the splash forever. The exit
+    // status stays unchecked — as before, only spawn/timeout errors fail.
+    let mut child = spawn_with_group(&mut cmd)?;
+    let _ = wait_with_timeout(&mut child, GIT_UPDATE_TIMEOUT)?;
     Ok(())
 }
 

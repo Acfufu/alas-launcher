@@ -1,13 +1,54 @@
-// No default console window createion on Windows
+// No default console window creation on Windows
 #![windows_subsystem = "windows"]
 
+// Consumed only by the macOS tray (tray.rs); gated so win/linux builds do not
+// compile an unused module (clippy -D warnings).
+#[cfg(target_os = "macos")]
+mod alas_tasks;
 mod backend;
+// Typed reads of config/deploy.yaml (WebuiPort / Gui.Language /
+// EnableReload / ws credentials). Cross-platform — setup.rs
+// `get_deploy_config` is ungated, so this module is too.
+mod deploy_config;
+// Managed child processes: process-group spawn, timeout-wait, exit registry,
+// port-ownership probes. Cross-platform — setup.rs git_update (ungated) is
+// its primary consumer.
+mod child_process;
+// Pure tray menu model (no tauri). Gated to macOS only because its sole
+// macOS-bound dependency, alas_tasks (above), is gated too — a plain
+// declaration would break win/linux builds.
+#[cfg(target_os = "macos")]
+mod menu_model;
+#[cfg(target_os = "macos")]
+mod tray;
+// Pure shell-settings persistence (no tauri); macOS-only until the settings
+// menu (shell_menu.rs) lands — win/linux builds must not compile it.
+#[cfg(target_os = "macos")]
+mod shell_settings;
+// macOS app menu bar shell-settings submenu (builds the 外壳设置 menu from
+// ShellSettings + ShellMenuLabels); gated so win/linux builds stay untouched.
+#[cfg(target_os = "macos")]
+mod shell_menu;
+// Dependency-free HTTP client for the ALAS control API; macOS-only because
+// its sole consumer is the tray.
+#[cfg(target_os = "macos")]
+mod control_api;
+// Control-API patch applier (anchor-verified, idempotent, fail-closed).
+// Cross-platform — setup.rs calls it ungated, so this module is too.
+mod patch;
+// Pure notification event detection (no tauri); macOS-only until the tray
+// wires it up — win/linux builds must not compile it.
+#[cfg(target_os = "macos")]
+mod notify;
 mod setup;
 mod window_util;
 
 use std::{
     fs,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     thread::{self},
 };
 
@@ -21,8 +62,8 @@ use tauri_plugin_dialog::{DialogExt, FilePath};
 use tracing::{error, info, warn};
 
 use crate::{
-    backend::ManagedBackend,
-    setup::{get_deploy_config, setup_alas_repo, setup_environment},
+    backend::BackendLifecycle,
+    setup::{setup_alas_repo, setup_environment},
 };
 
 fn main() -> Result<()> {
@@ -36,29 +77,53 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     setup_environment()?;
 
-    let port = get_deploy_config()
-        .as_ref()
-        .and_then(|config| config.get("Deploy"))
-        .and_then(|deploy| deploy.get("Webui"))
-        .and_then(|webui| webui.get("WebuiPort"))
-        .and_then(|port| port.as_u64());
-    if port.is_none() {
-        warn!("WebuiPort not found in config, using default port 22267");
-    }
-    let port = port.unwrap_or(22267) as u16;
+    let port = crate::deploy_config::webui_port();
 
-    let backend = Arc::new(Mutex::new(None));
+    let backend = Arc::new(BackendLifecycle::default());
+    let setup_backend = backend.clone();
+    // Stop flag for the tray poll thread; set in ExitRequested so the thread
+    // never calls set_menu on a disposed tray (Metis MAJOR-4).
+    let tray_stop = Arc::new(AtomicBool::new(false));
+    let setup_tray_stop = tray_stop.clone();
+
+    // Shared shell settings (macOS app menu). Created in main() scope — the
+    // setup closure (menu build + events) and the run closure (todo 6
+    // auto-start Ready thread) are separate move closures, so each gets its
+    // own clone; a local created inside setup would be invisible to the run
+    // callback (plan MAJOR-1).
+    #[cfg(target_os = "macos")]
+    let shell_settings = Arc::new(std::sync::Mutex::new(crate::shell_settings::load()));
+    #[cfg(target_os = "macos")]
+    let setup_shell_settings = shell_settings.clone();
+    #[cfg(target_os = "macos")]
+    let run_shell_settings = shell_settings.clone();
+
+    // Tray poll-wake channel slot: build_tray creates the sender inside the
+    // setup closure, but todo 6's auto-start-off branch (Ready thread, run
+    // closure) needs it to wake the poll after mark_stopped — the poll's diff
+    // gate ignores backend-status transitions, so without the wake the tray
+    // stays frozen on the Initializing render with a DISABLED toggle and the
+    // plan's "tray can still start the backend" requirement breaks. The slot
+    // is filled in setup, read in the run closure (MAJOR-1 pattern).
+    #[cfg(target_os = "macos")]
+    let tray_refresh_slot: Arc<std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    #[cfg(target_os = "macos")]
+    let setup_tray_refresh_slot = tray_refresh_slot.clone();
+    #[cfg(target_os = "macos")]
+    let run_tray_refresh_slot = tray_refresh_slot.clone();
 
     info!("Starting Webview...");
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![save_as])
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             let _ = app
                 .get_webview_window("main")
                 .and_then(|w| w.set_focus().ok());
         }))
-        .setup(|app| {
+        .setup(move |app| {
             tauri::WebviewWindowBuilder::from_config(
                 app,
                 app.config()
@@ -70,6 +135,176 @@ fn main() -> Result<()> {
             )?
             .on_page_load(page_load_injector)
             .build()?;
+            #[cfg(target_os = "macos")]
+            let tray_refresh: Option<std::sync::mpsc::Sender<()>> =
+                match crate::tray::build_tray(
+                    app,
+                    setup_backend.clone(),
+                    port,
+                    setup_tray_stop.clone(),
+                    setup_shell_settings.clone(),
+                ) {
+                    // build_tray returns the poll-thread refresh channel (todo
+                    // 4 wake mechanism): the language handler below sends on
+                    // it to force a tray rebuild in the new language.
+                    Ok((_tray, refresh)) => Some(refresh),
+                    Err(e) => {
+                        warn!("tray failed: {e}");
+                        None
+                    }
+                };
+            #[cfg(target_os = "macos")]
+            if let Some(refresh) = &tray_refresh {
+                *setup_tray_refresh_slot.lock().unwrap() = Some(refresh.clone());
+            }
+            #[cfg(target_os = "macos")]
+            {
+                // App menu bar: build the 外壳设置 menu from the shared
+                // settings + localized labels, install it, and KEEP the item
+                // handles — a live language switch relabels the installed
+                // native items in place (locked tauri 2.5.1 exposes no
+                // AppHandle::set_menu; see shell_menu.rs module doc for the
+                // full design rationale). warn-and-continue — a menu failure
+                // must never abort startup (mirrors the build_tray call site).
+                let labels = crate::menu_model::shell_menu_labels(
+                    &setup_shell_settings
+                        .lock()
+                        .unwrap()
+                        .resolved_language(crate::deploy_config::language().as_deref()),
+                );
+                let menu_handles: Option<crate::shell_menu::SettingsMenuHandles> =
+                    match crate::shell_menu::build_settings_menu(
+                        app.handle(),
+                        &setup_shell_settings,
+                        &labels,
+                    ) {
+                        Ok(handles) => {
+                            if let Err(e) = app.set_menu(handles.menu()) {
+                                warn!("settings menu failed: {e}");
+                            }
+                            Some(handles)
+                        }
+                        Err(e) => {
+                            warn!("settings menu failed: {e}");
+                            None
+                        }
+                    };
+                // App-level menu events (settings-* ids). Independent from the
+                // tray's own on_menu_event (tray-* ids, tray.rs:119).
+                // settings-lang-* is the todo-4 LIVE language switch: main.rs
+                // owns the deploy language (deploy_config module), the backend,
+                // the port and the tray refresh sender, so it orchestrates
+                // here and shell_menu.rs stays menu-build + label-computation
+                // only.
+                let menu_shell_settings = setup_shell_settings.clone();
+                let menu_backend = setup_backend.clone();
+                app.on_menu_event(move |app, event| match event.id().as_ref() {
+                    "settings-check-update" => {
+                        // Labels are computed at CLICK time so the dialog shows
+                        // in the CURRENT language, not the startup one.
+                        let labels = crate::menu_model::shell_menu_labels(
+                            &menu_shell_settings
+                                .lock()
+                                .unwrap()
+                                .resolved_language(crate::deploy_config::language().as_deref()),
+                        );
+                        crate::shell_menu::spawn_check_update(app, &menu_shell_settings, labels);
+                    }
+                    "settings-auto-start" => {
+                        // Flip + persist the shared setting (warn on save
+                        // failure; the in-memory value wins this session),
+                        // then re-check the installed CheckMenuItem in place
+                        // (muda Arc-backed native item, live update). NO
+                        // backend action at click time — the toggle only
+                        // affects the NEXT launch (the Ready-thread gate).
+                        let updated =
+                            crate::shell_menu::handle_auto_start_click(&menu_shell_settings);
+                        if let Some(handles) = &menu_handles {
+                            if let Err(e) = handles.apply_auto_start(&updated) {
+                                warn!("settings menu auto-start re-check failed: {e}");
+                            }
+                        }
+                    }
+                    "settings-notify-master" => {
+                        // Flip + persist the master notification switch, then
+                        // re-check the installed CheckMenuItems in place via
+                        // apply_labels (labels computed at click time so the
+                        // menu stays in the CURRENT language — mirrors the
+                        // settings-check-update arm).
+                        let updated =
+                            crate::shell_menu::handle_notify_master_click(&menu_shell_settings);
+                        let labels = crate::menu_model::shell_menu_labels(
+                            &updated
+                                .resolved_language(crate::deploy_config::language().as_deref()),
+                        );
+                        if let Some(handles) = &menu_handles {
+                            if let Err(e) = handles.apply_labels(&labels, &updated) {
+                                warn!("settings menu notify re-check failed: {e}");
+                            }
+                        }
+                    }
+                    "settings-notify-death" => {
+                        let updated =
+                            crate::shell_menu::handle_notify_death_click(&menu_shell_settings);
+                        let labels = crate::menu_model::shell_menu_labels(
+                            &updated
+                                .resolved_language(crate::deploy_config::language().as_deref()),
+                        );
+                        if let Some(handles) = &menu_handles {
+                            if let Err(e) = handles.apply_labels(&labels, &updated) {
+                                warn!("settings menu notify re-check failed: {e}");
+                            }
+                        }
+                    }
+                    "settings-notify-task" => {
+                        let updated =
+                            crate::shell_menu::handle_notify_task_click(&menu_shell_settings);
+                        let labels = crate::menu_model::shell_menu_labels(
+                            &updated
+                                .resolved_language(crate::deploy_config::language().as_deref()),
+                        );
+                        if let Some(handles) = &menu_handles {
+                            if let Err(e) = handles.apply_labels(&labels, &updated) {
+                                warn!("settings menu notify re-check failed: {e}");
+                            }
+                        }
+                    }
+                    id if id.starts_with("settings-lang-") => {
+                        // (a) Apply the click: mutate the shared language +
+                        // persist (in-memory wins on save failure), returns
+                        // the updated settings for label computation.
+                        let updated =
+                            crate::shell_menu::handle_language_click(&menu_shell_settings, id);
+                        // (b) Relabel + re-check the INSTALLED app menu in
+                        // place (muda handles update the macOS bar live).
+                        let labels = crate::menu_model::shell_menu_labels(
+                            &updated.resolved_language(crate::deploy_config::language().as_deref()),
+                        );
+                        if let Some(handles) = &menu_handles {
+                            if let Err(e) = handles.apply_labels(&labels, &updated) {
+                                warn!("settings menu relabel failed: {e}");
+                            }
+                        }
+                        // (c) Wake the tray poll thread — a woken poll ALWAYS
+                        // rebuilds (force_rebuild path, tray.rs), so the tray
+                        // menu re-renders in the new language even when the
+                        // task section is unchanged.
+                        if let Some(refresh) = &tray_refresh {
+                            let _ = refresh.send(());
+                        }
+                        // (d) The stopped-page copy is baked into its data:
+                        // URL at build time — re-navigate it when the backend
+                        // is not Running (the webui URL is language-free).
+                        crate::tray::refresh_stopped_page(
+                            app,
+                            &menu_backend,
+                            &menu_shell_settings,
+                            port,
+                        );
+                    }
+                    _ => {}
+                });
+            }
             Ok(())
         })
         .build(tauri::generate_context!())?
@@ -83,7 +318,32 @@ fn main() -> Result<()> {
                     }).expect("Error setting Ctrl-C handler");
                     let app_handle = app_handle.clone();
                     let backend = backend.clone();
+                    // todo 6: auto-start backend gate — the Ready-thread
+                    // branch reads this shared settings clone (MAJOR-1: the
+                    // setup closure's clone is invisible here; the run
+                    // callback is FnMut so we clone, not move).
+                    #[cfg(target_os = "macos")]
+                    let shell_settings = run_shell_settings.clone();
+                    #[cfg(target_os = "macos")]
+                    let tray_refresh_slot = run_tray_refresh_slot.clone();
                     thread::spawn(move || {
+                        // MAJOR-2 code-review invariant (plan todo 6, must-not
+                        // #4): begin_start runs BEFORE the setup window in
+                        // EVERY mode (auto-start on or off). BackendLifecycle
+                        // goes Initializing → the tray toggle is disabled
+                        // while setup_alas_repo wipes/rebuilds ./config, so a
+                        // user click in that window can never spawn gui.py
+                        // under a config dir mid-cleanup. Skipping begin_start
+                        // would leave the lifecycle at default Stopped with an
+                        // ENABLED toggle — the exact hazard the plan names.
+                        backend.begin_start();
+                        // Brief settings lock: read the launch gate, release
+                        // before any I/O (setup_alas_repo below).
+                        #[cfg(target_os = "macos")]
+                        let auto_start =
+                            crate::shell_menu::should_auto_start(&shell_settings.lock().unwrap());
+                        #[cfg(not(target_os = "macos"))]
+                        let auto_start = true;
                         let splash = app_handle.get_webview_window("splash").unwrap();
                         let status_updater = |text: &str| {
                             let content = format!("Loading ALAS, please wait..\n\n{}", text);
@@ -92,32 +352,112 @@ fn main() -> Result<()> {
                         };
                         status_updater("Initialize ALAS");
                         if let Err(e) = setup_alas_repo(&status_updater) {
+                            // MINOR-2: this error path is IDENTICAL for both
+                            // auto-start modes — the splash keeps the error
+                            // text (destroying it here would hide the failure
+                            // reason), plain mark_stopped only.
                             error!("{e}");
                             let content = format!("Failed loading ALAS, reason: {}\n\nPlease run alas-launcher from terminal for detailed logs", e);
                             let url = Url::parse(&text_to_splash(&content)).unwrap();
                             splash.navigate(url).unwrap();
+                            // Init failure must not leave the state machine stuck in
+                            // Initializing (toggle disabled forever): mark plain
+                            // Stopped. This is a setup failure, not a
+                            // backend-start failure — start_failed stays false.
+                            backend.mark_stopped();
+                            // MAJOR-1 code-review assertion: the timed poll's
+                            // three gates (task diff / section change / status
+                            // transition) all stay false after a failed setup —
+                            // backend-status transitions alone never re-fire the
+                            // rebuild — so without this wake the tray would stay
+                            // stuck on 启动中…/Initializing with a disabled toggle
+                            // until a manual Refresh.
+                            #[cfg(target_os = "macos")]
+                            {
+                                if let Some(sender) = tray_refresh_slot.lock().unwrap().as_ref() {
+                                    let _ = sender.send(());
+                                }
+                            }
                             return;
                         }
-                        info!("Starting gui.py on http://127.0.0.1:{}/", port);
-                        status_updater("Starting GUI");
-                        let b = ManagedBackend::new(port).unwrap();
-                        *backend.lock().unwrap() = Some(b);
-                        splash.destroy().unwrap();
-                        info!("Webview is ready");
-                        let window = app_handle.get_webview_window("main").unwrap();
-                        window
-                            .navigate(Url::parse(&format!("http://127.0.0.1:{}/", port)).unwrap())
-                            .unwrap();
-                        window.show().unwrap();
+                        if auto_start {
+                            info!("Starting gui.py on {}", crate::backend::webui_url(port));
+                            status_updater("Starting GUI");
+                            if let Err(e) = backend.start(port) {
+                                // Same as today: the splash stays on the "Starting GUI"
+                                // page, main window stays hidden. The module set
+                                // Stopped + start_failed so the tray shows the
+                                // localized start-failed label.
+                                error!("Failed to start backend: {e}");
+                                // MAJOR-1 code-review assertion: same failure
+                                // hazard as the setup path above — the timed
+                                // poll's three gates all stay false after a
+                                // failed start, so without this wake the tray
+                                // stays stuck on 启动中…/Initializing until a
+                                // manual Refresh.
+                                #[cfg(target_os = "macos")]
+                                {
+                                    if let Some(sender) =
+                                        tray_refresh_slot.lock().unwrap().as_ref()
+                                    {
+                                        let _ = sender.send(());
+                                    }
+                                }
+                            } else {
+                                splash.destroy().unwrap();
+                                info!("Webview is ready");
+                                let window = app_handle.get_webview_window("main").unwrap();
+                                window
+                                    .navigate(Url::parse(&crate::backend::webui_url(port)).unwrap())
+                                    .unwrap();
+                                window.show().unwrap();
+                            }
+                        }
+                        #[cfg(target_os = "macos")]
+                        if !auto_start {
+                            // auto-start OFF: the repo is updated, but the
+                            // backend must NOT spawn. End in usable plain
+                            // Stopped (start_failed untouched — no start was
+                            // attempted), navigate the main window to the
+                            // localized stopped page (labels resolved from the
+                            // shared settings via tray::refresh_stopped_page —
+                            // load_control_labels is tray-private, so the
+                            // pub(crate) helper is the intended call), show it,
+                            // and leave the tray toggle ready for manual start.
+                            backend.mark_stopped();
+                            // Wake the tray poll so it re-renders the enabled
+                            // Stopped toggle: its diff gate ignores backend-
+                            // status transitions (a timed poll rebuilds once
+                            // during Initializing and then never re-fires for
+                            // Stopped), so without this wake the tray would
+                            // stay frozen on 启动中… with a disabled toggle and
+                            // the plan's manual-start-from-tray requirement
+                            // would be unreachable.
+                            if let Some(sender) = tray_refresh_slot.lock().unwrap().as_ref() {
+                                let _ = sender.send(());
+                            }
+                            splash.destroy().unwrap();
+                            crate::tray::refresh_stopped_page(
+                                &app_handle,
+                                &backend,
+                                &shell_settings,
+                                port,
+                            );
+                            let window = app_handle.get_webview_window("main").unwrap();
+                            window.show().unwrap();
+                        }
                     });
                 }
                 tauri::RunEvent::ExitRequested { .. } => {
                     info!("Webview closed, shutting down backend...");
-                    if let Some(ref mut b) = *backend.lock().unwrap() {
-                        if let Err(e) = b.terminate() {
-                            warn!("Failed to terminate backend process: {:?}", e);
-                        }
-                    }
+                    // Stop the tray poll thread BEFORE terminating the backend:
+                    // it must never set_menu on a disposed tray (Metis MAJOR-4).
+                    tray_stop.store(true, Ordering::Relaxed);
+                    // Group-kill any subprocess the Ready thread registered
+                    // (e.g. the git update spawned during setup) — closing the
+                    // window mid-update must not orphan its git/pip tree.
+                    crate::child_process::kill_registered_groups();
+                    backend.stop();
                 }
                 tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::CloseRequested { .. }, .. } => {
                     info!("Window {} closed", label);
@@ -128,7 +468,6 @@ fn main() -> Result<()> {
         });
     Ok(())
 }
-
 #[tauri::command]
 fn save_as(app_handle: tauri::AppHandle, filename: &str, data: &str) {
     match BASE64_STANDARD.decode(data) {
@@ -176,7 +515,6 @@ if (!window.alas_launcher_injected) {
             const reader = new FileReader();
             reader.onload = async () => {
                 const data = reader.result.split(',')[1];
-                console.log(data);
                 window.__TAURI__.core.invoke('save_as', { filename, data });
             };
             reader.readAsDataURL(blob);

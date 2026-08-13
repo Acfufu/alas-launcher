@@ -20,7 +20,13 @@ tracing-subscriber = "0.3"
 command-group = "5.0.1"
 base64 = "0.22.1"
 tauri-plugin-dialog = "2"
-sysinfo = { version = "0.36.1", default-features = false, features = ["system"]}
+# Pinned to the 2.2.x release train (same era as tauri-plugin-dialog 2.2.1 in
+# the lock): the project deliberately locks tauri at 2.5.1 (see shell_menu.rs
+# module doc), and tauri-plugin-notification 2.3+ drags tauri-runtime to 2.11,
+# which breaks tauri-runtime-wry 2.10.1 (E0046/E0277) — a partially-incoherent
+# resolution. 2.2.1 stays on the locked 2.5.1 stack.
+tauri-plugin-notification = "=2.2.1"
+sysinfo = { version = "0.36.1", default-features = false, features = ["system"] }
 ctrlc = "3.5.0"
 
 [target.'cfg(unix)'.dependencies]
@@ -34,6 +40,9 @@ tauri-plugin-single-instance = "2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 openssl-probe = "0.1.6"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 
 [profile.release]
 strip = true

@@ -1,98 +1,160 @@
 **| English | [简体中文](README.md) |**
 
-# ALAS Launcher
+# ALAS Launcher — a native cross-platform launcher for AzurLaneAutoScript
 
-A new type of [AzurLaneAutoScript](https://github.com/LmeSzinc/AzurLaneAutoScript) launcher: **native on every platform** — on Apple Silicon there is no emulation, no Docker, just unzip and play.
+A Tauri 2 (Rust) desktop launcher that starts [AzurLaneAutoScript](https://github.com/LmeSzinc/AzurLaneAutoScript) (ALAS) natively on Windows, macOS, and Linux — no translation layer, no Docker. It prepares the runtime environment, updates the ALAS repository, and opens the local Web UI for you.
 
-<p align="center">
-  <img src="assets/readme/hero-en.gif" alt="ALAS Launcher: native on Windows, macOS Apple Silicon and Linux, built with Rust and Tauri 2" width="900">
-</p>
+## Interface
 
-> Static fallback: `assets/readme/hero-en.svg` (use if the GIF does not render)
-
-## Quick Start
-
-Grab the archive for your system and CPU from **Releases** on the right, extract it, and run the launcher.
-
-| Platform | How to run | Notes |
-| --- | --- | --- |
-| Windows | Open `alas-launcher.exe` | Windows 7 / 8 / 10 require [WebView2](https://developer.microsoft.com/en-us/microsoft-edge/webview2) |
-| macOS | Open `AzurLaneAutoScript.app` | Unsigned: if it errors, run `xattr -dr com.apple.quarantine AzurLaneAutoScript.app` first |
-| Linux | Run `alas-launcher` | Requires `libwebkit2gtk-4.1` and a recent `glibc` (CI runs on Ubuntu 22.04) |
-
-**Success check**: the launcher loads and opens the ALAS WebUI (`http://127.0.0.1:22267`). Seeing the familiar ALAS main screen means you are ready.
-
-## Screenshots
-
-<p align="center">
-<table><tr>
-<td><img src="screenshots/mac-en.webp" alt="ALAS scheduler UI running on macOS (English)" width="640px"></td>
-<td><img src="screenshots/win-en.webp" alt="ALAS scheduler UI running on Windows (English)" width="580px"></td>
-</tr></table>
-</p>
-
-## Launch Flow
-
-<p align="center">
-  <img src="assets/readme/workflow-en.gif" alt="Launch flow: download Release → launcher → update repo → toolkit ready → WebUI ready" width="900">
-</p>
-
-The launcher only does what startup needs: update the repo, prepare the portable environment, and open the WebUI. Launching it again only refocuses the existing window — it never kills a running process.
-
-## Differences from the Original
-
-<p align="center">
-  <img src="assets/readme/compare-en.svg" alt="Comparison: the original launcher updates the repo, kills processes, updates pip and Electron, restarts adb; this launcher only updates the repo and opens the WebUI" width="900">
-</p>
-
-1. **Cross-platform**: Windows / macOS (Apple Silicon) / Linux, all native.
-2. The original launcher kills existing processes, updates pip, updates Electron resources, and restarts adb on startup; this launcher **only updates the repo**, and a second launch just refocuses the window.
-3. Python package versions differ slightly from upstream, but it runs fine. Automatic pip updates are disabled (if upstream adds a requirements file, pip updates can be implemented).
-4. Restarting and replacing adb is tricky — **not implemented**.
-5. The directory structure is slightly adjusted (see below).
-
-## Directory Layout
-
-<p align="center">
-  <img src="assets/readme/structure-en.svg" alt="Directory layout: AzurLaneAutoScript root containing the alas-launcher and the portable toolkit" width="900">
-</p>
-
-| Component | Location |
+| macOS | Windows |
 | --- | --- |
-| ALAS root | Windows/Linux: `AzurLaneAutoScript` · macOS: `AzurLaneAutoScript.app/Contents/AzurLaneAutoScript` |
-| ALAS launcher | Windows: `alas-launcher.exe` · macOS: `.../Contents/MacOS/alas-launcher` · Linux: `alas-launcher` |
-| Python | All systems: `toolkit` (venv-like structure) |
-| Git | Unix: installed into `toolkit` · Windows: MinGit extracted to `toolkit/git` |
-| Adb | Unix: `toolkit/bin/adb` · Windows: `toolkit/adb.exe` |
+| ![ALAS Launcher desktop Web UI on macOS, showing the ALAS home task panel](screenshots/mac-en.webp) | ![ALAS Launcher desktop Web UI on Windows, showing the ALAS home task panel](screenshots/win-en.webp) |
 
-Environment variables added by the launcher:
+### Menu-bar overview (macOS)
 
-- **Unix**: `toolkit/bin` · `toolkit/libexec/git-core` · `toolkit/lib` (`LD_LIBRARY_PATH`)
-- **Windows**: `toolkit` · `toolkit/Scripts` · `toolkit/git/cmd`
+On macOS there is a menu-bar icon: inspect the ALAS task list and start or stop the scheduler without opening a window.
 
-## Why This Repo Exists
+![ALAS menu-bar animation: clicking the ship icon in the menu bar opens a native menu showing the scheduler status and a start/stop toggle (the Web UI stays alive); then the Web UI scheduler shows real ALAS tasks grouped by Running / Queued / Waiting, with the next scheduled time, plus the main window](assets/readme/tray.gif)
 
-Since getting a Mac Mini, I've been too lazy to press the power button on my PC. But it feels wrong not running ALAS...
+- **Live task list**: consistent with the Web UI scheduler — real ALAS tasks read from `config/alas.json`, grouped by `Running / Queued / Waiting`, with the next scheduled time; up to 3 per group to keep the menu compact, auto-refreshed every 3 seconds (manual refresh too).
+- **One-click scheduler toggle**: the menu toggle controls the ALAS scheduler, not the backend process — stopping the scheduler keeps the Web UI alive; if the backend is not running, the toggle starts it first.
+- **macOS only**: the menu-bar icon is currently enabled only on macOS; Windows / Linux builds are unaffected.
 
-This [blog post](https://www.binss.me/blog/run-azurlaneautoscript-on-arm64/) by binss was very inspiring, but its methods rely on a translation layer or Docker containers. As a native purist, I don't want to run user applications inside a shell, nor do I want to mess up my system environment — so why not run ALAS natively on macOS, on Apple Silicon?
+If the animation does not play, see the [static screenshot](screenshots/mac-en.webp).
 
-## Tech Stack
+## What it does
 
-<p align="center">
-  <img src="assets/readme/tech-en.svg" alt="Tech stack: Rust + Tauri 2, uv portable Python, self-built MXNet 1.9.1, manual releases" width="900">
-</p>
+The launcher automates the whole chain — prepare the environment, update the repository, launch the Web UI:
 
-What went into the build:
+![ALAS launcher workflow: launcher → environment setup (PATH/LD_LIBRARY_PATH) → read WebuiPort from config/deploy.yaml (default 22267) → clean config and update the ALAS Git repository → start gui.py → Tauri WebView navigates to the local Web UI; a failed update keeps showing the error on the splash screen, and closing the window terminates the backend](assets/readme/workflow.svg)
 
-1. **Compiled MXNet**: PyPI versions don't work, so I had to compile it myself (MXNet's CMake is... challenging, and patches were needed) — a backward-compatible build for all platforms. See [swordfeng/mxnet-build](https://github.com/swordfeng/mxnet-build).
-2. Used `uv` to download portable Python, so it runs anywhere.
-3. Lots of packages can't compile on arm64 Mac, so many Python package versions were updated. See `requirements.in`.
-4. Following binss's blog, chose MXNet 1.9.1 with a newer NumPy; that NumPy dropped `np.bool`, so MXNet got a monkey-patch to add it back.
-5. cnocr only accepts mxnet `[1.5.0, 1.7.0)`, so the version was adjusted when packaging.
-6. Used Tauri for the shell (the original GUI's Electron could work on Mac, but it looked messy — gave up after brief research).
-7. Packaging scripts were originally on GitHub Actions; CI has since been removed and releases are now built and published manually.
-8. Deduplicated files: `*-nix` symlinks were packed as copies, so they were deduped with hardlinks. Didn't bother shrinking size further.
+1. **Initialize**: prepares the runtime environment (PATH, LD_LIBRARY_PATH, etc.) and reads the Web UI port from `config/deploy.yaml`.
+2. **Update**: cleans the ALAS config directory and pulls the latest ALAS repository.
+3. **Launch**: starts `gui.py` on the local port (`gui.py --host 127.0.0.1 --port <configured port>`).
+4. **Ready**: the Tauri WebView opens the local Web UI, showing `Ready · 127.0.0.1:<port>`.
 
-## License
+If the repository update fails, the splash screen keeps showing the error; quitting the launcher terminates the backend process. adb replacement, pip auto-update, and remote access are not part of the launcher's responsibility.
 
-Since ALAS is GPLv3, this project is **GPLv3** too. Most dependencies use Apache2, BSD3, etc. — check upstream repos for details.
+## Differences from the official launcher
+
+| Capability | Official launcher | This launcher |
+| --- | --- | --- |
+| Platforms | Single platform | The same codebase natively supports Windows, macOS, and Linux |
+| macOS task overview | None | Menu-bar task list + native notifications (scheduler abnormal-death alert on by default, task-complete optional) |
+| Scheduler control channel | Web page button | Control API patch (HTTP, same ProcessManager as the web page; degrades to process-level control with password/SSL) |
+| Startup behavior | Kills existing processes, updates pip, updates Electron resources, restarts adb | Only updates the repository — no other side effects |
+| Repeated launch | Opens a new window | Single instance: refocuses the existing window |
+| pip auto-update | Yes | Disabled (Python package versions differ slightly from the official version; does not affect usage) |
+| adb restart / replacement | Yes | Not implemented |
+
+The directory layout is also adjusted — see [Directory structure and environment variables](#directory-structure-and-environment-variables).
+
+## Quick start
+
+Download the archive for your system and CPU architecture from the [Releases page](https://github.com/Acfufu/alas-launcher/releases), extract it, and launch it as described below.
+
+> [!IMPORTANT]
+> The current remote Release (`v0.1.0`) is a manually built draft; it is not yet declared a stable public installer. Verify it yourself before use.
+
+| Platform | Launch | Notes |
+| --- | --- | --- |
+| Windows | Run `alas-launcher.exe` | Windows 7 / 8 / 10 require [WebView2](https://developer.microsoft.com/microsoft-edge/webview2) first |
+| macOS | Open `AzurLaneAutoScript.app` | Unsigned; if Gatekeeper blocks it, run the command below |
+| Linux | Run `alas-launcher` | Requires `libwebkit2gtk-4.1` and a recent `glibc` (CI uses Ubuntu 22.04); without them the launcher may not run, but ALAS itself is usually unaffected |
+
+If Gatekeeper blocks the app on first launch on macOS:
+
+```bash
+xattr -dr com.apple.quarantine AzurLaneAutoScript.app   # remove the quarantine attribute
+```
+
+**Success signal**: once ready, the launcher automatically opens the local Web UI showing `Ready · 127.0.0.1:22267`.
+
+## Configuration
+
+The Web UI listens on port `22267` by default. The launcher reads `config/deploy.yaml` on startup; change the port via `Deploy.Webui.WebuiPort` in that file.
+
+- **Language**: switching the language only affects the launcher UI (menu bar, tray, stop page); the ALAS web pages always follow `Gui.Language` in `config/deploy.yaml`, and the two may differ (by design).
+- **Password / SSL**: after configuring `Deploy.Webui.Password` / `WebuiSSLKey` / `WebuiSSLCert`, the menu-bar scheduler toggle degrades to process-level control (the scheduler can no longer be driven through the control API), and the tray status line appends a "password/SSL configured, process-level control only" hint.
+
+## Building and releasing
+
+> For maintainers. End users do not need to build anything — download from [Releases](https://github.com/Acfufu/alas-launcher/releases) instead.
+
+<details>
+<summary>Build the macOS launcher shell</summary>
+
+Dependencies: [Rust](https://rustup.rs) (stable), Node.js (provides npx), Xcode Command Line Tools.
+
+```bash
+npx --yes @tauri-apps/cli@2 build --bundles app         # build the macOS app shell
+```
+
+The artifact is at `target/release/bundle/macos/AzurLaneAutoScript.app`.
+
+**Assemble the full payload.** The artifact above is only the launcher shell — it does not contain ALAS itself. A fully usable build needs the payload (Python toolkit / git / adb / ALAS repository) inside `Contents/AzurLaneAutoScript`. You can copy it from an existing installation:
+
+```bash
+APP=target/release/bundle/macos/AzurLaneAutoScript.app
+cp -R /Applications/AzurLaneAutoScript.app/Contents/AzurLaneAutoScript "$APP/Contents/"   # copy ALAS from an existing installation
+```
+
+Put complete artifacts in the `release/` directory (gitignored, to avoid accidental commits):
+
+```bash
+cp -R target/release/bundle/macos/AzurLaneAutoScript.app release/   # complete artifacts live here (gitignored)
+```
+
+![ALAS payload cross-platform directory layout: Windows has AzurLaneAutoScript/alas-launcher.exe and a toolkit (with git and adb.exe); macOS has AzurLaneAutoScript.app/Contents/AzurLaneAutoScript and Contents/MacOS/alas-launcher; Linux has AzurLaneAutoScript/alas-launcher and a toolkit; the bottom compares the Unix and Windows PATH/LD_LIBRARY_PATH differences](assets/readme/payload.svg)
+
+**Release.** Releasing is a manual process: build the complete `.app` locally (with payload), put it in `release/`, then publish. The version number must match the `version` in `tauri.conf.json`:
+
+```bash
+git tag v0.1.0            # version must match the version in tauri.conf.json
+git push origin v0.1.0
+gh release create v0.1.0 release/AzurLaneAutoScript.app --title "v0.1.0" --notes "..."
+```
+
+</details>
+
+## Directory structure and environment variables
+
+Paths below are relative to the ALAS root; `toolkit` is the Python environment directory (a venv-like layout):
+
+| Component | Windows | macOS | Linux |
+| --- | --- | --- | --- |
+| ALAS root | `AzurLaneAutoScript` | `AzurLaneAutoScript.app/Contents/AzurLaneAutoScript` | `AzurLaneAutoScript` |
+| Launcher | `AzurLaneAutoScript/alas-launcher.exe` | `AzurLaneAutoScript.app/Contents/MacOS/alas-launcher` | `AzurLaneAutoScript/alas-launcher` |
+| Python | `toolkit` | `toolkit` | `toolkit` |
+| Git | MinGit extracted into `toolkit/git` | Unix layout packed into `toolkit` | Unix layout packed into `toolkit` |
+| Adb | `toolkit/adb.exe` | `toolkit/bin/adb` | `toolkit/bin/adb` |
+
+The launcher adds the following environment variables:
+
+- **Unix**: `toolkit/bin`, `toolkit/libexec/git-core`, and `toolkit/lib` (`LD_LIBRARY_PATH`).
+- **Windows**: `toolkit`, `toolkit/Scripts`, `toolkit/git/cmd`.
+
+## Limitations, troubleshooting, and license
+
+### Limitations
+
+- The launcher shell does not include the ALAS payload; it must be assembled manually (see [Building and releasing](#building-and-releasing)).
+- The macOS app is unsigned; the first launch requires manually clearing quarantine.
+- The menu-bar overview (task list / scheduler toggle) is only enabled on macOS.
+- Scheduler start/stop relies on the control API patch to ALAS (anchored on `module/webui/fastapi.py`, unchanged since 2022-04-14); if the anchor fails, the menu-bar scheduler toggle degrades to process-level control (never a silent no-op).
+- Linux requires `libwebkit2gtk-4.1` and a recent `glibc`.
+- adb restart/replacement is not implemented; pip auto-update is disabled.
+- The remote Release is a draft and has not been declared a stable public installer.
+
+### Troubleshooting
+
+| Symptom | Fix |
+| --- | --- |
+| macOS says the app is damaged or cannot be opened | Run `xattr -dr com.apple.quarantine AzurLaneAutoScript.app` |
+| The Linux launcher does not start, but ALAS itself runs | Install `libwebkit2gtk-4.1`, or upgrade the system `glibc` |
+| The port is occupied, or you want to change it | Change `Deploy.Webui.WebuiPort` in `config/deploy.yaml` (default `22267`) |
+| The menu-bar task list is empty or shows "Tasks: unavailable" | Make sure the ALAS backend is running (the menu can start it in one click); task data comes directly from `config/alas.json` |
+
+### License
+
+Because ALAS is GPLv3, this launcher is also GPLv3. Most dependencies are under permissive licenses such as Apache-2.0 and BSD-3-Clause; see each upstream repository for details.
