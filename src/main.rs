@@ -33,6 +33,10 @@ mod shell_settings;
 // ShellSettings + ShellMenuLabels); gated so win/linux builds stay untouched.
 #[cfg(target_os = "macos")]
 mod shell_menu;
+// Dependency-free HTTP client for the ALAS control API; macOS-only because
+// its sole consumer is the tray.
+#[cfg(target_os = "macos")]
+mod control_api;
 // Control-API patch applier (anchor-verified, idempotent, fail-closed).
 // Cross-platform — setup.rs calls it ungated, so this module is too.
 mod patch;
