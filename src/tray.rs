@@ -24,6 +24,7 @@ use tauri::{
     tray::TrayIconBuilder,
     AppHandle, Manager, Url,
 };
+use tauri_plugin_notification::NotificationExt;
 use tracing::{info, warn};
 
 use crate::{
@@ -62,6 +63,18 @@ struct TrayShared {
     refresh: mpsc::Sender<()>,
     in_flight: Arc<AtomicBool>,
     port_fail_count: Arc<AtomicU8>,
+}
+
+/// Poll-thread-only notification baseline state (NOT shared across threads).
+/// TrayShared is Arc/Mutex shared, so a notification baseline stored there
+/// would be polluted by concurrent writers — this state is created inside the
+/// poll-thread closure and passed to poll_once as `&mut` (task cache diff,
+/// scheduler-instance-state baseline, and the death persistence streak).
+#[derive(Default)]
+struct PollNotifState {
+    last_tasks: Option<Vec<Task>>,
+    last_instance_state: Option<u8>,
+    dead_streak: u8, // 存活翻转持久化计数（Round-2：2 次连续判死才触发）
 }
 
 /// Build the macOS menu-bar tray icon with its native menu.
@@ -164,36 +177,39 @@ pub fn build_tray(
         // Last rendered scheduler-liveness (None = unknown / backend not
         // running); a flip forces a status-line rebuild even when the task
         // section is unchanged (manual webui stop/start must reflect).
-        let mut last_scheduler_alive: Option<bool> = None;
-        while !thread_shared.stop.load(Ordering::Relaxed) {
-            match refresh_rx.recv_timeout(TRAY_POLL_INTERVAL_SECS) {
-                // Woken (manual Refresh, or the worker-complete wake after an
-                // in-flight toggle): ALWAYS rebuild so the 处理中… toggle from
-                // the tail rebuild is replaced by the real state — the
-                // scheduler-liveness edge detector may have already consumed
-                // its flip while processing was still true, and a dead scan
-                // would otherwise skip the gate forever.
-                Ok(()) => poll_once(
-                    &app_handle,
-                    &thread_shared,
-                    port,
-                    &mut last_section,
-                    &mut last_scheduler_alive,
-                    true,
-                ),
-                // Timed poll: keep the diff-based gate (rebuild only on
-                // detected change) to avoid needless menu flicker.
-                Err(mpsc::RecvTimeoutError::Timeout) => poll_once(
-                    &app_handle,
-                    &thread_shared,
-                    port,
-                    &mut last_section,
-                    &mut last_scheduler_alive,
-                    false,
-                ),
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
+    let mut last_scheduler_alive: Option<bool> = None;
+    let mut notif = PollNotifState::default();
+    while !thread_shared.stop.load(Ordering::Relaxed) {
+        match refresh_rx.recv_timeout(TRAY_POLL_INTERVAL_SECS) {
+            // Woken (manual Refresh, or the worker-complete wake after an
+            // in-flight toggle): ALWAYS rebuild so the 处理中… toggle from
+            // the tail rebuild is replaced by the real state — the
+            // scheduler-liveness edge detector may have already consumed
+            // its flip while processing was still true, and a dead scan
+            // would otherwise skip the gate forever.
+            Ok(()) => poll_once(
+                &app_handle,
+                &thread_shared,
+                port,
+                &mut last_section,
+                &mut last_scheduler_alive,
+                true,
+                &mut notif,
+            ),
+            // Timed poll: keep the diff-based gate (rebuild only on
+            // detected change) to avoid needless menu flicker.
+            Err(mpsc::RecvTimeoutError::Timeout) => poll_once(
+                &app_handle,
+                &thread_shared,
+                port,
+                &mut last_section,
+                &mut last_scheduler_alive,
+                false,
+                &mut notif,
+            ),
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
+    }
     });
 
     Ok((tray, refresh_tx))
@@ -610,6 +626,10 @@ fn rebuild_menu(app: &AppHandle, shared: &TrayShared, section: TaskSection, sche
 /// the tail rebuild must be replaced by the real state even when scheduler
 /// liveness did not change since the previous poll (see
 /// [`menu_model::poll_needs_rebuild`] for the full rationale).
+///
+/// `notif` is the poll-thread-exclusive notification baseline (see
+/// [`PollNotifState`]): this cycle's task cache diff and scheduler-death
+/// detection run here, and their baselines update here too.
 fn poll_once(
     app: &AppHandle,
     shared: &TrayShared,
@@ -617,6 +637,7 @@ fn poll_once(
     last_section: &mut TaskSection,
     last_scheduler: &mut Option<bool>,
     force_rebuild: bool,
+    notif: &mut PollNotifState,
 ) {
     // (a) status snapshot — no I/O under the backend lock (the lock is
     // internal to BackendLifecycle; status() takes it briefly).
@@ -681,6 +702,62 @@ fn poll_once(
     } else {
         None
     };
+
+    // ---- 通知检测（macOS-only，随 poll 线程） ----
+    let settings = shared.settings.lock().unwrap().clone();
+    // 通知文案模板：来自 menu_model::shell_menu_labels 纯函数表，非硬编码。
+    let nlabels = crate::menu_model::shell_menu_labels(
+        &settings.resolved_language(crate::deploy_config::language().as_deref()),
+    );
+    // ① 任务完成：NextRun 前移（默认静默，开关控制）。
+    let tasks = shared.tasks.lock().unwrap().clone();
+    if let Some(prev) = &notif.last_tasks {
+        for ev in crate::notify::diff_tasks(prev, &tasks) {
+            if crate::notify::should_notify(&ev, &settings) {
+                let body = match &ev {
+                    crate::notify::NotifyEvent::TaskComplete { name, next_time, .. } =>
+                        nlabels.notify_task_done.replace("{name}", name).replace("{next_time}", next_time),
+                    crate::notify::NotifyEvent::SchedulerDeath { name } =>
+                        nlabels.notify_death_body.replace("{name}", name),
+                };
+                let _ = app.notification().builder().title("ALAS").body(body).show();
+            }
+        }
+    }
+    notif.last_tasks = Some(tasks);
+
+    // ② 调度器异常死亡：liveness 翻转为主信号，state 1→3 为附加信号。
+    //    prev 读更新前的 *last_scheduler（本块位于既有扫描之后、写回之前）；
+    //    dead_streak 连续 2 次判死才触发（滤掉更新/重启瞬断）。
+    let prev_alive = *last_scheduler;
+    let now_alive: Option<bool> = scheduler;
+    // 闸门须为 intent==None——`!= Stop` 会放行用户自己的 Start 引导窗口
+    // （死亡 streak=1 时点 Start → 下一拍 streak=2 → 误报）。异常死亡时
+    // intent 必为 None（Start 在确认存活时已被 advance_intent_if_changed
+    // 解除）；Stop 时调度器已死无意义。
+    let gates_ok = shared.backend.status() == BackendStatus::Running
+        && matches!(shared.backend.snapshot().scheduler_intent, SchedulerIntent::None);
+    let liveness_died = gates_ok && crate::notify::liveness_death(prev_alive, now_alive, &mut notif.dead_streak);
+    // 附加信号：API 可用时 state 1→3（renderables 无残留污染时也权威）。仅更新基线。
+    // state 通道有意不加 gates——1→3 语义无歧义（用户 Stop → 追加 Manual stop → 2，
+    // 后端下线 → api 调用失败 → false），加闸反而会漏掉 Start 引导期的真实崩溃。
+    let state_died = if let Ok(list) = crate::control_api::api_instances(port) {
+        let state = list.iter().find(|i| i.name == "alas").map(|i| i.state);
+        let died = crate::notify::death_by_state(notif.last_instance_state, state);
+        notif.last_instance_state = state;
+        died
+    } else {
+        false
+    };
+    if liveness_died || state_died {
+        let ev = crate::notify::NotifyEvent::SchedulerDeath { name: "alas".into() };
+        if crate::notify::should_notify(&ev, &settings) {
+            let _ = app.notification().builder()
+                .title("ALAS")
+                .body(nlabels.notify_death_body.replace("{name}", "alas"))
+                .show();
+        }
+    }
 
     // Decision is pure (menu_model::poll_decision): the clock string and the
     // fetch result are injected, so this call site carries no decision logic.

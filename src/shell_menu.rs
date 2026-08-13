@@ -109,6 +109,54 @@ pub fn handle_auto_start_click(settings: &Arc<Mutex<ShellSettings>>) -> ShellSet
     updated
 }
 
+/// Apply a `settings-notify-master` click: flip the shared `notify_enabled`
+/// master switch, persist it, and return the updated settings. Mirrors
+/// [`handle_auto_start_click`] (save AFTER the lock drops; a failed save only
+/// warns — the in-memory value applies this session). The caller (main.rs)
+/// re-checks the installed CheckMenuItems in place via
+/// [`SettingsMenuHandles::apply_labels`].
+pub fn handle_notify_master_click(settings: &Arc<Mutex<ShellSettings>>) -> ShellSettings {
+    let updated = {
+        let mut guard = settings.lock().unwrap();
+        guard.notify_enabled = !guard.notify_enabled;
+        guard.clone()
+    };
+    if let Err(e) = updated.save() {
+        warn!("failed to persist shell settings: {e}; notifications apply for this session only");
+    }
+    updated
+}
+
+/// Apply a `settings-notify-death` click: flip the shared
+/// `notify_scheduler_death`, persist, return the updated settings. Mirrors
+/// [`handle_notify_master_click`].
+pub fn handle_notify_death_click(settings: &Arc<Mutex<ShellSettings>>) -> ShellSettings {
+    let updated = {
+        let mut guard = settings.lock().unwrap();
+        guard.notify_scheduler_death = !guard.notify_scheduler_death;
+        guard.clone()
+    };
+    if let Err(e) = updated.save() {
+        warn!("failed to persist shell settings: {e}; notifications apply for this session only");
+    }
+    updated
+}
+
+/// Apply a `settings-notify-task` click: flip the shared
+/// `notify_task_complete`, persist, return the updated settings. Mirrors
+/// [`handle_notify_master_click`].
+pub fn handle_notify_task_click(settings: &Arc<Mutex<ShellSettings>>) -> ShellSettings {
+    let updated = {
+        let mut guard = settings.lock().unwrap();
+        guard.notify_task_complete = !guard.notify_task_complete;
+        guard.clone()
+    };
+    if let Err(e) = updated.save() {
+        warn!("failed to persist shell settings: {e}; notifications apply for this session only");
+    }
+    updated
+}
+
 /// Pure: the menu id of the language item that must render CHECKED for the
 /// given setting — None → `settings-lang-follow`, each known lang → its own
 /// id, an unknown lang → follow (defensive: an unlisted language cannot be
@@ -360,6 +408,9 @@ pub struct SettingsMenuHandles {
     follow: CheckMenuItem<Wry>,
     check_update: MenuItem<Wry>,
     auto_start: CheckMenuItem<Wry>,
+    notify_master: CheckMenuItem<Wry>,
+    notify_death: CheckMenuItem<Wry>,
+    notify_task: CheckMenuItem<Wry>,
 }
 
 impl SettingsMenuHandles {
@@ -388,6 +439,13 @@ impl SettingsMenuHandles {
         self.check_update.set_text(labels.check_update.clone())?;
         self.auto_start.set_text(labels.auto_start.clone())?;
         self.auto_start.set_checked(settings.auto_start_backend)?;
+        self.notify_master.set_text(labels.notify_master.clone())?;
+        self.notify_master.set_checked(settings.notify_enabled)?;
+        self.notify_death.set_text(labels.notify_death.clone())?;
+        self.notify_death
+            .set_checked(settings.notify_scheduler_death)?;
+        self.notify_task.set_text(labels.notify_task.clone())?;
+        self.notify_task.set_checked(settings.notify_task_complete)?;
         Ok(())
     }
 
@@ -418,10 +476,17 @@ pub fn build_settings_menu(
     };
 
     // Snapshot the settings ONCE (brief lock; no I/O held).
-    let (language, auto_start_backend) = {
-        let guard = settings.lock().unwrap();
-        (guard.language.clone(), guard.auto_start_backend)
-    };
+    let (language, auto_start_backend, notify_enabled, notify_scheduler_death, notify_task_complete) =
+        {
+            let guard = settings.lock().unwrap();
+            (
+                guard.language.clone(),
+                guard.auto_start_backend,
+                guard.notify_enabled,
+                guard.notify_scheduler_death,
+                guard.notify_task_complete,
+            )
+        };
     let checked_id = checked_language_id(&language);
 
     // 语言 submenu: one CheckMenuItem per fixed language id + 跟随 ALAS.
@@ -462,7 +527,8 @@ pub fn build_settings_menu(
     )?;
 
     // 外壳设置 submenu: 语言 submenu → separator → 检查更新 → separator →
-    // 自动启动后端 check item.
+    // 自动启动后端 check item → separator → 通知开关（总开关 / 调度器异常退出 /
+    // 任务完成）check items.
     let sep_after_language = PredefinedMenuItem::separator(app)?;
     let check_update = MenuItem::with_id(
         app,
@@ -480,6 +546,31 @@ pub fn build_settings_menu(
         auto_start_backend,
         None::<&str>,
     )?;
+    let sep_after_auto_start = PredefinedMenuItem::separator(app)?;
+    let notify_master = CheckMenuItem::with_id(
+        app,
+        "settings-notify-master",
+        labels.notify_master.clone(),
+        true,
+        notify_enabled,
+        None::<&str>,
+    )?;
+    let notify_death = CheckMenuItem::with_id(
+        app,
+        "settings-notify-death",
+        labels.notify_death.clone(),
+        true,
+        notify_scheduler_death,
+        None::<&str>,
+    )?;
+    let notify_task = CheckMenuItem::with_id(
+        app,
+        "settings-notify-task",
+        labels.notify_task.clone(),
+        true,
+        notify_task_complete,
+        None::<&str>,
+    )?;
 
     let items: Vec<&dyn IsMenuItem<Wry>> = vec![
         &language_submenu,
@@ -487,6 +578,10 @@ pub fn build_settings_menu(
         &check_update,
         &sep_after_check,
         &auto_start,
+        &sep_after_auto_start,
+        &notify_master,
+        &notify_death,
+        &notify_task,
     ];
     let settings_submenu = Submenu::with_id_and_items(
         app,
@@ -505,12 +600,20 @@ pub fn build_settings_menu(
         follow,
         check_update,
         auto_start,
+        notify_master,
+        notify_death,
+        notify_task,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes the real-settings-file round-trip tests: they all write the
+    /// SAME user settings file, so running in parallel would race each
+    /// other's flip→assert→restore sequences against the shared file.
+    static SETTINGS_FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn language_after_click_follow_resets_to_none() {
@@ -569,6 +672,7 @@ mod tests {
 
     #[test]
     fn handle_auto_start_click_flips_and_persists() {
+        let _serial = SETTINGS_FILE_LOCK.lock().unwrap();
         // The handler persists via ShellSettings::save() → the REAL settings
         // path (no injectable path exists in the public surface, and
         // shell_settings.rs stays untouched per plan constraints), so this
@@ -611,6 +715,122 @@ mod tests {
         assert!(!crate::shell_settings::load().auto_start_backend);
 
         drop(restore); // restore the pre-test file state
+    }
+
+    #[test]
+    fn handle_notify_master_click_flips_and_persists() {
+        let _serial = SETTINGS_FILE_LOCK.lock().unwrap();
+        // Mirrors handle_auto_start_click_flips_and_persists: the handler
+        // persists via the REAL settings path, so the test snapshots the real
+        // file and restores it unconditionally via a Drop guard (a panic
+        // mid-test still leaves the machine's settings file untouched).
+        struct Restore {
+            path: std::path::PathBuf,
+            original: Option<String>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.original {
+                    Some(content) => {
+                        let _ = std::fs::write(&self.path, content);
+                    }
+                    None => {
+                        let _ = std::fs::remove_file(&self.path);
+                    }
+                }
+            }
+        }
+        let restore = Restore {
+            path: crate::shell_settings::settings_path(),
+            original: std::fs::read_to_string(crate::shell_settings::settings_path()).ok(),
+        };
+
+        let settings = Arc::new(Mutex::new(ShellSettings {
+            language: None,
+            notify_enabled: true,
+            ..Default::default()
+        }));
+        let updated = handle_notify_master_click(&settings);
+        assert!(!updated.notify_enabled);
+        assert!(!settings.lock().unwrap().notify_enabled);
+        assert!(!crate::shell_settings::load().notify_enabled);
+
+        drop(restore);
+    }
+
+    #[test]
+    fn handle_notify_death_click_flips_and_persists() {
+        let _serial = SETTINGS_FILE_LOCK.lock().unwrap();
+        struct Restore {
+            path: std::path::PathBuf,
+            original: Option<String>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.original {
+                    Some(content) => {
+                        let _ = std::fs::write(&self.path, content);
+                    }
+                    None => {
+                        let _ = std::fs::remove_file(&self.path);
+                    }
+                }
+            }
+        }
+        let restore = Restore {
+            path: crate::shell_settings::settings_path(),
+            original: std::fs::read_to_string(crate::shell_settings::settings_path()).ok(),
+        };
+
+        let settings = Arc::new(Mutex::new(ShellSettings {
+            language: None,
+            notify_scheduler_death: true,
+            ..Default::default()
+        }));
+        let updated = handle_notify_death_click(&settings);
+        assert!(!updated.notify_scheduler_death);
+        assert!(!settings.lock().unwrap().notify_scheduler_death);
+        assert!(!crate::shell_settings::load().notify_scheduler_death);
+
+        drop(restore);
+    }
+
+    #[test]
+    fn handle_notify_task_click_flips_and_persists() {
+        let _serial = SETTINGS_FILE_LOCK.lock().unwrap();
+        struct Restore {
+            path: std::path::PathBuf,
+            original: Option<String>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.original {
+                    Some(content) => {
+                        let _ = std::fs::write(&self.path, content);
+                    }
+                    None => {
+                        let _ = std::fs::remove_file(&self.path);
+                    }
+                }
+            }
+        }
+        let restore = Restore {
+            path: crate::shell_settings::settings_path(),
+            original: std::fs::read_to_string(crate::shell_settings::settings_path()).ok(),
+        };
+
+        // notify_task_complete defaults OFF — the flip must persist false→true.
+        let settings = Arc::new(Mutex::new(ShellSettings {
+            language: None,
+            notify_task_complete: false,
+            ..Default::default()
+        }));
+        let updated = handle_notify_task_click(&settings);
+        assert!(updated.notify_task_complete);
+        assert!(settings.lock().unwrap().notify_task_complete);
+        assert!(crate::shell_settings::load().notify_task_complete);
+
+        drop(restore);
     }
 
     #[test]

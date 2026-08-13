@@ -408,6 +408,13 @@ pub struct ShellMenuLabels {
     pub check_failed: String,
     pub up_to_date: String,
     pub update_available: String,
+    pub notify_master: String,
+    pub notify_death: String,
+    pub notify_task: String,
+    /// Task-complete notification body template; `{name}` + `{next_time}` placeholders.
+    pub notify_task_done: String,
+    /// Scheduler-death notification body template; `{name}` placeholder.
+    pub notify_death_body: String,
     pub lang_names: Vec<String>,
 }
 
@@ -424,6 +431,11 @@ pub fn shell_menu_labels(lang: &str) -> ShellMenuLabels {
         check_failed,
         up_to_date,
         update_available,
+        notify_master,
+        notify_death,
+        notify_task,
+        notify_task_done,
+        notify_death_body,
     ) = match lang {
         "zh-TW" => (
             "設定",
@@ -434,6 +446,11 @@ pub fn shell_menu_labels(lang: &str) -> ShellMenuLabels {
             "檢查失敗",
             "已是最新",
             "發現新版本，重啟後更新",
+            "通知",
+            "調度器異常退出時通知",
+            "任務完成時通知",
+            "{name} 完成 · 下次 {next_time}",
+            "調度器異常退出（{name}）",
         ),
         "en-US" => (
             "Settings",
@@ -444,6 +461,11 @@ pub fn shell_menu_labels(lang: &str) -> ShellMenuLabels {
             "Check failed",
             "Up to date",
             "Update available, restart to apply",
+            "Notifications",
+            "Notify on scheduler abnormal exit",
+            "Notify on task completion",
+            "{name} done · next {next_time}",
+            "Scheduler exited abnormally ({name})",
         ),
         "ja-JP" => (
             "設定",
@@ -454,6 +476,11 @@ pub fn shell_menu_labels(lang: &str) -> ShellMenuLabels {
             "確認失敗",
             "最新です",
             "新しいバージョンがあります、再起動後に更新",
+            "通知",
+            "スケジューラー異常終了時に通知",
+            "タスク完了時に通知",
+            "{name} 完了 · 次回 {next_time}",
+            "スケジューラーが異常終了しました（{name}）",
         ),
         // zh-CN doubles as the fallback for any unknown or empty language.
         _ => (
@@ -465,6 +492,11 @@ pub fn shell_menu_labels(lang: &str) -> ShellMenuLabels {
             "检查失败",
             "已是最新",
             "发现新版本，重启后更新",
+            "通知",
+            "调度器异常退出时通知",
+            "任务完成时通知",
+            "{name} 完成 · 下次 {next_time}",
+            "调度器异常退出（{name}）",
         ),
     };
     ShellMenuLabels {
@@ -476,6 +508,11 @@ pub fn shell_menu_labels(lang: &str) -> ShellMenuLabels {
         check_failed: check_failed.into(),
         up_to_date: up_to_date.into(),
         update_available: update_available.into(),
+        notify_master: notify_master.into(),
+        notify_death: notify_death.into(),
+        notify_task: notify_task.into(),
+        notify_task_done: notify_task_done.into(),
+        notify_death_body: notify_death_body.into(),
         // Self-names in fixed order, mapping 1:1 to the settings language ids
         // zh-CN, zh-TW, en-US, ja-JP — identical for every language.
         lang_names: vec![
@@ -1369,6 +1406,11 @@ mod tests {
             assert!(!labels.check_failed.is_empty(), "lang {lang}");
             assert!(!labels.up_to_date.is_empty(), "lang {lang}");
             assert!(!labels.update_available.is_empty(), "lang {lang}");
+            assert!(!labels.notify_master.is_empty(), "lang {lang}");
+            assert!(!labels.notify_death.is_empty(), "lang {lang}");
+            assert!(!labels.notify_task.is_empty(), "lang {lang}");
+            assert!(!labels.notify_task_done.is_empty(), "lang {lang}");
+            assert!(!labels.notify_death_body.is_empty(), "lang {lang}");
             assert_eq!(
                 labels.lang_names,
                 vec![

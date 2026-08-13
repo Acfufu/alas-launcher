@@ -117,6 +117,7 @@ fn main() -> Result<()> {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![save_as])
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             let _ = app
                 .get_webview_window("main")
@@ -221,6 +222,50 @@ fn main() -> Result<()> {
                         if let Some(handles) = &menu_handles {
                             if let Err(e) = handles.apply_auto_start(&updated) {
                                 warn!("settings menu auto-start re-check failed: {e}");
+                            }
+                        }
+                    }
+                    "settings-notify-master" => {
+                        // Flip + persist the master notification switch, then
+                        // re-check the installed CheckMenuItems in place via
+                        // apply_labels (labels computed at click time so the
+                        // menu stays in the CURRENT language — mirrors the
+                        // settings-check-update arm).
+                        let updated =
+                            crate::shell_menu::handle_notify_master_click(&menu_shell_settings);
+                        let labels = crate::menu_model::shell_menu_labels(
+                            &updated
+                                .resolved_language(crate::deploy_config::language().as_deref()),
+                        );
+                        if let Some(handles) = &menu_handles {
+                            if let Err(e) = handles.apply_labels(&labels, &updated) {
+                                warn!("settings menu notify re-check failed: {e}");
+                            }
+                        }
+                    }
+                    "settings-notify-death" => {
+                        let updated =
+                            crate::shell_menu::handle_notify_death_click(&menu_shell_settings);
+                        let labels = crate::menu_model::shell_menu_labels(
+                            &updated
+                                .resolved_language(crate::deploy_config::language().as_deref()),
+                        );
+                        if let Some(handles) = &menu_handles {
+                            if let Err(e) = handles.apply_labels(&labels, &updated) {
+                                warn!("settings menu notify re-check failed: {e}");
+                            }
+                        }
+                    }
+                    "settings-notify-task" => {
+                        let updated =
+                            crate::shell_menu::handle_notify_task_click(&menu_shell_settings);
+                        let labels = crate::menu_model::shell_menu_labels(
+                            &updated
+                                .resolved_language(crate::deploy_config::language().as_deref()),
+                        );
+                        if let Some(handles) = &menu_handles {
+                            if let Err(e) = handles.apply_labels(&labels, &updated) {
+                                warn!("settings menu notify re-check failed: {e}");
                             }
                         }
                     }
