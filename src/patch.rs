@@ -18,7 +18,9 @@ use tracing::{info, warn};
 
 const CONTROL_API_SRC: &str = include_str!("../assets/patches/control_api.py");
 const INJECT_IMPORT: &str = include_str!("../assets/patches/fastapi.inject.py");
-const MARKER: &str = "# === alas-launcher:control-api ===";
+/// Exposed crate-wide: the real-payload integration test (control_api.rs)
+/// asserts marker uniqueness on the installed payload.
+pub(crate) const MARKER: &str = "# === alas-launcher:control-api ===";
 const INJECT_EXTEND: &str = "    routes.extend(control_routes())\n";
 const ANCHOR_IMPORT: &str = "from starlette.staticfiles import StaticFiles";
 const ANCHOR_RETURN: &str = "    return Starlette(";
@@ -110,9 +112,9 @@ pub fn apply_patch(alas_dir: &Path) -> Result<PatchOutcome> {
             // `?` short-circuiting bypassed mark_patch_failed, leaving the
             // tray armed while the API is actually dead).
             atomic_write(&control_path, CONTROL_API_SRC)
-                .map_err(|e| { mark_patch_failed(); e })?;
+                .inspect_err(|_| mark_patch_failed())?;
             atomic_write(&fastapi_path, &injected)
-                .map_err(|e| { mark_patch_failed(); e })?;
+                .inspect_err(|_| mark_patch_failed())?;
             info!("control API patch applied");
             Ok(PatchOutcome::Applied)
         }
@@ -127,7 +129,6 @@ pub fn apply_patch(alas_dir: &Path) -> Result<PatchOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     const PRISTINE: &str = r#"from starlette.staticfiles import StaticFiles
 
