@@ -11,8 +11,8 @@ use tracing::warn;
 ///
 /// FAIL-OPEN: a missing tool or unparseable output returns None — the start
 /// is NOT blocked. Acceptability: None only skips the port-ownership check
-/// for that one start; `ManagedBackend::new`'s existing ALAS_LAUNCHER_PID
-/// residue scan still reaps same-launcher stale processes, so only a server
+/// for that one start; `ManagedBackend`'s ALAS_LAUNCHER_PID residue scan
+/// (Drop) still reaps same-launcher stale processes, so only a server
 /// left behind by ANOTHER launcher instance slips through on that rare path —
 /// and the lsof probe is near-universal on macOS. Fail-closed would break
 /// startup entirely on machines without the tool, which is worse than the

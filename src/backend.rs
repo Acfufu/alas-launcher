@@ -71,6 +71,10 @@ pub enum SchedulerIntent {
 /// [`SchedulerIntent`]).
 pub struct BackendState {
     pub status: BackendStatus,
+    /// The live backend process handle. `Some` ⇔ Running or Initializing
+    /// (still waiting for the port): the child is installed immediately after
+    /// spawn, BEFORE the port is ready, so `stop()` can take and kill it at
+    /// any moment during the wait.
     pub backend: Option<ManagedBackend>,
     pub start_failed: bool,
     pub crashed: bool,
@@ -119,7 +123,6 @@ pub struct BackendStateSnapshot {
 pub struct ManagedBackend {
     child: Option<ManagedChild>,
     #[cfg(test)]
-    #[expect(dead_code)] // read by Task 2's wait_for_ready (ready_skip short-circuit)
     ready_skip: bool,
 }
 
@@ -139,51 +142,6 @@ impl ManagedBackend {
             #[cfg(test)]
             ready_skip: false,
         })
-    }
-
-    /// Spawn + 60s port-wait, fused (legacy shape kept until Task 2 moves the
-    /// wait into the lifecycle).
-    pub fn new(port: u16) -> Result<Self> {
-        let mut res = Self::spawn(port)?;
-
-        let address = format!("127.0.0.1:{}", port).parse().unwrap();
-        let start_time = std::time::Instant::now();
-        while start_time.elapsed() < Duration::from_secs(60) {
-            if TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
-                if let Some(child) = res.child.as_mut() {
-                    // Metis MINOR-6: the port may be held by a stale/unrelated
-                    // process. Verify the spawned child actually survived before
-                    // declaring the backend ready.
-                    if child
-                        .try_wait()
-                        .map_err(|e| anyhow!("Failed to check gui.py status: {e}"))?
-                        .is_some()
-                    {
-                        return Err(anyhow!("gui.py exited before becoming ready"));
-                    }
-                    // MAJOR-3: the port may answer from a STALE server left by
-                    // an earlier launcher instance while our gui.py is still
-                    // coming up. Verify the listening process is our own child
-                    // (or in its process group) before declaring Running — a
-                    // mismatch means the port was already taken.
-                    let spawned = child.id();
-                    match port_owner_pid(port) {
-                        Some(owner) if !is_same_process_group(owner, spawned) => {
-                            return Err(anyhow!(
-                                "Port {port} is occupied by pid {owner} (our backend is {spawned}); refusing to start over a stale server"
-                            ));
-                        }
-                        // None → the port-owner tool is unavailable: fail-open
-                        // (see child_process::port_owner_pid) and rely on the
-                        // ALAS_LAUNCHER_PID residue scan in Drop.
-                        _ => {}
-                    }
-                }
-                return Ok(res);
-            }
-            sleep(Duration::from_millis(100));
-        }
-        Err(anyhow!("Timeout waiting for port {} to be ready", port))
     }
 
     pub fn terminate(&mut self) -> Result<ExitStatus> {
@@ -230,9 +188,9 @@ impl ManagedBackend {
         }
     }
 
-    /// Non-blocking exit poll for the readiness wait (Task 2's
-    /// `wait_for_ready` calls this on the installed child).
-    #[expect(dead_code)] // first call site lands in Task 2 (wait_for_ready)
+    /// Non-blocking exit poll for the readiness wait: `wait_for_ready` calls
+    /// this on the installed child to detect a gui.py that died before the
+    /// port came up (MINOR-6).
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         match self.child.as_mut() {
             Some(c) => c.try_wait(),
@@ -255,6 +213,17 @@ impl ManagedBackend {
         Self {
             child: Some(child),
             ready_skip: true,
+        }
+    }
+
+    /// Test seam: like `from_child` but with `ready_skip = false` — runs the
+    /// REAL 60s wait loop (MAJOR-3 / MINOR-6 / ownership-check coverage).
+    #[cfg(test)]
+    #[expect(dead_code)] // first call site lands in Task 3 (real-wait-loop tests)
+    pub(crate) fn from_child_unchecked(child: GroupChild) -> Self {
+        Self {
+            child: Some(ManagedChild::from_group_child(child)),
+            ready_skip: false,
         }
     }
 
@@ -311,19 +280,22 @@ impl Drop for ManagedBackend {
 pub struct BackendLifecycle {
     state: Mutex<BackendState>,
     // Internal seam so `start()` is testable without spawning python: tests
-    // inject a fake spawner; production wraps ManagedBackend::new.
+    // inject a fake spawner; production wraps ManagedBackend::spawn.
     spawner: Box<dyn Fn(u16) -> Result<ManagedBackend> + Send + Sync>,
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)] // seam box type is per-plan; a type alias would hide the shape
+    wait_override: std::sync::Mutex<Option<Box<dyn Fn() -> Result<()> + Send + Sync>>>,
 }
 
 impl Default for BackendLifecycle {
     fn default() -> Self {
-        Self::new_with_spawner(ManagedBackend::new)
+        Self::new_with_spawner(ManagedBackend::spawn)
     }
 }
 
 impl BackendLifecycle {
     /// Build a lifecycle whose spawn step runs `spawner` instead of
-    /// `ManagedBackend::new` — the test seam.
+    /// `ManagedBackend::spawn` — the test seam.
     ///
     /// Note: `Sync` is required (not just `Send`) so `Arc<BackendLifecycle>`
     /// can be shared across the Ready thread and the tray poll thread.
@@ -333,6 +305,8 @@ impl BackendLifecycle {
         Self {
             state: Mutex::new(BackendState::default()),
             spawner: Box::new(spawner),
+            #[cfg(test)]
+            wait_override: std::sync::Mutex::new(None),
         }
     }
 
@@ -373,6 +347,14 @@ impl BackendLifecycle {
         state.pending_start_epoch = Some(state.epoch);
     }
 
+    /// Test seam: replace the readiness-wait inner loop (spec §3.5). The
+    /// readiness tail (epoch/pid re-check + Running) still runs in start().
+    #[cfg(test)]
+    #[expect(dead_code)] // first call site lands in Task 3 (wait_override tests)
+    pub fn set_wait_override(&self, f: impl Fn() -> Result<()> + Send + Sync + 'static) {
+        *self.wait_override.lock().unwrap() = Some(Box::new(f));
+    }
+
     /// Start the backend on `port`.
     ///
     /// ORDERING CONTRACT (Metis BLOCKER-2): the old backend MUST be fully
@@ -381,18 +363,20 @@ impl BackendLifecycle {
     /// freshly spawned child. The take/terminate/drop sequence therefore runs
     /// entirely OUTSIDE the lock and before the spawn.
     ///
-    /// No lock is held across the spawn either: the port-readiness wait inside
-    /// `ManagedBackend::new` can take up to 60s, and status readers (the tray
-    /// poll thread reads the status every 3s) must never block on it.
+    /// No lock is held across the spawn or the port-readiness wait either:
+    /// [`BackendLifecycle::wait_for_ready`] polls for up to 60s, and status
+    /// readers (the tray poll thread reads the status every 3s) must never
+    /// block on it.
     ///
-    /// EXIT RACE (MAJOR-2): once the spawn runs on a worker thread, an
-    /// ExitRequested can land inside the spawn window. `stop()` bumps the
-    /// epoch, so this method detects the interruption — at entry (a stop
-    /// between `begin_start` and here aborts before any spawn) or after the
-    /// spawn (a stop mid-spawn disposes the late child and re-affirms
-    /// Stopped). Either way the exit path stays authoritative and the start
-    /// reports `STOP_INTERVENED` — never a bogus Running.
+    /// INSTALL-EARLY: the child is installed into state immediately after the
+    /// spawn (③), BEFORE the port wait — so `stop()` can take and kill it at
+    /// any moment. Ownership races are resolved by three epoch checkpoints
+    /// (② spawn-failure guard / ③ install / ⑤ readiness tail) plus the pid
+    /// ownership check in the wait loop (④) and tail (⑤): the loser of a race
+    /// with `stop()` or a concurrent start reports `STOP_INTERVENED` — never
+    /// a bogus Running — and the winner owns the state machine.
     pub fn start(&self, port: u16) -> Result<()> {
+        // ① 入口（语义不变）：pending epoch 检查 / Initializing / take old。
         let (old, epoch) = {
             let mut state = self.state.lock().unwrap();
             if let Some(pending) = state.pending_start_epoch {
@@ -405,50 +389,171 @@ impl BackendLifecycle {
             state.start_failed = false;
             (state.backend.take(), state.epoch)
         };
-        // Outside the lock: fully terminate + drop the old backend before any
-        // new process can exist.
+        // 锁外：旧 backend 完全终止后才可能 spawn（BLOCKER-2）。
         terminate_old(old);
-        match (self.spawner)(port) {
-            Ok(backend) => {
+
+        // ② spawn（快，无等待；失败 → epoch 区分 stop 干预与真失败）。
+        let mut backend = match (self.spawner)(port) {
+            Ok(b) => b,
+            Err(e) => {
                 let mut state = self.state.lock().unwrap();
-                if state.epoch != epoch {
-                    // A stop() intervened while the spawn was in flight: it
-                    // already took backend=None and set Stopped. Dispose the
-                    // late child (terminate the process group) so it cannot
-                    // orphan, re-affirm Stopped, and report the interruption.
-                    state.status = BackendStatus::Stopped;
-                    state.start_failed = false;
-                    state.crashed = false;
-                    state.scheduler_intent = SchedulerIntent::None;
-                    state.start_intent_at = None;
-                    drop(state);
-                    let mut backend = backend;
-                    let _ = backend.terminate();
-                    drop(backend);
+                // Round-2 (Oracle 3)：所有权守卫——同 epoch 并发 start 的 winner
+                // 可能已装 child（后装者胜收敛）。此时写 Stopped+start_failed 会
+                // 覆盖 winner 的 Running/Initializing → 状态污染。只有确认无
+                // winner（backend 空）且 epoch 未变才标记真失败。
+                if state.epoch != epoch || state.backend.is_some() {
                     return Err(anyhow!(STOP_INTERVENED));
                 }
-                state.backend = Some(backend);
-                state.status = BackendStatus::Running;
-                state.crashed = false;
-                state.scheduler_intent = SchedulerIntent::Start;
-                // Re-arm the TTL clock at the moment the backend is actually
-                // up: the 90s boot window starts here.
-                state.start_intent_at = Some(Instant::now());
-                Ok(())
-            }
-            Err(e) => {
-                // Consistent start-failure marking for BOTH callers (Ready
-                // thread and tray toggle) — previously the Ready thread left
-                // start_failed unset.
-                let mut state = self.state.lock().unwrap();
                 state.status = BackendStatus::Stopped;
                 state.start_failed = true;
                 state.crashed = false;
                 state.scheduler_intent = SchedulerIntent::None;
                 state.start_intent_at = None;
-                Err(e)
+                return Err(e);
+            }
+        };
+        let my_pid = backend.pid(); // Option<u32>：pid() 返回 Option，比较统一 flatten 后对齐
+
+        // ③ 立即安装（微秒窗口）：epoch 检查 + 同 epoch 并发 start 的旧 child 替换。
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.epoch != epoch {
+                drop(state);
+                let _ = backend.terminate();
+                return Err(anyhow!(STOP_INTERVENED));
+            }
+            // 同 epoch 并发 double-start 收敛：后装者胜，先装者被终止。
+            let other = state.backend.take();
+            state.backend = Some(backend);
+            drop(state);
+            if let Some(mut o) = other {
+                let _ = o.terminate();
             }
         }
+
+        // ④ 等待（锁外；ready_skip/override 只替换内层轮询）。
+        if let Err(e) = self.wait_for_ready(port, epoch, my_pid) {
+            return self.dispose_backend(epoch, my_pid, e);
+        }
+
+        // ⑤ 收尾（统一在 start() 内——epoch/pid 复检 + Running 原子完成）。
+        let mut state = self.state.lock().unwrap();
+        if state.epoch != epoch
+            || state.backend.as_ref().and_then(|b| b.pid()) != my_pid
+        {
+            // Round-2 (Momus 2)：不写状态——winner（stop/并发 start）拥有状态机，
+            // 写 Stopped 会瞬态覆盖其 Initializing/Running。直接干预报错。
+            return Err(anyhow!(STOP_INTERVENED));
+        }
+        state.status = BackendStatus::Running;
+        state.start_failed = false; // Round-1: 并发 start 的 stale dispose 可能已置 true
+        state.crashed = false;
+        state.scheduler_intent = SchedulerIntent::Start;
+        state.start_intent_at = Some(Instant::now());
+        Ok(())
+    }
+
+    /// 锁外端口等待（≤60s）。每轮微秒级短锁，绝不跨轮持锁；零 unwrap。
+    /// ready_skip（cfg(test)）短路；wait_override（cfg(test)）替换整段轮询。
+    fn wait_for_ready(&self, port: u16, _epoch: u64, my_pid: Option<u32>) -> Result<()> {
+        // 缝顺序（Round-1 修正，偏离 spec §3.2 伪码）：override 必须优先于
+        // ready_skip——否则 Task 3 的 override 测试永不执行（ready_skip 短路）。
+        #[cfg(test)]
+        {
+            if let Some(ov) = &*self.wait_override.lock().unwrap() {
+                return ov();
+            }
+            let short = {
+                let s = self.state.lock().unwrap();
+                s.backend.as_ref().is_some_and(|b| b.ready_skip)
+            };
+            if short {
+                return Ok(());
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let address = format!("127.0.0.1:{port}").parse().unwrap();
+        loop {
+            // 所有权检查：stop()/并发 start() 取走或替换 child → 立即退出，不碰 child。
+            let owner = {
+                let s = self.state.lock().unwrap();
+                s.backend.as_ref().and_then(|b| b.pid())
+            };
+            if owner != my_pid {
+                return Err(anyhow!(STOP_INTERVENED));
+            }
+            // MINOR-6 早退（短锁）：child 已死（含被 stop 杀）。
+            // Round-2 (Oracle 5)：try_wait 会对已退出子进程做 reap——若 ③ 在本轮
+            // 所有权检查后、此处之前替换了 child，reap 到的是 winner 的 child
+            // （同进程线程共享子进程表）→ winner 的 wait() 得 ECHILD。因此先
+            // 复检所有权再 try_wait；不匹配 → 不碰（STOP_INTERVENED 由下轮/收尾报）。
+            let exited = {
+                let mut s = self.state.lock().unwrap();
+                if s.backend.as_ref().and_then(|b| b.pid()) != my_pid {
+                    None
+                } else {
+                    s.backend.as_mut().and_then(|b| b.try_wait().ok().flatten())
+                }
+            };
+            if exited.is_some() {
+                return Err(anyhow!("gui.py exited before becoming ready"));
+            }
+            // 端口探测（无句柄依赖）。
+            if TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
+                // MAJOR-3：归属校验（短锁取 pid；None → 已被 stop 取走）。
+                let spawned = match owner {
+                    Some(p) => p,
+                    None => return Err(anyhow!(STOP_INTERVENED)),
+                };
+
+                match port_owner_pid(port) {
+                    Some(o) if !is_same_process_group(o, spawned) => {
+                        return Err(anyhow!(
+                            "Port {port} is occupied by pid {o} (our backend is {spawned}); refusing to start over a stale server"
+                        ));
+                    }
+                    _ => {}
+                }
+                return Ok(()); // 就绪信号；⑤ 在 start() 统一复检。
+            }
+            if Instant::now() >= deadline {
+                return Err(anyhow!("Timeout waiting for port {port} to be ready"));
+            }
+            sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// 等待失败处置（Round-1 修正，Oracle 2）：只处置自己仍拥有的 child
+    /// （pid 校验）。`took_something == false` 一律视为干预——stop()/并发
+    /// start() 已取走 child——**不改写状态**（winner 拥有状态机），返回
+    /// STOP_INTERVENED。真失败仅在「取到了自己的 child 且 epoch 未变」时
+    /// 置 start_failed=true。
+    fn dispose_backend(&self, epoch: u64, my_pid: Option<u32>, err: anyhow::Error) -> Result<()> {
+        let taken = {
+            let mut s = self.state.lock().unwrap();
+            if s.backend.as_ref().and_then(|b| b.pid()) != my_pid {
+                None // 已被 stop()/并发 start() 取走——不碰。
+            } else {
+                s.backend.take()
+            }
+        };
+        let took_something = taken.is_some();
+        if let Some(mut b) = taken {
+            let _ = b.terminate();
+            drop(b);
+        }
+        let mut state = self.state.lock().unwrap();
+        if state.epoch != epoch || !took_something {
+            // 干预：stop()/并发 start() 拥有权。不改状态（避免覆盖 winner 的
+            // Initializing，也避免 Running+start_failed 污染），直接干预报错。
+            return Err(anyhow!(STOP_INTERVENED));
+        }
+        state.status = BackendStatus::Stopped;
+        state.start_failed = true;
+        state.crashed = false;
+        state.scheduler_intent = SchedulerIntent::None;
+        state.start_intent_at = None;
+        Err(err)
     }
 
     /// Stop the backend (if any): status -> Stopped, all failure flags and
@@ -544,6 +649,10 @@ impl BackendLifecycle {
 
     /// Pid of the live backend process, if any — the root of the process-tree
     /// scheduler probe. Brief lock, no handle out.
+    ///
+    /// During Initializing (the port wait) this returns `Some(live child)` —
+    /// expected by design; consumers (tray.rs:379,702) all gate on
+    /// `status == Running` before acting on the pid.
     pub fn backend_pid(&self) -> Option<u32> {
         self.state
             .lock()
@@ -810,6 +919,16 @@ mod tests {
         assert_eq!(s.status, BackendStatus::Running);
         assert_eq!(s.scheduler_intent, SchedulerIntent::Start);
         assert!(!s.crashed);
+    }
+
+    /// The readiness tail (epoch re-check + Running) must run for EVERY wait
+    /// outcome — including the ready_skip seam — not just the real loop.
+    #[test]
+    fn ready_skip_path_still_marks_running() {
+        let lc = BackendLifecycle::new_with_spawner(ok_spawner());
+        lc.start(22267).unwrap();
+        assert_eq!(lc.status(), BackendStatus::Running);
+        assert_eq!(lc.snapshot().scheduler_intent, SchedulerIntent::Start);
     }
 
     #[test]
