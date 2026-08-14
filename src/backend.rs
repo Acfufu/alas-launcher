@@ -219,7 +219,6 @@ impl ManagedBackend {
     /// Test seam: like `from_child` but with `ready_skip = false` — runs the
     /// REAL 60s wait loop (MAJOR-3 / MINOR-6 / ownership-check coverage).
     #[cfg(test)]
-    #[expect(dead_code)] // first call site lands in Task 3 (real-wait-loop tests)
     pub(crate) fn from_child_unchecked(child: GroupChild) -> Self {
         Self {
             child: Some(ManagedChild::from_group_child(child)),
@@ -350,7 +349,6 @@ impl BackendLifecycle {
     /// Test seam: replace the readiness-wait inner loop (spec §3.5). The
     /// readiness tail (epoch/pid re-check + Running) still runs in start().
     #[cfg(test)]
-    #[expect(dead_code)] // first call site lands in Task 3 (wait_override tests)
     pub fn set_wait_override(&self, f: impl Fn() -> Result<()> + Send + Sync + 'static) {
         *self.wait_override.lock().unwrap() = Some(Box::new(f));
     }
@@ -825,6 +823,14 @@ mod tests {
         }
     }
 
+    /// An ephemeral, currently-free port (bind :0, read the port, drop the
+    /// listener). Avoids collisions with the dev machine's 22267 (the ALAS
+    /// WebUI port — may be live while the app is running).
+    fn free_ephemeral_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    }
+
     #[test]
     fn start_success_sets_running() {
         let lc = BackendLifecycle::new_with_spawner(ok_spawner());
@@ -1044,6 +1050,143 @@ mod tests {
             "no spawn may happen after a stop"
         );
         assert_eq!(lc.status(), BackendStatus::Stopped);
+    }
+
+    // ---- stop-during-wait semantics (Task 3) -----------------------------
+
+    /// New contract: the child is installed in state BEFORE readiness, so
+    /// backend_pid() is Some while status is Initializing.
+    #[test]
+    fn start_installs_child_before_ready() {
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let gate2 = Arc::clone(&gate);
+        let lc = Arc::new(BackendLifecycle::new_with_spawner(ok_spawner()));
+        lc.set_wait_override(move || {
+            gate2.wait();
+            gate2.wait();
+            Ok(())
+        });
+        let lc2 = lc.clone();
+        let worker = std::thread::spawn(move || lc2.start(22267));
+        gate.wait(); // worker 已进入 wait override
+        let s = lc.snapshot();
+        assert_eq!(s.status, BackendStatus::Initializing, "still initializing during the wait");
+        assert!(lc.backend_pid().is_some(), "child installed before ready");
+        gate.wait(); // 释放 worker
+        let r = worker.join().unwrap();
+        assert!(r.is_ok(), "start completes after the wait");
+        assert_eq!(lc.status(), BackendStatus::Running);
+    }
+
+    /// stop() landing mid-wait terminates the INSTALLED child; the late start
+    /// reports STOP_INTERVENED, never start_failed.
+    #[test]
+    fn stop_during_wait_terminates_installed_child() {
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let gate2 = Arc::clone(&gate);
+        let pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let pids2 = Arc::clone(&pids);
+        let lc = Arc::new(BackendLifecycle::new_with_spawner(move |_| {
+            let child = sleep_child();
+            pids2.lock().unwrap().push(child.id());
+            Ok(ManagedBackend::from_child(child))
+        }));
+        lc.set_wait_override(move || {
+            gate2.wait();
+            gate2.wait();
+            Ok(())
+        });
+        let lc2 = lc.clone();
+        let worker = std::thread::spawn(move || lc2.start(22267));
+        gate.wait(); // worker 在 override 内
+        lc.stop();   // 退出/停止落在等待窗口
+        gate.wait(); // 释放 worker
+        let err = worker.join().unwrap().unwrap_err();
+        assert!(err.to_string().contains("stop intervened"), "got: {err}");
+        let s = lc.snapshot();
+        assert_eq!(s.status, BackendStatus::Stopped);
+        assert!(!s.start_failed, "stop intervention is not a start failure");
+        let pid = pids.lock().unwrap()[0];
+        assert!(!process_is_alive(pid), "stop must terminate the installed child");
+        assert_eq!(lc.backend_pid(), None);
+    }
+
+    /// A genuine wait failure (no stop involved) marks start_failed and
+    /// disposes the child.
+    #[test]
+    fn wait_failure_marks_start_failed_and_disposes() {
+        let pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let pids2 = Arc::clone(&pids);
+        let lc = Arc::new(BackendLifecycle::new_with_spawner(move |_| {
+            let child = sleep_child();
+            pids2.lock().unwrap().push(child.id());
+            Ok(ManagedBackend::from_child(child))
+        }));
+        lc.set_wait_override(|| Err(anyhow!("boom")));
+        let err = lc.start(22267).unwrap_err();
+        assert_eq!(err.to_string(), "boom");
+        let s = lc.snapshot();
+        assert_eq!(s.status, BackendStatus::Stopped);
+        assert!(s.start_failed, "genuine wait failure is a start failure");
+        assert_eq!(lc.backend_pid(), None);
+        let pid = pids.lock().unwrap()[0];
+        assert!(!process_is_alive(pid), "failed wait must dispose the child");
+    }
+
+    /// stop() landing before a wait failure still wins: STOP_INTERVENED, not
+    /// start_failed (spec §3.2 注, Oracle finding 6).
+    #[test]
+    fn stop_during_wait_with_wait_error_is_intervention_not_failure() {
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let gate2 = Arc::clone(&gate);
+        let lc = Arc::new(BackendLifecycle::new_with_spawner(ok_spawner()));
+        lc.set_wait_override(move || {
+            gate2.wait();
+            gate2.wait();
+            Err(anyhow!("boom"))
+        });
+        let lc2 = lc.clone();
+        let worker = std::thread::spawn(move || lc2.start(22267));
+        gate.wait();
+        lc.stop();
+        gate.wait();
+        let err = worker.join().unwrap().unwrap_err();
+        assert!(err.to_string().contains("stop intervened"), "got: {err}");
+        assert!(!lc.snapshot().start_failed, "intervention beats wait failure");
+        assert_eq!(lc.backend_pid(), None);
+    }
+
+    /// A stale first wait must NEVER touch the second start's child: the
+    /// pid-ownership check aborts it with STOP_INTERVENED while the second
+    /// start's child stays alive until the final stop (Oracle finding 2).
+    #[test]
+    fn second_start_during_first_wait_first_wait_never_kills_new_child() {
+        let pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        let pids2 = Arc::clone(&pids);
+        let lc = Arc::new(BackendLifecycle::new_with_spawner(move |_| {
+            let child = sleep_child();
+            pids2.lock().unwrap().push(child.id());
+            Ok(ManagedBackend::from_child_unchecked(child)) // REAL wait loop
+        }));
+        let port = free_ephemeral_port(); // Round-1: 不用 22267（开发机可能跑着 ALAS）
+        let lc1 = lc.clone();
+        let t1 = std::thread::spawn(move || lc1.start(port));
+        std::thread::sleep(Duration::from_millis(300)); // t1 已 install + 进入真实等待
+        let lc2 = lc.clone();
+        let t2 = std::thread::spawn(move || lc2.start(port));
+        std::thread::sleep(Duration::from_millis(300)); // t2 已替换 child
+        let pids = pids.lock().unwrap().clone();
+        assert_eq!(pids.len(), 2, "two spawns happened");
+        assert!(!process_is_alive(pids[0]), "first child terminated before second spawn");
+        assert!(process_is_alive(pids[1]), "second child survives the stale first wait");
+        let err1 = t1.join().unwrap().unwrap_err();
+        assert!(err1.to_string().contains("stop intervened"), "stale wait aborts, got: {err1}");
+        lc.stop(); // 终止第二个 child → t2 的等待也中止
+        let err2 = t2.join().unwrap().unwrap_err();
+        assert!(err2.to_string().contains("stop intervened"), "got: {err2}");
+        assert!(!process_is_alive(pids[1]), "final stop terminates the second child");
+        assert_eq!(lc.status(), BackendStatus::Stopped);
+        assert!(!lc.snapshot().start_failed);
     }
 
     // ---- MINOR-1: atomic intent transition -----------------------------------
