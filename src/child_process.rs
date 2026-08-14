@@ -139,6 +139,12 @@ pub fn kill_registered_groups() {
     }
 }
 
+/// Test seam: snapshot of registered pids (backends' terminate/Drop pairing).
+#[cfg(test)]
+pub(crate) fn registered_pids() -> Vec<u32> {
+    exit_registry().lock().unwrap().clone()
+}
+
 /// Kill the process group led by `pid` (best effort, retried briefly).
 ///
 /// A SIGKILL sent during the spawn handshake can be delayed until the

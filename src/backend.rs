@@ -1,4 +1,5 @@
 use std::{
+    io,
     net::TcpStream,
     process::{Command, ExitStatus},
     sync::Mutex,
@@ -15,7 +16,16 @@ use tracing::warn;
 use command_group::GroupChild;
 
 use crate::child_process::port::{is_same_process_group, port_owner_pid};
-use crate::child_process::{kill_group, spawn_with_group, ManagedChild};
+use crate::child_process::{
+    kill_group, register_for_exit, spawn_with_group, unregister_for_exit, ManagedChild,
+};
+
+/// Test-only serialization for tests that touch the process-global exit
+/// registry (`EXIT_REGISTRY`): `kill_registered_groups` mem::takes the whole
+/// registry, so every register/unregister test must run one at a time.
+/// Module-level pub(crate) so child_process.rs tests can share it (Task 5).
+#[cfg(test)]
+pub(crate) static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Lifecycle status of the ALAS backend (the spawned gui.py process).
 ///
@@ -108,15 +118,33 @@ pub struct BackendStateSnapshot {
 
 pub struct ManagedBackend {
     child: Option<ManagedChild>,
+    #[cfg(test)]
+    #[expect(dead_code)] // read by Task 2's wait_for_ready (ready_skip short-circuit)
+    ready_skip: bool,
 }
 
 impl ManagedBackend {
-    pub fn new(port: u16) -> Result<Self> {
+    /// Spawn gui.py as the leader of a new process group and register it with
+    /// the exit registry — the spawn-window safety net (spec §3.1): even before
+    /// the child is installed in state, an exit sweep can group-kill it.
+    /// No readiness wait: that lives in `BackendLifecycle::wait_for_ready`.
+    pub fn spawn(port: u16) -> Result<Self> {
         std::env::set_var("ALAS_LAUNCHER_PID", format!("{}", std::process::id()));
         let mut cmd = Command::new("python");
         cmd.args(["gui.py", "--host", "127.0.0.1", "--port", &port.to_string()]);
         let child = spawn_with_group(&mut cmd)?;
-        let mut res = Self { child: Some(child) };
+        register_for_exit(&child);
+        Ok(Self {
+            child: Some(child),
+            #[cfg(test)]
+            ready_skip: false,
+        })
+    }
+
+    /// Spawn + 60s port-wait, fused (legacy shape kept until Task 2 moves the
+    /// wait into the lifecycle).
+    pub fn new(port: u16) -> Result<Self> {
+        let mut res = Self::spawn(port)?;
 
         let address = format!("127.0.0.1:{}", port).parse().unwrap();
         let start_time = std::time::Instant::now();
@@ -160,6 +188,7 @@ impl ManagedBackend {
 
     pub fn terminate(&mut self) -> Result<ExitStatus> {
         if let Some(mut child) = self.child.take() {
+            let pid = child.id();
             #[cfg(unix)]
             {
                 use command_group::Signal;
@@ -167,26 +196,65 @@ impl ManagedBackend {
                 let start_time = std::time::Instant::now();
                 while start_time.elapsed() < Duration::from_millis(500) {
                     if let Ok(Some(exit_status)) = child.try_wait() {
+                        // Round-2 (Oracle 2)：leader 退出 ≠ 组已死——uvicorn 子进程 /
+                        // 非 daemon multiprocessing 子进程可能存活。必须先 kill_group
+                        // 清组再注销，否则注销后 EXIT_REGISTRY 兜底失效（孤儿组）。
+                        // Round-4 (Oracle 1，同时解决 Momus 1 的测试确定性)：注销条件为
+                        // Ok **或 ESRCH**。ESRCH ⟺ 组已死（zombie 也算成员、kill 返回
+                        // Ok）→ 注销严格更优：清陈旧条目（防 pid 复用误杀），且注册表
+                        // 测试用 sleep 子进程（SIGTERM 即死 → kill_group ESRCH）可确定性
+                        // 通过。EPERM（组存活但不可杀）→ 不注销，registry best-effort 兜底。
+                        match kill_group(&mut child) {
+                            Ok(_) => unregister_for_exit(pid),
+                            // Round-5 终审（Momus+Oracle 一致）：libc 非直接依赖（Cargo.toml
+                            // 仅 nix 0.30 cfg(unix)），裸 libc::ESRCH 编译 E0433。改用
+                            // nix::errno::Errno::ESRCH as i32——Errno 全平台 #[repr(i32)]，
+                            // errno 模块无 feature 门控，仓库既有模式 child_process.rs:192。
+                            Err(e) if e.raw_os_error() == Some(nix::errno::Errno::ESRCH as i32) => {
+                                unregister_for_exit(pid)
+                            }
+                            Err(_) => {}
+                        }
                         return Ok(exit_status);
                     }
                     sleep(Duration::from_millis(100));
                 }
                 warn!("gui.py didn't exit, killing it...");
             }
+            // kill 失败 → 不注销：组可能还活着，registry 是退出兜底。
             kill_group(&mut child)?;
+            unregister_for_exit(pid);
             Ok(child.wait()?)
         } else {
             Ok(ExitStatus::default())
         }
     }
 
-    /// Test seam: wrap an already-spawned process group so lifecycle tests can
-    /// inject a fake backend without ever touching `new()` (and its 60s port
-    /// readiness wait).
+    /// Non-blocking exit poll for the readiness wait (Task 2's
+    /// `wait_for_ready` calls this on the installed child).
+    #[expect(dead_code)] // first call site lands in Task 2 (wait_for_ready)
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        match self.child.as_mut() {
+            Some(c) => c.try_wait(),
+            None => Ok(None),
+        }
+    }
+
+    /// Test seam: wrap an already-spawned process group so lifecycle tests
+    /// can inject a fake backend without touching `spawn()`. `ready_skip`
+    /// short-circuits the readiness wait (Task 2).
     #[cfg(test)]
     pub(crate) fn from_child(child: GroupChild) -> Self {
+        Self::from_managed_child(ManagedChild::from_group_child(child))
+    }
+
+    /// Test seam: same, from a `ManagedChild` (lets registry-pairing tests
+    /// register a real spawned group without invoking `spawn()`'s python).
+    #[cfg(test)]
+    pub(crate) fn from_managed_child(child: ManagedChild) -> Self {
         Self {
-            child: Some(ManagedChild::from_group_child(child)),
+            child: Some(child),
+            ready_skip: true,
         }
     }
 
@@ -200,21 +268,33 @@ impl ManagedBackend {
 
 impl Drop for ManagedBackend {
     fn drop(&mut self) {
+        // ALAS_LAUNCHER_PID 残留清扫（Round-1 修正 + Round-2 修正，双审 blocker）：
+        // 只在 Drop 入口 child 仍被持有（未被 terminate 取走 = 真泄漏）时执行。
+        // Round-2 关键修正：had_child 必须在 take **之前**捕获——`take()` 无条件
+        // 置 None，若在 if-let 之后检查 is_some() 恒为 false，清扫变死代码
+        // （panic 路径兜底 + 逃逸进程清扫全部丢失）。清扫会误杀并发 start 刚
+        // spawn 的同 ALAS_LAUNCHER_PID 子进程——但那只发生在 terminate 已 take
+        // child 的路径（had_child=false → 跳过 ✓）；had_child=true 时我们拥有
+        // child，清扫仅杀逃逸进程（kill 失败存活组由 EXIT_REGISTRY 兜底）。
+        let had_child = self.child.is_some();
         if let Some(mut child) = self.child.take() {
+            let pid = child.id();
             match kill_group(&mut child) {
-                Ok(_) => {}
+                Ok(_) => unregister_for_exit(pid),
                 Err(e) => warn!("Failed to kill gui.py process: {e}"),
             }
         }
-        // Kill potential leaked processes
-        let sys = sysinfo::System::new_all();
-        for (pid, process) in sys.processes() {
-            for var in process.environ() {
-                if pid.as_u32() != std::process::id()
-                    && var.to_str().unwrap_or_default()
-                        == format!("ALAS_LAUNCHER_PID={}", std::process::id())
-                {
-                    process.kill();
+        if had_child {
+            // Kill potential leaked processes
+            let sys = sysinfo::System::new_all();
+            for (pid, process) in sys.processes() {
+                for var in process.environ() {
+                    if pid.as_u32() != std::process::id()
+                        && var.to_str().unwrap_or_default()
+                            == format!("ALAS_LAUNCHER_PID={}", std::process::id())
+                    {
+                        process.kill();
+                    }
                 }
             }
         }
@@ -1058,5 +1138,43 @@ mod tests {
         // Running + degraded (password/SSL): legacy process-level stop.
         assert_eq!(toggle_decision(&running, true, false), ToggleAction::StopBackend);
         assert_eq!(toggle_decision(&running, false, false), ToggleAction::StopBackend);
+    }
+
+    /// The spawn()/terminate()/Drop registry pairing: registered at spawn,
+    /// dropped on terminate (after a successful group kill) and on Drop, so a
+    /// recycled pid can never be swept by a later exit.
+    #[test]
+    fn registry_wiring_spawn_terminate() {
+        let _g = REGISTRY_TEST_LOCK.lock().unwrap();
+        let mut cmd = Command::new("sleep");
+        cmd.arg("60");
+        let managed = crate::child_process::spawn_with_group(&mut cmd).unwrap();
+        let pid = managed.id();
+        crate::child_process::register_for_exit(&managed);
+        assert!(
+            crate::child_process::registered_pids().contains(&pid),
+            "registered child must appear in the exit registry"
+        );
+        let mut mb = ManagedBackend::from_managed_child(managed);
+        mb.terminate().unwrap();
+        assert!(
+            !crate::child_process::registered_pids().contains(&pid),
+            "terminate must unregister the child after a successful group kill"
+        );
+    }
+
+    #[test]
+    fn drop_unregisters_from_exit_registry() {
+        let _g = REGISTRY_TEST_LOCK.lock().unwrap();
+        let mut cmd = Command::new("sleep");
+        cmd.arg("60");
+        let managed = crate::child_process::spawn_with_group(&mut cmd).unwrap();
+        let pid = managed.id();
+        crate::child_process::register_for_exit(&managed);
+        drop(ManagedBackend::from_managed_child(managed));
+        assert!(
+            !crate::child_process::registered_pids().contains(&pid),
+            "Drop must unregister the child after a successful group kill"
+        );
     }
 }
