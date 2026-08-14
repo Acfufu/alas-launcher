@@ -1,10 +1,12 @@
 ////// Managed child processes: process-group spawn, timeout-wait, exit
 ////// registry and port-ownership probes (Momus ADVISORY-1/2, plan todo 7).
+////// 退出清理编排（cleanup_for_exit）也在此——紧邻它清空的 registry。
 
 use anyhow::{anyhow, Result};
 use command_group::{CommandGroup, GroupChild};
 use std::io;
 use std::process::{ChildStderr, ChildStdout, Command, ExitStatus};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -136,6 +138,41 @@ pub fn kill_registered_groups() {
     let pids = std::mem::take(&mut *exit_registry().lock().unwrap());
     for pid in pids {
         kill_process_group(pid);
+    }
+}
+
+/// Exit-time cleanup shared by `RunEvent::ExitRequested` and `RunEvent::Exit`
+/// (main.rs): halt the tray poll thread, group-kill every registered process
+/// (the spawn-window backend child included), then stop the backend.
+///
+/// Idempotent by construction: `tray_stop` is a plain store, the registry is
+/// `mem::take`d, and `BackendLifecycle::stop()` no-ops on a missing backend —
+/// so firing twice (window/tray quit fires ExitRequested then Exit) is safe,
+/// and macOS native quit (Cmd+Q / Dock, which skips ExitRequested and only
+/// fires Exit) still gets the cleanup.
+///
+/// Lives here rather than in main.rs so it is unit-testable without a tauri
+/// runtime, next to the registry it drains (backend ← child_process reverse
+/// reference is intentional, same-crate).
+#[allow(dead_code)] // wired by task 6 (main.rs ExitRequested/Exit arms)
+pub fn cleanup_for_exit(tray_stop: &AtomicBool, backend: &crate::backend::BackendLifecycle) {
+    tray_stop.store(true, Ordering::Relaxed);
+    kill_registered_groups();
+    backend.stop();
+    // Round-4 (Oracle 2)：setsid 守护化孙进程不在 registry 组内、且 terminate 路径的
+    // Drop 清扫被 had_child 门控跳过 → 正常退出会漏。退出时进程将亡，无并发 start
+    // 交叉风险，可安全补一次无条件 ALAS_LAUNCHER_PID 清扫（best-effort，见 spec §8）。
+    // ALAS 当前从不 setsid，此为防御性兜底。
+    let sys = sysinfo::System::new_all();
+    for (pid, process) in sys.processes() {
+        for var in process.environ() {
+            if pid.as_u32() != std::process::id()
+                && var.to_str().unwrap_or_default()
+                    == format!("ALAS_LAUNCHER_PID={}", std::process::id())
+            {
+                process.kill();
+            }
+        }
     }
 }
 
@@ -305,6 +342,7 @@ mod tests {
 
     #[test]
     fn exit_registry_register_and_unregister() {
+        let _g = crate::backend::REGISTRY_TEST_LOCK.lock().unwrap(); // 串行化全局 registry
         // Registered → kill_registered_groups() takes the group down.
         let mut child = spawn_long_running();
         register_for_exit(&child);
@@ -324,5 +362,31 @@ mod tests {
         );
         let _ = kill_group(&mut child2);
         let _ = child2.wait();
+    }
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    /// cleanup_for_exit must be idempotent: two calls (ExitRequested then Exit)
+    /// are safe, the tray stop flag stays set, the backend ends Stopped.
+    /// Round-3：内部调 kill_registered_groups（mem::take 全局 registry）→ 必须持
+    /// REGISTRY_TEST_LOCK；同时给既有 exit_registry_register_and_unregister 加同锁。
+    #[test]
+    fn cleanup_for_exit_is_idempotent() {
+        let _g = crate::backend::REGISTRY_TEST_LOCK.lock().unwrap();
+        let tray_stop = Arc::new(AtomicBool::new(false));
+        let lc = crate::backend::BackendLifecycle::new_with_spawner(|_| {
+            let mut cmd = Command::new("sleep");
+            cmd.arg("60");
+            let managed = spawn_with_group(&mut cmd).unwrap();
+            Ok(crate::backend::ManagedBackend::from_managed_child(managed))
+        });
+        lc.start(22267).unwrap();
+        assert_eq!(lc.status(), crate::backend::BackendStatus::Running);
+        cleanup_for_exit(&tray_stop, &lc);
+        cleanup_for_exit(&tray_stop, &lc); // 第二遍：全 no-op
+        assert!(tray_stop.load(Ordering::Relaxed), "tray stop flag stays set");
+        assert_eq!(lc.status(), crate::backend::BackendStatus::Stopped);
+        assert!(!lc.snapshot().start_failed);
     }
 }
