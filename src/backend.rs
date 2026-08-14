@@ -498,10 +498,15 @@ impl BackendLifecycle {
             }
             // 端口探测（无句柄依赖）。
             if TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
-                // MAJOR-3：归属校验（短锁取 pid；None → 已被 stop 取走）。
-                let spawned = match owner {
-                    Some(p) => p,
-                    None => return Err(anyhow!(STOP_INTERVENED)),
+                // MAJOR-3 用新鲜 pid（Round-F fix 2）：顶部 owner 在探测期间可能
+                // 已陈旧；短锁重读，被替换 → STOP_INTERVENED（⑤ 复检仍是最终裁决）。
+                let spawned = {
+                    let s = self.state.lock().unwrap();
+                    let cur = s.backend.as_ref().and_then(|b| b.pid());
+                    match (cur, my_pid) {
+                        (Some(p), Some(m)) if p == m => p,
+                        _ => return Err(anyhow!(STOP_INTERVENED)),
+                    }
                 };
 
                 match port_owner_pid(port) {
