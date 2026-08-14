@@ -85,6 +85,14 @@ fn main() -> Result<()> {
     // never calls set_menu on a disposed tray (Metis MAJOR-4).
     let tray_stop = Arc::new(AtomicBool::new(false));
     let setup_tray_stop = tray_stop.clone();
+    // MAJOR-4: tray poll thread's JoinHandle slot (issue #1). build_tray fills
+    // it (macOS only); cleanup_for_exit takes and joins the handle before
+    // tauri's cleanup_before_exit, so set_menu can never race tray teardown.
+    // Unconditional like tray_stop — cleanup_for_exit runs on every platform.
+    let tray_poll_handle: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    #[cfg(target_os = "macos")]
+    let setup_tray_poll_handle = tray_poll_handle.clone();
 
     // Shared shell settings (macOS app menu). Created in main() scope — the
     // setup closure (menu build + events) and the run closure (todo 6
@@ -143,6 +151,7 @@ fn main() -> Result<()> {
                     port,
                     setup_tray_stop.clone(),
                     setup_shell_settings.clone(),
+                    setup_tray_poll_handle.clone(),
                 ) {
                     // build_tray returns the poll-thread refresh channel (todo
                     // 4 wake mechanism): the language handler below sends on
@@ -453,14 +462,14 @@ fn main() -> Result<()> {
                     // Stop the tray poll thread BEFORE terminating the backend:
                     // it must never set_menu on a disposed tray (Metis MAJOR-4).
                     // Idempotent — Exit also fires on this path.
-                    crate::child_process::cleanup_for_exit(&tray_stop, &backend);
+                    crate::child_process::cleanup_for_exit(&tray_stop, &tray_poll_handle, &backend);
                 }
                 tauri::RunEvent::Exit => {
                     // Final cleanup for paths that skip ExitRequested — macOS
                     // Cmd+Q / Dock Quit (NSApp terminate) fires ONLY this event
                     // (V4: CloseRequested and ExitRequested never fire there).
                     info!("App exiting, final backend cleanup...");
-                    crate::child_process::cleanup_for_exit(&tray_stop, &backend);
+                    crate::child_process::cleanup_for_exit(&tray_stop, &tray_poll_handle, &backend);
                 }
                 tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::CloseRequested { .. }, .. } => {
                     info!("Window {} closed", label);

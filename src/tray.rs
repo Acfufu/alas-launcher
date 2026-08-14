@@ -101,6 +101,10 @@ pub fn build_tray(
     port: u16,
     stop: Arc<AtomicBool>,
     settings: Arc<Mutex<crate::shell_settings::ShellSettings>>,
+    // MAJOR-4: the poll thread's JoinHandle lands here; cleanup_for_exit
+    // (child_process.rs) takes and joins it before tauri tears down the tray,
+    // so set_menu can never race cleanup_before_exit (issue #1, #12534).
+    poll_handle: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
 ) -> tauri::Result<(tauri::tray::TrayIcon, mpsc::Sender<()>)> {
     let (refresh_tx, refresh_rx) = mpsc::channel::<()>();
     let shared = TrayShared {
@@ -176,7 +180,7 @@ pub fn build_tray(
     // (rebuild_menu reaches it through the app handle).
     let app_handle = app.handle().clone();
     let _thread_tray = tray.clone();
-    std::thread::spawn(move || {
+    let handle = std::thread::spawn(move || {
         let mut last_section = TaskSection::Empty;
         // Last rendered scheduler-liveness (None = unknown / backend not
         // running); a flip forces a status-line rebuild even when the task
@@ -215,6 +219,10 @@ pub fn build_tray(
         }
     }
     });
+    // MAJOR-4: hand the handle to cleanup_for_exit (via the main.rs slot) —
+    // it joins this thread before tauri's cleanup_before_exit tears down the
+    // tray, making the set_menu-vs-teardown race deterministic (issue #1).
+    *poll_handle.lock().unwrap() = Some(handle);
 
     Ok((tray, refresh_tx))
 }

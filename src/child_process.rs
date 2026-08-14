@@ -146,17 +146,39 @@ pub fn kill_registered_groups() {
 /// (main.rs): halt the tray poll thread, group-kill every registered process
 /// (the spawn-window backend child included), then stop the backend.
 ///
-/// Idempotent by construction: `tray_stop` is a plain store, the registry is
-/// `mem::take`d, and `BackendLifecycle::stop()` no-ops on a missing backend —
-/// so firing twice (window/tray quit fires ExitRequested then Exit) is safe,
-/// and macOS native quit (Cmd+Q / Dock, which skips ExitRequested and only
-/// fires Exit) still gets the cleanup.
+/// Metis MAJOR-4 (issue #1): the poll thread must be JOINED before this
+/// function returns — tauri's `cleanup_before_exit` clears the tray resource
+/// table right after the run-event handler returns, so any `set_menu` still
+/// in flight would touch disposed resources and panic (#12534). Taking the
+/// `JoinHandle` out of `poll_handle` and joining makes that impossible:
+/// once joined, no `set_menu` can ever run again. The join is bounded in
+/// practice — the poll loop wakes at most every 3s (`recv_timeout`) plus one
+/// in-flight `poll_once` (ms-scale; worst ~5s control-api timeout), and the
+/// poll thread never blocks on the main thread, so no deadlock. On
+/// non-macOS the slot is never filled and the join is a no-op.
+///
+/// Idempotent by construction: `tray_stop` is a plain store, `poll_handle` is
+/// `take`n (second call sees `None`), the registry is `mem::take`d, and
+/// `BackendLifecycle::stop()` no-ops on a missing backend — so firing twice
+/// (window/tray quit fires ExitRequested then Exit) is safe, and macOS native
+/// quit (Cmd+Q / Dock, which skips ExitRequested and only fires Exit) still
+/// gets the cleanup.
 ///
 /// Lives here rather than in main.rs so it is unit-testable without a tauri
 /// runtime, next to the registry it drains (backend ← child_process reverse
 /// reference is intentional, same-crate).
-pub fn cleanup_for_exit(tray_stop: &AtomicBool, backend: &crate::backend::BackendLifecycle) {
+pub fn cleanup_for_exit(
+    tray_stop: &AtomicBool,
+    poll_handle: &std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    backend: &crate::backend::BackendLifecycle,
+) {
     tray_stop.store(true, Ordering::Relaxed);
+    // MAJOR-4: join BEFORE killing the backend — the poll thread is still
+    // doing harmless backend-status reads during the join; the tray itself is
+    // alive until tauri's cleanup_before_exit, which runs after we return.
+    if let Some(handle) = poll_handle.lock().unwrap().take() {
+        let _ = handle.join();
+    }
     kill_registered_groups();
     backend.stop();
     // Round-4 (Oracle 2)：setsid 守护化孙进程不在 registry 组内、且 terminate 路径的
@@ -365,7 +387,7 @@ mod tests {
     }
 
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     /// cleanup_for_exit must be idempotent: two calls (ExitRequested then Exit)
     /// are safe, the tray stop flag stays set, the backend ends Stopped.
@@ -375,6 +397,7 @@ mod tests {
     fn cleanup_for_exit_is_idempotent() {
         let _g = crate::backend::REGISTRY_TEST_LOCK.lock().unwrap();
         let tray_stop = Arc::new(AtomicBool::new(false));
+        let poll_handle: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
         let lc = crate::backend::BackendLifecycle::new_with_spawner(|_| {
             let mut cmd = Command::new("sleep");
             cmd.arg("60");
@@ -383,10 +406,38 @@ mod tests {
         });
         lc.start(22267).unwrap();
         assert_eq!(lc.status(), crate::backend::BackendStatus::Running);
-        cleanup_for_exit(&tray_stop, &lc);
-        cleanup_for_exit(&tray_stop, &lc); // 第二遍：全 no-op
+        cleanup_for_exit(&tray_stop, &poll_handle, &lc);
+        cleanup_for_exit(&tray_stop, &poll_handle, &lc); // 第二遍：全 no-op
         assert!(tray_stop.load(Ordering::Relaxed), "tray stop flag stays set");
         assert_eq!(lc.status(), crate::backend::BackendStatus::Stopped);
         assert!(!lc.snapshot().start_failed);
+    }
+
+    /// MAJOR-4 join contract: after cleanup_for_exit returns, the poll thread
+    /// must be joined (dead) — no set_menu can race tauri's cleanup_before_exit.
+    /// A parked thread (the 3s recv_timeout analog) must be reaped within the
+    /// call, and the second call must be a no-op (handle already taken).
+    #[test]
+    fn cleanup_for_exit_joins_poll_thread() {
+        let _g = crate::backend::REGISTRY_TEST_LOCK.lock().unwrap();
+        let tray_stop = Arc::new(AtomicBool::new(false));
+        let poll_handle: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+        let thread_done = Arc::new(AtomicBool::new(false));
+        let thread_stop = tray_stop.clone();
+        let thread_done_clone = thread_done.clone();
+        let handle = std::thread::spawn(move || {
+            while !thread_stop.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            thread_done_clone.store(true, Ordering::Relaxed);
+        });
+        *poll_handle.lock().unwrap() = Some(handle);
+        let lc = crate::backend::BackendLifecycle::default();
+        cleanup_for_exit(&tray_stop, &poll_handle, &lc);
+        assert!(
+            thread_done.load(Ordering::Relaxed),
+            "poll thread must be joined before cleanup_for_exit returns"
+        );
+        cleanup_for_exit(&tray_stop, &poll_handle, &lc); // 第二遍：handle 已 take，no-op
     }
 }
