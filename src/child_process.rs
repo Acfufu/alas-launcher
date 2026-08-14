@@ -129,8 +129,9 @@ pub fn unregister_for_exit(pid: u32) {
     exit_registry().lock().unwrap().retain(|p| *p != pid);
 }
 
-/// Kill every registered process group (best effort). Called from the main
-/// thread's ExitRequested. Unix: SIGKILL to each group. Windows: no queryable
+/// Kill every registered process group (best effort). Called from
+/// `cleanup_for_exit`, which the main thread runs on both `RunEvent::ExitRequested`
+/// and `RunEvent::Exit`. Unix: SIGKILL to each group. Windows: no queryable
 /// job handle exists from a pid, so the registered leader is killed via
 /// sysinfo — the launcher is exiting anyway, and `ManagedBackend`'s Drop runs
 /// the ALAS_LAUNCHER_PID residue scan for backend children.
@@ -154,7 +155,6 @@ pub fn kill_registered_groups() {
 /// Lives here rather than in main.rs so it is unit-testable without a tauri
 /// runtime, next to the registry it drains (backend ← child_process reverse
 /// reference is intentional, same-crate).
-#[allow(dead_code)] // wired by task 6 (main.rs ExitRequested/Exit arms)
 pub fn cleanup_for_exit(tray_stop: &AtomicBool, backend: &crate::backend::BackendLifecycle) {
     tray_stop.store(true, Ordering::Relaxed);
     kill_registered_groups();

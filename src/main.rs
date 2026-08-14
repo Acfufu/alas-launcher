@@ -46,7 +46,7 @@ mod window_util;
 use std::{
     fs,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::AtomicBool,
         Arc,
     },
     thread::{self},
@@ -452,12 +452,15 @@ fn main() -> Result<()> {
                     info!("Webview closed, shutting down backend...");
                     // Stop the tray poll thread BEFORE terminating the backend:
                     // it must never set_menu on a disposed tray (Metis MAJOR-4).
-                    tray_stop.store(true, Ordering::Relaxed);
-                    // Group-kill any subprocess the Ready thread registered
-                    // (e.g. the git update spawned during setup) — closing the
-                    // window mid-update must not orphan its git/pip tree.
-                    crate::child_process::kill_registered_groups();
-                    backend.stop();
+                    // Idempotent — Exit also fires on this path.
+                    crate::child_process::cleanup_for_exit(&tray_stop, &backend);
+                }
+                tauri::RunEvent::Exit => {
+                    // Final cleanup for paths that skip ExitRequested — macOS
+                    // Cmd+Q / Dock Quit (NSApp terminate) fires ONLY this event
+                    // (V4: CloseRequested and ExitRequested never fire there).
+                    info!("App exiting, final backend cleanup...");
+                    crate::child_process::cleanup_for_exit(&tray_stop, &backend);
                 }
                 tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::CloseRequested { .. }, .. } => {
                     info!("Window {} closed", label);
