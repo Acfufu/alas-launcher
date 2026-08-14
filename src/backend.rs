@@ -1439,4 +1439,41 @@ mod tests {
             "Drop must unregister the child after a successful group kill"
         );
     }
+
+    /// MAJOR-3: a foreign listener on the port must fail the start with the
+    /// stale-server error and dispose the child.
+    #[test]
+    fn wait_ready_rejects_stale_server() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // listener 保持存活：占用端口（测试进程自己持有）。
+        let lc = BackendLifecycle::new_with_spawner(|_| {
+            let mut cmd = Command::new("sleep");
+            cmd.arg("60");
+            Ok(ManagedBackend::from_child_unchecked(cmd.group_spawn().unwrap()))
+        });
+        let err = lc.start(port).unwrap_err();
+        assert!(err.to_string().contains("occupied by pid"), "got: {err}");
+        let s = lc.snapshot();
+        assert_eq!(s.status, BackendStatus::Stopped);
+        assert!(s.start_failed);
+        assert_eq!(lc.backend_pid(), None);
+    }
+
+    /// MINOR-6: a child that exits before the port is ready fails fast with the
+    /// early-exit error (no 60s wait).
+    #[test]
+    fn wait_ready_detects_early_exit() {
+        let port = free_ephemeral_port();
+        let lc = BackendLifecycle::new_with_spawner(|_| {
+            let mut cmd = Command::new("sleep");
+            cmd.arg("0"); // 立即退出
+            Ok(ManagedBackend::from_child_unchecked(cmd.group_spawn().unwrap()))
+        });
+        let err = lc.start(port).unwrap_err();
+        assert!(err.to_string().contains("exited before becoming ready"), "got: {err}");
+        assert_eq!(lc.status(), BackendStatus::Stopped);
+        assert!(lc.snapshot().start_failed);
+        assert_eq!(lc.backend_pid(), None);
+    }
 }
