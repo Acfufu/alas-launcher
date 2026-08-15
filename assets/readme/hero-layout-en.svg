@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200" height="420" viewBox="0 0 1200 420"
+     role="img" aria-labelledby="title desc">
+  <title id="title">ALAS Launcher</title>
+  <desc id="desc">ALAS Launcher launches AzurLaneAutoScript natively on Windows, macOS, and Linux; the screenshot card shows the real ALAS Web UI it opens.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#081B30"/>
+      <stop offset="0.55" stop-color="#0C2440"/>
+      <stop offset="1" stop-color="#143152"/>
+    </linearGradient>
+    <linearGradient id="chipg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1B3A5F"/>
+      <stop offset="1" stop-color="#132C4A"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#4CC9F0" stop-opacity="0.3"/>
+      <stop offset="1" stop-color="#4CC9F0" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1200" height="420" rx="26" fill="url(#bg)"/>
+  <rect x="1" y="1" width="1198" height="418" rx="25" fill="none" stroke="#2E5A8A" stroke-opacity="0.55" stroke-width="2"/>
+
+  <!-- radar decoration behind the screenshot card -->
+  <g id="radar">
+    <circle cx="936" cy="212" r="170" fill="url(#glow)"/>
+    <g fill="none" stroke="#4CC9F0" stroke-opacity="0.22">
+      <circle cx="936" cy="212" r="64"/>
+      <circle cx="936" cy="212" r="116"/>
+      <circle cx="936" cy="212" r="168"/>
+    </g>
+    <line x1="936" y1="212" x2="1068" y2="128" stroke="#4CC9F0" stroke-width="3" stroke-linecap="round"/>
+    <circle cx="1068" cy="128" r="7" fill="#4CC9F0"/>
+    <circle cx="868" cy="296" r="5" fill="#F0B429"/>
+  </g>
+
+  <!-- real UI screenshot card (raster subject) -->
+  <g id="shot">
+    <rect x="700" y="76" width="432" height="272" rx="16" fill="#0A2138" stroke="#2E5A8A" stroke-opacity="0.95" stroke-width="2"/>
+    <image href="screenshot-mac-en.webp" x="716" y="92" width="400" height="240" preserveAspectRatio="xMidYMid slice"/>
+    <rect x="716" y="92" width="400" height="240" rx="8" fill="none" stroke="#4CC9F0" stroke-opacity="0.4" stroke-width="1.5"/>
+    <circle cx="736" cy="78" r="4" fill="#4CC9F0"/>
+    <text x="750" y="83" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="15" fill="#8FC7E8">LIVE WEB UI</text>
+    <rect x="1004" y="316" width="112" height="26" rx="13" fill="#122B49" stroke="#2E5A8A" stroke-opacity="0.9"/>
+    <text x="1060" y="334" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14" fill="#7FD4F2" text-anchor="middle">127.0.0.1:22267</text>
+  </g>
+
+  <!-- anchor badge -->
+  <g id="anchor">
+    <g transform="translate(92,84)" fill="none" stroke="#4CC9F0" stroke-width="7" stroke-linecap="round">
+      <circle cx="28" cy="8" r="8"/>
+      <line x1="28" y1="16" x2="28" y2="82"/>
+      <path d="M28 82 Q28 112 0 112 M28 82 Q28 112 56 112"/>
+      <path d="M6 98 Q28 120 50 98"/>
+      <line x1="10" y1="34" x2="46" y2="34"/>
+    </g>
+    <circle cx="124" cy="84" r="4" fill="#F0B429"/>
+  </g>
+
+  <!-- title -->
+  <g id="title-block">
+    <text x="136" y="108" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="58" font-weight="700" fill="#F5F9FF" letter-spacing="1">ALAS Launcher</text>
+    <rect x="138" y="128" width="200" height="5" rx="2.5" fill="#4CC9F0"/>
+  </g>
+
+  <!-- tech badges -->
+  <g id="pills">
+    <rect x="138" y="150" width="78" height="28" rx="14" fill="#122B49" stroke="#2E5A8A" stroke-opacity="0.8"/>
+    <text x="177" y="169" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14" fill="#8FC7E8" text-anchor="middle">Rust</text>
+    <rect x="228" y="150" width="88" height="28" rx="14" fill="#122B49" stroke="#2E5A8A" stroke-opacity="0.8"/>
+    <text x="272" y="169" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14" fill="#8FC7E8" text-anchor="middle">Tauri 2</text>
+    <rect x="328" y="150" width="100" height="28" rx="14" fill="#122B49" stroke="#2E5A8A" stroke-opacity="0.8"/>
+    <text x="378" y="169" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14" fill="#8FC7E8" text-anchor="middle">GPLv3</text>
+  </g>
+
+  <!-- description -->
+  <g id="desc-block">
+    <text x="136" y="218" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="24" fill="#C9DDF2">A native launcher for <tspan fill="#7FD4F2">AzurLaneAutoScript</tspan>:</text>
+    <text x="136" y="252" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="24" fill="#C9DDF2">no Docker, no translation layer - unzip and play.</text>
+  </g>
+
+  <!-- platform cards -->
+  <g id="chips">
+        <g id="chip-0"><rect x="140" y="296" width="196" height="54" rx="14" fill="url(#chipg)" stroke="#2E5A8A" stroke-opacity="0.9"/><text x="238" y="329" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="20" font-weight="600" fill="#F0F6FD" text-anchor="middle">Windows</text></g>
+    <g id="chip-1"><rect x="360" y="296" width="196" height="54" rx="14" fill="url(#chipg)" stroke="#2E5A8A" stroke-opacity="0.9"/><text x="458" y="329" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="20" font-weight="600" fill="#F0F6FD" text-anchor="middle">macOS · Native</text></g>
+    <g id="chip-2"><rect x="600" y="296" width="196" height="54" rx="14" fill="url(#chipg)" stroke="#2E5A8A" stroke-opacity="0.9"/><text x="698" y="329" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="20" font-weight="600" fill="#F0F6FD" text-anchor="middle">Linux</text></g>
+  </g>
+
+  <!-- footer metadata -->
+  <g id="meta">
+    <text x="136" y="392" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="17" fill="#6E8FB0">Single instance · Repo-only updates · Portable Python · Re-launch refocuses the window</text>
+  </g>
+</svg>
