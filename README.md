@@ -4,31 +4,26 @@
 
 基于 Tauri 2（Rust）的桌面启动器，在 Windows、macOS、Linux 上原生启动 [AzurLaneAutoScript](https://github.com/LmeSzinc/AzurLaneAutoScript)（ALAS）：不经过转译层、不依赖 Docker，启动后自动准备环境、更新仓库并打开本地 Web UI。
 
-## 界面一览
-
-| macOS | Windows |
-| --- | --- |
-| ![macOS 上 ALAS Launcher 的桌面 Web UI 截图，显示 ALAS 首页任务面板](screenshots/mac-cn.webp) | ![Windows 上 ALAS Launcher 的桌面 Web UI 截图，显示 ALAS 首页任务面板](screenshots/win-cn.webp) |
+![ALAS Launcher 混合英雄图：左侧为 ALAS 启动器标题、技术徽章、平台卡片与「无需 Docker、解压即用」说明；右侧卡片内嵌真实 macOS 上 ALAS Web UI 界面截图，标注 127.0.0.1:22267](assets/readme/hero-zh.webp)
 
 ### macOS 菜单栏速览
 
-macOS 上带菜单栏图标：不用打开窗口就能查看 ALAS 任务列表、启停调度器。
+macOS 专属的原生适配：菜单栏常驻 ALAS 舰船图标，调度器状态、任务列表、启停开关都收进原生菜单栏——**不打开窗口即可查看和控制当前运行情况**。
 
-![ALAS 菜单栏动图：点击菜单栏舰船图标弹出原生菜单，显示调度器运行状态与启动/停止开关（Web UI 保持存活）；随后展示 Web UI 调度器按「运行中 / 队列中 / 等待中」分组的真实 ALAS 任务列表（含下次调度时间）与主窗口](assets/readme/tray-zh.gif)
+<p align="center"><img src="assets/readme/tray-menu.png" width="56%" alt="macOS 菜单栏速览实拍：ALAS 调度器运行状态、任务列表与启停开关"></p>
+<p align="center"><sub>菜单栏任务列表与调度器启停 · <a href="screenshots/mac-cn.webp">完整 Web UI 截图</a></sub></p>
 
 - **任务列表实时可见**：与 Web UI 调度器一致，按「运行中 / 队列中 / 等待中」分组展示真实 ALAS 任务（数据来自 `config/alas.json`）与下次调度时间；每组最多 3 条，3 秒自动刷新，也可手动刷新。
 - **调度器一键启停**：菜单开关控制的是 ALAS 调度器而非后端进程——停止调度器后 Web UI 保持存活；后端未运行时点击开关会先启动后端。
 - **仅 macOS**：菜单栏图标目前只在 macOS 上启用，Windows / Linux 构建不受影响。
 
-动图无法播放时，可查看[静态截图版](screenshots/mac-cn.webp)。
-
-## 它能做什么
+## 它怎么工作
 
 启动器把「准备环境 → 更新仓库 → 启动 Web UI」整条链路自动化：
 
-![ALAS 启动器工作流：启动器 → 环境配置（PATH/LD_LIBRARY_PATH）→ 读取 config/deploy.yaml 的 WebuiPort（默认 22267）→ 清理配置并更新 ALAS Git 仓库 → 启动 gui.py → Tauri WebView 导航到本地 Web UI；更新失败时启动画面显示错误，窗口关闭时后端被终止](assets/readme/workflow-zh.svg)
+![ALAS 启动器启动流程动图：初始化环境（注入 PATH 与 LD_LIBRARY_PATH，读取 WebuiPort 默认 22267）→ 更新仓库（清理配置并拉取最新 ALAS）→ 启动 Web 服务（gui.py --host 127.0.0.1 --port 22267）→ 就绪（WebView 打开本地 ALAS Web UI）](assets/readme/workflow-animated-zh.svg)
 
-1. **初始化**：准备运行环境（PATH、LD_LIBRARY_PATH 等），从 `config/deploy.yaml` 读取 Web UI 端口。
+1. **初始化**：准备运行环境（PATH、LD_LIBRARY_PATH 等），从 `config/deploy.yaml` 读取 Web UI 端口（默认 `22267`）。
 2. **更新**：清理 ALAS 配置目录，拉取 ALAS 仓库更新。
 3. **启动**：在本机端口启动 `gui.py`（`gui.py --host 127.0.0.1 --port <配置端口>`）。
 4. **就绪**：Tauri WebView 打开本地 Web UI，显示 `Ready · 127.0.0.1:<端口>`。
@@ -36,6 +31,8 @@ macOS 上带菜单栏图标：不用打开窗口就能查看 ALAS 任务列表�
 仓库更新失败时，启动画面会继续显示错误信息；退出启动器时，后端进程会被终止。adb 替换、pip 自动更新和远程访问不属于启动器职责。
 
 ## 与官方版的差异
+
+![官方版与 ALAS Launcher 启动行为对比：左侧官方版启动时杀进程、更新 pip、更新 Electron 资源、重启 adb；右侧本版本只更新仓库，无其他副作用操作](assets/readme/compare-zh.svg)
 
 | 能力 | 官方版 | 本版本 |
 | --- | --- | --- |
