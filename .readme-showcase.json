@@ -1,0 +1,8 @@
+{
+  "scanner": {
+    "profile": "deep",
+    "tracked_only": true,
+    "include": ["**"],
+    "exclude": ["icons/icon.icns"]
+  }
+}
