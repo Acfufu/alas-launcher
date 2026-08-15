@@ -93,6 +93,7 @@ pub fn setup_alas_repo(mut status_updater: impl FnMut(&str)) -> Result<()> {
     atomic_failure_cleanup("./config")?;
     status_updater("Updating ALAS");
     git_update(&mut status_updater)?;
+    apply_sparse_checkout(&mut status_updater);
     status_updater("Applying control API patch");
     match crate::patch::apply_patch(&alas_repo_dir()) {
         Ok(crate::patch::PatchOutcome::Applied) => {
@@ -110,6 +111,32 @@ pub fn setup_alas_repo(mut status_updater: impl FnMut(&str)) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Exclude the upstream Electron launcher (`webapp/`) from the worktree.
+///
+/// `webapp/` is dead upstream (frozen since 2022-01-16), yet every
+/// `git reset --hard` materializes it into each install. Sparse-checkout
+/// state (`.git/info/sparse-checkout` + `core.sparseCheckout`) survives both
+/// update paths in `deploy.git.GitManager`: `git_repository_init`
+/// (reset --hard + pull --ff-only) and the GitOverCdn pack download (raw git
+/// pack objects, ends in the same reset --hard) — verified empirically.
+/// Non-cone denylist (`/*` + `!webapp/`): any new upstream top-level dir is
+/// included automatically, unlike a cone-mode allowlist. Fail-soft: old git
+/// (<2.25, no sparse-checkout) or a broken repo degrades to keeping webapp/
+/// instead of blocking the launch.
+fn apply_sparse_checkout(status_updater: &mut impl FnMut(&str)) {
+    status_updater("Excluding webapp (dead Electron launcher)");
+    let dir = alas_repo_dir();
+    let status = Command::new("git")
+        .current_dir(&dir)
+        .args(["sparse-checkout", "set", "--no-cone", "/*", "!webapp/"])
+        .status();
+    match status {
+        Ok(s) if s.success() => info!("sparse checkout applied: excluded webapp/ in {:?}", dir),
+        Ok(s) => warn!("sparse checkout failed with {s}; keeping webapp/"),
+        Err(e) => warn!("sparse checkout failed: {e:#}; keeping webapp/"),
+    }
 }
 
 pub fn get_deploy_config() -> Option<JsonValue> {
