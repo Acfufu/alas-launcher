@@ -14,6 +14,7 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Snapshot of one candidate process (filled by the discovery pass).
 #[derive(Clone)]
@@ -221,6 +222,217 @@ fn real_enumerate() -> Vec<Candidate> {
             }
         })
         .collect()
+}
+
+/// One surviving stale process, rendered for the user-facing error payload.
+#[derive(Debug, Clone)]
+pub struct StaleProcessInfo {
+    pub pid: u32,
+    pub cmdline: String,
+    pub evidence: String,
+}
+
+/// Why stale cleanup did not (fully) succeed.
+#[derive(Debug)]
+pub enum StaleCleanupError {
+    /// Processes still alive after `u8` convergence rounds.
+    Survivors(Vec<StaleProcessInfo>, u8),
+    /// The port is held by a live process that is NOT a stale ALAS backend —
+    /// killing it would be wrong, so the start is refused instead.
+    ForeignPortOwner { port: u16, pid: u32, cmdline: String },
+}
+
+impl std::fmt::Display for StaleCleanupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Survivors(v, r) => write!(
+                f,
+                "Failed to clean up stale ALAS processes after {} attempts: {}",
+                r,
+                v.iter()
+                    .map(|i| format!("pid {}: {}", i.pid, i.cmdline))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::ForeignPortOwner { port, pid, cmdline } => write!(
+                f,
+                "Port {} is occupied by a non-ALAS process (pid {}: {})",
+                port, pid, cmdline
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StaleCleanupError {}
+
+// Stub for Task 3 compilation — real_kill lands in Task 6.
+fn real_kill(_pid: u32) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Production entry point: converge stale ALAS processes on `port` to zero
+/// within 10 rounds (200 ms apart), reporting progress via `progress`.
+pub fn kill_stale_alas(port: u16, progress: &dyn Fn(&str)) -> Result<(), StaleCleanupError> {
+    let repo = crate::setup::try_alas_repo_dir();
+    kill_stale_alas_with_injection(
+        port,
+        progress,
+        repo.as_deref(),
+        &real_enumerate,
+        &crate::child_process::port::port_owner_pid,
+        &crate::child_process::is_registered,
+        &mut real_kill,
+        10,
+        Duration::from_millis(200),
+    )
+}
+
+fn kill_stale_alas_with_injection(
+    port: u16,
+    progress: &dyn Fn(&str),
+    repo: Option<&Path>,
+    enumerate: &dyn Fn() -> Vec<Candidate>,
+    port_owner: &dyn Fn(u16) -> Option<u32>,
+    is_registered: &dyn Fn(u32) -> bool,
+    kill: &mut dyn FnMut(u32) -> std::io::Result<()>,
+    max_rounds: u8,
+    sleep: Duration,
+) -> Result<(), StaleCleanupError> {
+    let launcher_pid = std::process::id();
+    #[cfg(unix)]
+    let launcher_pgid = nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(
+        launcher_pid as i32,
+    )))
+    .ok()
+    .map(|p| p.as_raw() as u32);
+    #[cfg(windows)]
+    let launcher_pgid: Option<u32> = None;
+    // AppTranslocation detect
+    if let Ok(exe) = std::env::current_exe() {
+        if exe.components().any(|c| c.as_os_str() == "AppTranslocation") {
+            tracing::warn!("running under AppTranslocation — stale cleanup may be degraded");
+        }
+    }
+    let mut round_survivors: Vec<StaleProcessInfo> = Vec::new();
+    for round in 1..=max_rounds {
+        let raw = collect_raw_candidates(port, repo, enumerate, port_owner);
+        if raw.is_empty() {
+            return Ok(());
+        }
+        // Port owner interception — X vs no-evidence routing (FR2.3, FR1.4)
+        if let Some(owner_pid) = port_owner(port) {
+            if let Some(c) = raw.iter().find(|c| c.pid == owner_pid) {
+                let passes_x = c.pid != launcher_pid
+                    && !is_registered(c.pid)
+                    && match (c.pgid, launcher_pgid) {
+                        (Some(a), Some(b)) => a != b,
+                        _ => true,
+                    };
+                if passes_x {
+                    if is_stale_candidate(c, repo, port, launcher_pid, launcher_pgid, is_registered)
+                        .is_none()
+                    {
+                        let cmd_s = c
+                            .cmd
+                            .iter()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let cmdline = truncate_cmd(&cmd_s);
+                        return Err(StaleCleanupError::ForeignPortOwner {
+                            port,
+                            pid: owner_pid,
+                            cmdline,
+                        });
+                    }
+                    // passes_x && F+E — will be killed via verified below
+                } else {
+                    // X veto (same pgid or registered) — count as survivor with
+                    // detailed evidence per FR2.3/T3
+                    let cmd_s = c
+                        .cmd
+                        .iter()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let which_x = if c.pid == launcher_pid {
+                        "X1 self"
+                    } else if is_registered(c.pid) {
+                        "X3 registered"
+                    } else {
+                        "X2 same pgid"
+                    };
+                    round_survivors.push(StaleProcessInfo {
+                        pid: owner_pid,
+                        cmdline: truncate_cmd(&cmd_s),
+                        evidence: format!("{} F/E {:?}", which_x, c.cmd),
+                    });
+                }
+            }
+        }
+        if !round_survivors.is_empty() {
+            // X-intercepted survivors present — do not early-Ok, collect
+            // verified as well and kill
+        }
+        let verified: Vec<&Candidate> = raw
+            .iter()
+            .filter(|c| {
+                is_stale_candidate(c, repo, port, launcher_pid, launcher_pgid, is_registered)
+                    .is_some()
+            })
+            .collect();
+        if verified.is_empty() && round_survivors.is_empty() {
+            tracing::warn!(
+                "stale candidates filtered out (F/E): pids {:?} — possible F-anchor breakage",
+                raw.iter().map(|c| c.pid).collect::<Vec<_>>()
+            );
+            return Ok(());
+        }
+        // Kill verified only (X-survivors not killed per veto) — per-kill
+        // tracing per FR1.5
+        for c in &verified {
+            let evidence =
+                is_stale_candidate(c, repo, port, launcher_pid, launcher_pgid, is_registered);
+            match kill(c.pid) {
+                Ok(_) => tracing::info!(
+                    "killed pid {} pgid {:?} evidence {:?} cmd {:?}",
+                    c.pid,
+                    c.pgid,
+                    evidence,
+                    c.cmd
+                ),
+                Err(e) => tracing::error!("failed to kill pid {}: {}", c.pid, e),
+            }
+        }
+        progress(&format!(
+            "Cleaning up stale ALAS processes (round {round}/{max_rounds})..."
+        ));
+        std::thread::sleep(sleep);
+        // On final round, build survivors payload from this round's verified +
+        // X-intercepted (ensures non-empty per FR1.4)
+        if round == max_rounds {
+            let mut final_survivors = round_survivors.clone();
+            for c in &verified {
+                let cmd_s = c
+                    .cmd
+                    .iter()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                final_survivors.push(StaleProcessInfo {
+                    pid: c.pid,
+                    cmdline: truncate_cmd(&cmd_s),
+                    evidence: "verified survivor".into(),
+                });
+            }
+            if !final_survivors.is_empty() {
+                return Err(StaleCleanupError::Survivors(final_survivors, max_rounds));
+            }
+            return Ok(());
+        }
+        round_survivors.clear();
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -542,5 +754,231 @@ mod tests {
             ],
         };
         assert!(is_stale_candidate(&cand_bad, Some(&repo), 22267, 99, None, &|_| false).is_none());
+    }
+
+    // ---- T3: convergence loop (kill_stale_alas_with_injection) ----
+
+    fn lb_candidate(pid: u32, pgid: u32, exe: PathBuf) -> Candidate {
+        Candidate {
+            pid,
+            pgid: Some(pgid),
+            exe: Some(exe),
+            cwd: None,
+            environ: vec![],
+            cmd: vec![
+                "python".into(),
+                "gui.py".into(),
+                "--port".into(),
+                "22267".into(),
+            ],
+        }
+    }
+
+    #[test]
+    fn raw_nonempty_all_filtered_no_port_owner_immediate_ok() {
+        // enumerate returns one candidate that fails F (exe outside toolkit),
+        // port_owner returns None → zero kill calls, Ok, no progress rounds.
+        let repo = PathBuf::from("/tmp/fake");
+        let mut kill_calls = 0;
+        let res = kill_stale_alas_with_injection(
+            22267,
+            &|_s| {},
+            Some(repo.as_path()),
+            &|| {
+                vec![Candidate {
+                    pid: 10,
+                    pgid: Some(10),
+                    exe: Some("/bin/zsh".into()),
+                    cwd: Some(repo.clone()),
+                    environ: vec![],
+                    cmd: vec!["zsh".into()],
+                }]
+            },
+            &|_| None,
+            &|_| false,
+            &mut |_| {
+                kill_calls += 1;
+                Ok(())
+            },
+            10,
+            Duration::from_millis(0),
+        );
+        assert!(res.is_ok());
+        assert_eq!(kill_calls, 0);
+    }
+
+    #[test]
+    fn first_round_empty_returns_ok_without_kills() {
+        let repo = PathBuf::from("/tmp/fake/AzurLaneAutoScript");
+        let enum_calls = std::cell::Cell::new(0);
+        let mut kill_calls = 0;
+        let progress_calls = std::cell::Cell::new(0);
+        let res = kill_stale_alas_with_injection(
+            22267,
+            &|_| progress_calls.set(progress_calls.get() + 1),
+            Some(repo.as_path()),
+            &|| {
+                enum_calls.set(enum_calls.get() + 1);
+                vec![]
+            },
+            &|_| None,
+            &|_| false,
+            &mut |_| {
+                kill_calls += 1;
+                Ok(())
+            },
+            10,
+            Duration::from_millis(0),
+        );
+        assert!(res.is_ok());
+        assert_eq!(enum_calls.get(), 1); // early-Ok before port-owner probe re-enumeration
+        assert_eq!(kill_calls, 0);
+        assert_eq!(progress_calls.get(), 0);
+    }
+
+    #[test]
+    fn ten_round_survivors_x_veto_reports_survivors_error() {
+        // Registered pid owning the port: X3 veto each round, never killed,
+        // never early-Ok → Survivors(payload, 10) after max_rounds.
+        let repo = PathBuf::from("/tmp/fake/AzurLaneAutoScript");
+        let mut kill_calls = 0;
+        let res = kill_stale_alas_with_injection(
+            22267,
+            &|_| {},
+            Some(repo.as_path()),
+            &|| {
+                vec![Candidate {
+                    pid: 300,
+                    pgid: Some(30),
+                    exe: Some(repo.join("toolkit/bin/python")),
+                    cwd: Some(repo.clone()),
+                    environ: vec!["ALAS_LAUNCHER_PID=1".into()],
+                    cmd: vec![
+                        "python".into(),
+                        "gui.py".into(),
+                        "--port".into(),
+                        "22267".into(),
+                    ],
+                }]
+            },
+            &|_| Some(300),
+            &|p| p == 300,
+            &mut |_| {
+                kill_calls += 1;
+                Ok(())
+            },
+            10,
+            Duration::from_millis(0),
+        );
+        match res {
+            Err(StaleCleanupError::Survivors(v, rounds)) => {
+                assert_eq!(rounds, 10);
+                assert_eq!(v.len(), 1);
+                assert_eq!(v[0].pid, 300);
+                assert!(v[0].evidence.contains("X3 registered"));
+            }
+            other => panic!("expected Survivors, got {:?}", other.err().map(|e| e.to_string())),
+        }
+        assert_eq!(kill_calls, 0); // X-vetoed pids are never killed
+    }
+
+    #[test]
+    fn foreign_port_owner_zero_kill() {
+        // Port owner passes X but fails F+E (exe outside toolkit) → refuse
+        // with ForeignPortOwner, never kill anything.
+        let repo = PathBuf::from("/tmp/fake/AzurLaneAutoScript");
+        let mut kill_calls = 0;
+        let res = kill_stale_alas_with_injection(
+            22267,
+            &|_| {},
+            Some(repo.as_path()),
+            &|| {
+                vec![lb_candidate(500, 50, "/usr/bin/python3".into())]
+            },
+            &|_| Some(500),
+            &|_| false,
+            &mut |_| {
+                kill_calls += 1;
+                Ok(())
+            },
+            10,
+            Duration::from_millis(0),
+        );
+        match res {
+            Err(StaleCleanupError::ForeignPortOwner { port, pid, cmdline }) => {
+                assert_eq!(port, 22267);
+                assert_eq!(pid, 500);
+                assert!(cmdline.contains("gui.py"));
+                assert!(cmdline.chars().count() <= 200);
+            }
+            other => panic!("expected ForeignPortOwner, got {:?}", other.err().map(|e| e.to_string())),
+        }
+        assert_eq!(kill_calls, 0);
+    }
+
+    #[test]
+    fn kill_err_retries_until_max_rounds_then_survivors() {
+        // Verified stale candidate whose kill always fails: retried every
+        // round, Survivors error after 10 rounds with 10 kill attempts.
+        let repo = PathBuf::from("/tmp/fake/AzurLaneAutoScript");
+        let mut kill_calls = 0;
+        let res = kill_stale_alas_with_injection(
+            22267,
+            &|_| {},
+            Some(repo.as_path()),
+            &|| {
+                vec![lb_candidate(600, 60, repo.join("toolkit/bin/python"))]
+            },
+            &|_| None,
+            &|_| false,
+            &mut |_| {
+                kill_calls += 1;
+                Err(std::io::Error::other("denied"))
+            },
+            10,
+            Duration::from_millis(0),
+        );
+        match res {
+            Err(StaleCleanupError::Survivors(v, rounds)) => {
+                assert_eq!(rounds, 10);
+                assert_eq!(v.len(), 1);
+                assert_eq!(v[0].pid, 600);
+                assert_eq!(v[0].evidence, "verified survivor");
+            }
+            other => panic!("expected Survivors, got {:?}", other.err().map(|e| e.to_string())),
+        }
+        assert_eq!(kill_calls, 10);
+    }
+
+    #[test]
+    fn second_round_vanish_returns_ok() {
+        // Round 1 kills a verified candidate; round 2 sees an empty table →
+        // early-Ok without a Survivors payload.
+        let repo = PathBuf::from("/tmp/fake/AzurLaneAutoScript");
+        let round = std::cell::Cell::new(0);
+        let mut kill_calls = 0;
+        let res = kill_stale_alas_with_injection(
+            22267,
+            &|_| {},
+            Some(repo.as_path()),
+            &|| {
+                round.set(round.get() + 1);
+                if round.get() == 1 {
+                    vec![lb_candidate(700, 70, repo.join("toolkit/bin/python"))]
+                } else {
+                    vec![]
+                }
+            },
+            &|_| None,
+            &|_| false,
+            &mut |_| {
+                kill_calls += 1;
+                Ok(())
+            },
+            10,
+            Duration::from_millis(0),
+        );
+        assert!(res.is_ok());
+        assert_eq!(kill_calls, 1);
     }
 }
