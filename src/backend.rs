@@ -19,6 +19,7 @@ use crate::child_process::port::{is_same_process_group, port_owner_pid};
 use crate::child_process::{
     kill_group, register_for_exit, spawn_with_group, unregister_for_exit, ManagedChild,
 };
+#[cfg(test)]
 use crate::stale_cleanup::StaleCleanupError;
 
 /// Test-only serialization for tests that touch the process-global exit
