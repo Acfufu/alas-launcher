@@ -118,6 +118,12 @@ fn exit_registry() -> &'static Mutex<Vec<u32>> {
     EXIT_REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// True when `pid` is currently registered for exit-time group-kill
+/// (stale-cleanup seam: distinguishes launcher-owned groups from strays).
+pub(crate) fn is_registered(pid: u32) -> bool {
+    exit_registry().lock().unwrap().contains(&pid)
+}
+
 /// Register `child` for group-kill when the app exits.
 pub fn register_for_exit(child: &ManagedChild) {
     exit_registry().lock().unwrap().push(child.id());

@@ -15,17 +15,18 @@ use crate::child_process::{
     GIT_UPDATE_TIMEOUT,
 };
 
-fn alas_repo_dir() -> PathBuf {
+/// Fallible [`alas_repo_dir`]: `None` when no portable layout matches,
+/// instead of panicking — lets stale-cleanup probe for an install first.
+pub(crate) fn try_alas_repo_dir() -> Option<PathBuf> {
     // Always check if this is a typical same-folder portable distribution
     let exe_folder = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
+        .ok()?
+        .parent()?
         .to_path_buf();
     let mut installer_py = exe_folder.clone();
     installer_py.extend(["deploy", "installer.py"]);
     if fs::exists(installer_py).unwrap() {
-        return exe_folder;
+        return Some(exe_folder);
     }
     // If it's MacOS, it could be ALAS.app/Contents/AzurLaneAutoScript
     #[cfg(target_os = "macos")]
@@ -36,11 +37,15 @@ fn alas_repo_dir() -> PathBuf {
             repo_folder.pop();
             repo_folder.push("AzurLaneAutoScript");
             if fs::exists(&repo_folder).unwrap() {
-                return repo_folder;
+                return Some(repo_folder);
             }
         }
     }
-    panic!("Cannot find ALAS repo folder");
+    None
+}
+
+pub(crate) fn alas_repo_dir() -> PathBuf {
+    try_alas_repo_dir().unwrap_or_else(|| panic!("Cannot find ALAS repo folder"))
 }
 
 fn prepend_path_to_env(key: &str, path: PathBuf) {
