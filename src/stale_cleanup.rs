@@ -270,9 +270,49 @@ impl std::fmt::Display for StaleCleanupError {
 
 impl std::error::Error for StaleCleanupError {}
 
-// Stub for Task 3 compilation — real_kill lands in Task 6.
-fn real_kill(_pid: u32) -> std::io::Result<()> {
-    Ok(())
+/// Kill a process and its whole process group (FR1.3).
+///
+/// Unix: SIGKILL to `-pgid` (whole group) plus the leader itself, closing the
+/// pre-setpgid window where the leader has no descendants yet.
+/// Windows: `taskkill /F /T /PID` (tree kill), falling back to a single
+/// sysinfo kill when taskkill is unavailable or fails.
+pub(crate) fn real_kill(pid: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let pgid = nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(pid as i32)))
+            .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-(pgid.as_raw())),
+            Some(nix::sys::signal::Signal::SIGKILL),
+        );
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            Some(nix::sys::signal::Signal::SIGKILL),
+        );
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => Ok(()),
+            _ => {
+                tracing::warn!("taskkill failed for pid {pid}, falling back to single kill");
+                let sys = sysinfo::System::new_all();
+                if let Some(p) = sys.process(sysinfo::Pid::from_u32(pid)) {
+                    if p.kill() {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::other("fallback kill failed"))
+                    }
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
 }
 
 /// Production entry point: converge stale ALAS processes on `port` to zero
@@ -723,8 +763,39 @@ mod tests {
         assert_eq!(raw[0].pid, 100);
     }
 
-    // ---- T4b: spoofed cmdline cannot fake identity without the F anchor ----
+    // ---- T4a: real group kill against a live spawned process ----
 
+    /// True when no process remains in the group led by `leader`
+    /// (kill(-pgid, 0) → ESRCH). Mirrors the child_process test helper.
+    #[cfg(unix)]
+    fn group_is_gone(leader: u32) -> bool {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(-(leader as i32)), None)
+            .map(|_| false)
+            .unwrap_or_else(|e| e == nix::errno::Errno::ESRCH)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_group_reaps_whole_group() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "sleep 30"]);
+        let mut child = crate::child_process::spawn_with_group(&mut cmd).unwrap();
+        let pid = child.id();
+        crate::stale_cleanup::real_kill(pid).unwrap();
+        let _ = child.wait();
+        // SIGKILL delivery is asynchronous (see child_process::kill_process_group):
+        // poll briefly instead of asserting on timing luck.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !group_is_gone(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "group led by {pid} still alive after real_kill"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    // ---- T4b: spoofed cmdline cannot fake identity without the F anchor ----
     #[test]
     fn t4b_spoofed_cmdline_identity_via_injection() {
         let repo = PathBuf::from("/tmp/fake/AzurLaneAutoScript");
