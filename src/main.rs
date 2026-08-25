@@ -41,6 +41,9 @@ mod patch;
 #[cfg(target_os = "macos")]
 mod notify;
 mod setup;
+// Stale-process identity decision (pure function, no I/O); cross-platform —
+// the discovery/kill loop (upcoming tasks) consumes it ungated.
+mod stale_cleanup;
 mod window_util;
 
 use std::{
@@ -218,6 +221,22 @@ fn main() -> Result<()> {
                                 .resolved_language(crate::deploy_config::language().as_deref()),
                         );
                         crate::shell_menu::spawn_check_update(app, &menu_shell_settings, labels);
+                    }
+                    "settings-restart-backend" => {
+                        // Restart the backend: stop the current instance (if
+                        // any), then the standard start sequence on a worker
+                        // thread (never blocks the menu-event thread — same
+                        // MAJOR-2 contract as the tray start path). The
+                        // restart worker resolves its own labels/guard; the
+                        // tray refresh wake (if present) forces a poll
+                        // rebuild so the tray re-renders the new state.
+                        crate::tray::spawn_restart_worker(
+                            app.clone(),
+                            menu_backend.clone(),
+                            port,
+                            &menu_shell_settings,
+                            tray_refresh.clone(),
+                        );
                     }
                     "settings-auto-start" => {
                         // Flip + persist the shared setting (warn on save
