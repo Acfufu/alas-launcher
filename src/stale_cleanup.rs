@@ -16,6 +16,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// Snapshot of one candidate process (filled by the discovery pass).
+#[derive(Clone)]
 pub struct Candidate {
     pub pid: u32,
     pub pgid: Option<u32>,
@@ -133,6 +134,93 @@ pub fn is_stale_candidate(
     } else {
         None
     }
+}
+
+/// Pre-filter the live process table down to raw stale candidates (FR1.1).
+///
+/// Over-collects on purpose: keeps processes matching the L-B cmdline pattern
+/// (`gui.py` + adjacent `--port <port>` argv pair), the L-C heuristic hint
+/// (`ALAS_LAUNCHER_PID=` environment marker), and — when the port is owned by
+/// some pid not already in the set — that owner process too. The X∧F∧E gates
+/// in [`is_stale_candidate`] do the precise killing decision later.
+///
+/// `enumerate` and `port_owner` are injected seams (T1): tests pass fakes,
+/// production passes [`real_enumerate`] and `port_owner_pid`. `repo` is
+/// reserved for later enrichment tasks and currently unused.
+pub fn collect_raw_candidates(
+    port: u16,
+    repo: Option<&Path>,
+    enumerate: &dyn Fn() -> Vec<Candidate>,
+    port_owner: &dyn Fn(u16) -> Option<u32>,
+) -> Vec<Candidate> {
+    let _ = repo; // reserved for L-A enrichment in a later task
+    let all = enumerate();
+    let port_s = port.to_string();
+    let mut raw: Vec<Candidate> = all
+        .into_iter()
+        .filter(|c| {
+            // L-B: cmd contains gui.py AND an exact adjacent "--port <port>"
+            // pair (no substring matching, no glued "--port=<port>").
+            let has_port_pair = c
+                .cmd
+                .windows(2)
+                .any(|w| w[0].to_string_lossy() == "--port" && w[1].to_string_lossy() == port_s);
+            let is_lb = c.cmd.iter().any(|s| s.to_string_lossy().contains("gui.py"))
+                && has_port_pair;
+            // L-C heuristic: launcher-spawned marker in environ.
+            let is_lc_hint = c
+                .environ
+                .iter()
+                .any(|e| e.to_string_lossy().starts_with("ALAS_LAUNCHER_PID="));
+            is_lb || is_lc_hint
+        })
+        .collect();
+    if let Some(pid) = port_owner(port) {
+        if !raw.iter().any(|c| c.pid == pid) {
+            // Enrich the single owner pid via a fresh lookup; if it vanished
+            // between calls it simply does not join the candidate set.
+            if let Some(extra) = enumerate().into_iter().find(|c| c.pid == pid) {
+                raw.push(extra);
+            }
+        }
+    }
+    raw
+}
+
+/// Truncate a rendered command line to 200 chars for log/display safety.
+pub fn truncate_cmd(s: &str) -> String {
+    s.chars().take(200).collect()
+}
+
+/// Production enumeration seam: snapshot every live process via sysinfo.
+fn real_enumerate() -> Vec<Candidate> {
+    let mut sys = sysinfo::System::new_all();
+    sys.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::All,
+        true,
+        sysinfo::ProcessRefreshKind::everything(),
+    );
+    sys.processes()
+        .values()
+        .map(|p| {
+            #[cfg(unix)]
+            let pgid = nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(
+                p.pid().as_u32() as i32,
+            )))
+            .ok()
+            .map(|pid| pid.as_raw() as u32);
+            #[cfg(windows)]
+            let pgid: Option<u32> = None;
+            Candidate {
+                pid: p.pid().as_u32(),
+                pgid,
+                exe: p.exe().map(|e| e.to_path_buf()),
+                cwd: p.cwd().map(|c| c.to_path_buf()),
+                environ: p.environ().to_vec(),
+                cmd: p.cmd().to_vec(),
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -393,5 +481,66 @@ mod tests {
             ..cand(108, Some(18))
         };
         assert!(is_stale_candidate(&c, Some(&r), PORT, 1, None, &|_| false).is_none());
+    }
+
+    // ---- T2: discovery seam (collect_raw_candidates) ----
+
+    #[test]
+    fn collect_with_port_owner_none_uses_lb_lc_only() {
+        let repo = PathBuf::from("/tmp/fake/AzurLaneAutoScript");
+        let cand = Candidate {
+            pid: 100,
+            pgid: Some(10),
+            exe: Some(repo.join("toolkit/bin/python")),
+            cwd: Some(repo.clone()),
+            environ: vec![],
+            cmd: vec![
+                "python".into(),
+                "gui.py".into(),
+                "--port".into(),
+                "22267".into(),
+            ],
+        };
+        let raw = collect_raw_candidates(22267, Some(&repo), &|| vec![cand.clone()], &|_| None);
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0].pid, 100);
+    }
+
+    // ---- T4b: spoofed cmdline cannot fake identity without the F anchor ----
+
+    #[test]
+    fn t4b_spoofed_cmdline_identity_via_injection() {
+        let repo = PathBuf::from("/tmp/fake/AzurLaneAutoScript");
+        let toolkit_exe = repo.join("toolkit/bin/python");
+        // exe inside toolkit + spoofed gui.py --port passes F+E
+        let cand_ok = Candidate {
+            pid: 1,
+            pgid: Some(1),
+            exe: Some(toolkit_exe.clone()),
+            cwd: Some(repo.clone()),
+            environ: vec![],
+            cmd: vec![
+                "python".into(),
+                "gui.py".into(),
+                "--port".into(),
+                "22267".into(),
+            ],
+        };
+        assert!(is_stale_candidate(&cand_ok, Some(&repo), 22267, 99, None, &|_| false).is_some());
+        // exe outside toolkit with same cmd fails F
+        let cand_bad = Candidate {
+            pid: 2,
+            pgid: Some(2),
+            exe: Some("/usr/bin/python3".into()),
+            cwd: Some(repo.clone()),
+            environ: vec![],
+            cmd: vec![
+                "python".into(),
+                "gui.py".into(),
+                "--port".into(),
+                "22267".into(),
+            ],
+        };
+        assert!(is_stale_candidate(&cand_bad, Some(&repo), 22267, 99, None, &|_| false).is_none());
     }
 }
