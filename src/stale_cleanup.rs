@@ -189,8 +189,13 @@ pub fn collect_raw_candidates(
 }
 
 /// Truncate a rendered command line to 200 chars for log/display safety.
+/// Char-safe (not byte-safe): multi-byte UTF-8 never splits mid-codepoint.
 pub fn truncate_cmd(s: &str) -> String {
-    s.chars().take(200).collect()
+    if s.chars().count() <= 200 {
+        s.to_string()
+    } else {
+        s.chars().take(200).collect()
+    }
 }
 
 /// Production enumeration seam: snapshot every live process via sysinfo.
@@ -980,5 +985,54 @@ mod tests {
         );
         assert!(res.is_ok());
         assert_eq!(kill_calls, 1);
+    }
+
+    // ---- T4: truncation + error Display/anyhow contract (FR1.5) ----
+
+    #[test]
+    fn cmdline_truncated_to_200_chars() {
+        let long = "x".repeat(500);
+        let info = StaleProcessInfo {
+            pid: 1,
+            cmdline: truncate_cmd(&long),
+            evidence: "E2".into(),
+        };
+        assert!(info.cmdline.chars().count() <= 200);
+        assert_eq!(info.cmdline.chars().count(), 200);
+
+        let short = "gui.py --port 22267";
+        assert_eq!(truncate_cmd(short), short);
+
+        let multibyte = "舰".repeat(300);
+        assert_eq!(truncate_cmd(&multibyte).chars().count(), 200);
+    }
+
+    #[test]
+    fn stale_cleanup_error_display_and_anyhow_conversion() {
+        let survivors = StaleCleanupError::Survivors(
+            vec![StaleProcessInfo {
+                pid: 9,
+                cmdline: "python gui.py".into(),
+                evidence: "E4".into(),
+            }],
+            10,
+        );
+        assert!(survivors
+            .to_string()
+            .contains("Failed to clean up stale ALAS processes after 10 attempts"));
+        assert!(survivors.to_string().contains("pid 9"));
+
+        let foreign = StaleCleanupError::ForeignPortOwner {
+            port: 22267,
+            pid: 5,
+            cmdline: "nginx".into(),
+        };
+        assert!(foreign.to_string().contains("Port 22267 is occupied"));
+        assert!(foreign.to_string().contains("pid 5"));
+
+        fn takes_anyhow(e: impl Into<anyhow::Error>) -> String {
+            e.into().to_string()
+        }
+        assert!(takes_anyhow(foreign).contains("nginx"));
     }
 }
