@@ -39,10 +39,12 @@ macOS 专属的原生适配：菜单栏常驻 ALAS 舰船图标，调度器状�
 | 平台 | 单一平台 | 同一套代码原生支持 Windows、macOS、Linux |
 | macOS 任务速览 | 无 | 菜单栏任务列表 + 原生通知（调度器异常死亡默认提醒、任务完成可选） |
 | 调度器控制通道 | 网页按钮 | 控制 API 补丁（HTTP，与网页同一 ProcessManager；密码/SSL 时降级进程级控制） |
-| 启动时行为 | 杀已有进程、更新 pip、更新 Electron 资源、重启 adb | 只更新仓库，无其他副作用操作 |
+| 启动时行为 | 杀已有进程、更新 pip... | 只更新仓库 + 清理上次残留的本安装 ALAS 进程，无其他副作用操作 |
 | 重复启动 | 打开新窗口 | 单实例：重新聚焦已有窗口 |
 | pip 自动更新 | 有 | 已禁用（Python 包版本与官方版略有差异，但不影响使用） |
 | adb 重启 / 替换 | 有 | 未实现 |
+
+（清理行为见上表文字描述，对比图为旧版文案）
 
 目录结构也有调整，见[目录结构与环境变量](#目录结构与环境变量)。
 
@@ -152,6 +154,7 @@ gh release create v0.1.0 release/AzurLaneAutoScript.app --title "v0.1.0" --notes
 | Linux 启动器无法启动，但 ALAS 本体可运行 | 安装 `libwebkit2gtk-4.1`，或升级系统 `glibc` |
 | 端口被占用或想更换端口 | 修改 `config/deploy.yaml` 的 `Deploy.Webui.WebuiPort`（默认 `22267`） |
 | 菜单栏任务列表为空或显示「Tasks: unavailable」 | 确认 ALAS 后端在运行（菜单可一键启动）；任务数据直接来自 `config/alas.json` |
+| 残留清理失败 / splash 显示 stale 进程错误 | 按错误页提示手动结束列出的 pid，或修改 config/deploy.yaml 的 Deploy.Webui.WebuiPort 后重启 |
 
 ### 许可
 

@@ -39,10 +39,12 @@ If the repository update fails, the splash screen keeps showing the error; quitt
 | Platforms | Single platform | The same codebase natively supports Windows, macOS, and Linux |
 | macOS task overview | None | Menu-bar task list + native notifications (scheduler abnormal-death alert on by default, task-complete optional) |
 | Scheduler control channel | Web page button | Control API patch (HTTP, same ProcessManager as the web page; degrades to process-level control with password/SSL) |
-| Startup behavior | Kills existing processes, updates pip, updates Electron resources, restarts adb | Only updates the repository — no other side effects |
+| Startup behavior | Kills existing processes, updates pip, updates Electron resources, restarts adb | Only updates the repository + cleans up stale ALAS processes from the previous run of this install — no other side effects |
 | Repeated launch | Opens a new window | Single instance: refocuses the existing window |
 | pip auto-update | Yes | Disabled (Python package versions differ slightly from the official version; does not affect usage) |
 | adb restart / replacement | Yes | Not implemented |
+
+Cleanup behavior is described in the table above; the comparison diagram still shows the previous wording.
 
 The directory layout is also adjusted — see [Directory structure and environment variables](#directory-structure-and-environment-variables).
 
@@ -152,6 +154,7 @@ The launcher adds the following environment variables:
 | Linux launcher fails to start, but ALAS itself runs | Install `libwebkit2gtk-4.1`, or upgrade system `glibc` |
 | Port in use or you want a different port | Edit `Deploy.Webui.WebuiPort` in `config/deploy.yaml` (default `22267`) |
 | Menu-bar task list empty or shows "Tasks: unavailable" | Make sure the ALAS backend is running (the menu can start it); task data comes directly from `config/alas.json` |
+| Stale cleanup failed / splash shows stale process error | Kill the listed pids per the error page, or change Deploy.Webui.WebuiPort in config/deploy.yaml and relaunch |
 
 ### License
 
