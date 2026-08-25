@@ -19,6 +19,7 @@ use crate::child_process::port::{is_same_process_group, port_owner_pid};
 use crate::child_process::{
     kill_group, register_for_exit, spawn_with_group, unregister_for_exit, ManagedChild,
 };
+use crate::stale_cleanup::StaleCleanupError;
 
 /// Test-only serialization for tests that touch the process-global exit
 /// registry (`EXIT_REGISTRY`): `kill_registered_groups` mem::takes the whole
@@ -284,6 +285,12 @@ pub struct BackendLifecycle {
     #[cfg(test)]
     #[allow(clippy::type_complexity)] // seam box type is per-plan; a type alias would hide the shape
     wait_override: std::sync::Mutex<Option<Box<dyn Fn() -> Result<()> + Send + Sync>>>,
+    // Test seam mirroring `wait_override`: replaces the stale-cleanup step of
+    // start() so ordering tests never enumerate the real process table.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    cleanup_override:
+        std::sync::Mutex<Option<Box<dyn Fn(u16) -> Result<(), StaleCleanupError> + Send + Sync>>>,
 }
 
 impl Default for BackendLifecycle {
@@ -306,6 +313,13 @@ impl BackendLifecycle {
             spawner: Box::new(spawner),
             #[cfg(test)]
             wait_override: std::sync::Mutex::new(None),
+            // Tests default to a NO-OP cleanup step: start() would otherwise
+            // run the real kill_stale_alas sweep against the dev machine's
+            // live port 22267 (slow sysinfo loops, and a deadlock for every
+            // barrier test whose worker dies before reaching the wait gate).
+            // Ordering tests overwrite this via set_cleanup_override.
+            #[cfg(test)]
+            cleanup_override: std::sync::Mutex::new(Some(Box::new(|_| Ok(())))),
         }
     }
 
@@ -353,6 +367,16 @@ impl BackendLifecycle {
         *self.wait_override.lock().unwrap() = Some(Box::new(f));
     }
 
+    /// Test seam: replace the stale-cleanup step of start() (spec FR2) so
+    /// ordering tests record calls instead of touching the process table.
+    #[cfg(test)]
+    pub fn set_cleanup_override(
+        &self,
+        f: impl Fn(u16) -> Result<(), StaleCleanupError> + Send + Sync + 'static,
+    ) {
+        *self.cleanup_override.lock().unwrap() = Some(Box::new(f));
+    }
+
     /// Start the backend on `port`.
     ///
     /// ORDERING CONTRACT (Metis BLOCKER-2): the old backend MUST be fully
@@ -373,7 +397,7 @@ impl BackendLifecycle {
     /// ownership check in the wait loop (④) and tail (⑤): the loser of a race
     /// with `stop()` or a concurrent start reports `STOP_INTERVENED` — never
     /// a bogus Running — and the winner owns the state machine.
-    pub fn start(&self, port: u16) -> Result<()> {
+    pub fn start(&self, port: u16, progress: &dyn Fn(&str)) -> Result<()> {
         // ① 入口（语义不变）：pending epoch 检查 / Initializing / take old。
         let (old, epoch) = {
             let mut state = self.state.lock().unwrap();
@@ -389,6 +413,36 @@ impl BackendLifecycle {
         };
         // 锁外：旧 backend 完全终止后才可能 spawn（BLOCKER-2）。
         terminate_old(old);
+
+        // FR2：spawn 前收敛残留 ALAS 进程（锁外——枚举+多轮 kill 可达数秒，
+        // 托盘轮询线程绝不能被阻塞）。override 仅测试注入；失败时与 spawn
+        // 失败同一 epoch 守卫（stop()/并发 start 赢家拥有状态机），真失败
+        // 置 Stopped+start_failed 并保留具体错误类型供 main.rs downcast。
+        let cleanup_result = {
+            #[cfg(test)]
+            {
+                match &*self.cleanup_override.lock().unwrap() {
+                    Some(ov) => ov(port),
+                    None => crate::stale_cleanup::kill_stale_alas(port, progress),
+                }
+            }
+            #[cfg(not(test))]
+            {
+                crate::stale_cleanup::kill_stale_alas(port, progress)
+            }
+        };
+        if let Err(e) = cleanup_result {
+            let mut state = self.state.lock().unwrap();
+            if state.epoch != epoch || state.backend.is_some() {
+                return Err(anyhow!(STOP_INTERVENED));
+            }
+            state.status = BackendStatus::Stopped;
+            state.start_failed = true;
+            state.crashed = false;
+            state.scheduler_intent = SchedulerIntent::None;
+            state.start_intent_at = None;
+            return Err(e.into());
+        }
 
         // ② spawn（快，无等待；失败 → epoch 区分 stop 干预与真失败）。
         let mut backend = match (self.spawner)(port) {
@@ -839,15 +893,34 @@ mod tests {
     #[test]
     fn start_success_sets_running() {
         let lc = BackendLifecycle::new_with_spawner(ok_spawner());
-        lc.start(22267).unwrap();
+        lc.start(22267, &|_| {}).unwrap();
         assert_eq!(lc.status(), BackendStatus::Running);
         assert!(!lc.snapshot().start_failed);
+    }
+
+    /// FR2 ordering contract: stale cleanup converges BEFORE the spawner
+    /// runs (a fresh gui.py must never race the kill sweep for the port).
+    #[test]
+    fn cleanup_runs_before_spawn() {
+        let order: Arc<Mutex<Vec<&str>>> = Arc::new(Mutex::new(vec![]));
+        let order_spawn = order.clone();
+        let order_cleanup = order.clone();
+        let lc = BackendLifecycle::new_with_spawner(move |_| {
+            order_spawn.lock().unwrap().push("spawn");
+            Ok(ManagedBackend::from_child(sleep_child()))
+        });
+        lc.set_cleanup_override(move |_port| {
+            order_cleanup.lock().unwrap().push("cleanup");
+            Ok(())
+        });
+        lc.start(22267, &|_| {}).unwrap();
+        assert_eq!(*order.lock().unwrap(), vec!["cleanup", "spawn"]);
     }
 
     #[test]
     fn start_failure_sets_stopped_start_failed() {
         let lc = BackendLifecycle::new_with_spawner(|_| Err(anyhow!("boom")));
-        let err = lc.start(22267).unwrap_err();
+        let err = lc.start(22267, &|_| {}).unwrap_err();
         assert_eq!(err.to_string(), "boom");
         assert_eq!(lc.status(), BackendStatus::Stopped);
         assert!(lc.snapshot().start_failed);
@@ -856,7 +929,7 @@ mod tests {
     #[test]
     fn begin_start_sets_initializing_and_clears_failed() {
         let lc = BackendLifecycle::new_with_spawner(|_| Err(anyhow!("boom")));
-        let _ = lc.start(22267); // leaves Stopped + start_failed
+        let _ = lc.start(22267, &|_| {}); // leaves Stopped + start_failed
         lc.begin_start();
         let s = lc.snapshot();
         assert_eq!(s.status, BackendStatus::Initializing);
@@ -874,7 +947,7 @@ mod tests {
     fn stop_terminates_the_backend() {
         let pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
         let lc = BackendLifecycle::new_with_spawner(recording_spawner(pids.clone()));
-        lc.start(22267).unwrap();
+        lc.start(22267, &|_| {}).unwrap();
         let pid = pids.lock().unwrap()[0];
         assert!(process_is_alive(pid), "child alive right after start");
         lc.stop();
@@ -925,7 +998,7 @@ mod tests {
     #[test]
     fn start_arms_start_intent_and_success_keeps_it() {
         let lc = BackendLifecycle::new_with_spawner(ok_spawner());
-        lc.start(22267).unwrap();
+        lc.start(22267, &|_| {}).unwrap();
         let s = lc.snapshot();
         assert_eq!(s.status, BackendStatus::Running);
         assert_eq!(s.scheduler_intent, SchedulerIntent::Start);
@@ -937,7 +1010,7 @@ mod tests {
     #[test]
     fn ready_skip_path_still_marks_running() {
         let lc = BackendLifecycle::new_with_spawner(ok_spawner());
-        lc.start(22267).unwrap();
+        lc.start(22267, &|_| {}).unwrap();
         assert_eq!(lc.status(), BackendStatus::Running);
         assert_eq!(lc.snapshot().scheduler_intent, SchedulerIntent::Start);
     }
@@ -946,7 +1019,7 @@ mod tests {
     fn backend_pid_tracks_the_live_child() {
         let lc = BackendLifecycle::new_with_spawner(ok_spawner());
         assert_eq!(lc.backend_pid(), None, "no backend before start");
-        lc.start(22267).unwrap();
+        lc.start(22267, &|_| {}).unwrap();
         let pid = lc.backend_pid().expect("backend pid after start");
         assert!(process_is_alive(pid), "recorded pid is the live child");
         lc.stop();
@@ -957,7 +1030,7 @@ mod tests {
     fn backend_pid_uses_the_recording_spawner_child() {
         let pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
         let lc = BackendLifecycle::new_with_spawner(recording_spawner(pids.clone()));
-        lc.start(22267).unwrap();
+        lc.start(22267, &|_| {}).unwrap();
         let spawned = pids.lock().unwrap()[0];
         assert_eq!(lc.backend_pid(), Some(spawned));
     }
@@ -969,8 +1042,8 @@ mod tests {
     fn ordering_contract_second_start_kills_first_child_before_spawn() {
         let pids: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
         let lc = BackendLifecycle::new_with_spawner(recording_spawner(pids.clone()));
-        lc.start(22267).unwrap();
-        lc.start(22267).unwrap();
+        lc.start(22267, &|_| {}).unwrap();
+        lc.start(22267, &|_| {}).unwrap();
         let pids = pids.lock().unwrap().clone();
         assert_eq!(pids.len(), 2, "two spawns happened");
         assert_ne!(pids[0], pids[1], "second spawn is a distinct process");
@@ -1009,7 +1082,7 @@ mod tests {
         lc.begin_start();
         let worker = {
             let lc = Arc::clone(&lc);
-            std::thread::spawn(move || lc.start(22267))
+            std::thread::spawn(move || lc.start(22267, &|_| {}))
         };
         gate.wait(); // the worker is now inside the spawn step
 
@@ -1044,7 +1117,7 @@ mod tests {
         });
         lc.begin_start();
         lc.stop(); // the exit lands between begin_start and start()
-        let err = lc.start(22267).unwrap_err();
+        let err = lc.start(22267, &|_| {}).unwrap_err();
         assert!(
             err.to_string().contains("stop intervened"),
             "start must report the interruption, got: {err}"
@@ -1072,7 +1145,7 @@ mod tests {
             Ok(())
         });
         let lc2 = lc.clone();
-        let worker = std::thread::spawn(move || lc2.start(22267));
+        let worker = std::thread::spawn(move || lc2.start(22267, &|_| {}));
         gate.wait(); // worker 已进入 wait override
         let s = lc.snapshot();
         assert_eq!(s.status, BackendStatus::Initializing, "still initializing during the wait");
@@ -1102,7 +1175,7 @@ mod tests {
             Ok(())
         });
         let lc2 = lc.clone();
-        let worker = std::thread::spawn(move || lc2.start(22267));
+        let worker = std::thread::spawn(move || lc2.start(22267, &|_| {}));
         gate.wait(); // worker 在 override 内
         lc.stop();   // 退出/停止落在等待窗口
         gate.wait(); // 释放 worker
@@ -1128,7 +1201,7 @@ mod tests {
             Ok(ManagedBackend::from_child(child))
         }));
         lc.set_wait_override(|| Err(anyhow!("boom")));
-        let err = lc.start(22267).unwrap_err();
+        let err = lc.start(22267, &|_| {}).unwrap_err();
         assert_eq!(err.to_string(), "boom");
         let s = lc.snapshot();
         assert_eq!(s.status, BackendStatus::Stopped);
@@ -1151,7 +1224,7 @@ mod tests {
             Err(anyhow!("boom"))
         });
         let lc2 = lc.clone();
-        let worker = std::thread::spawn(move || lc2.start(22267));
+        let worker = std::thread::spawn(move || lc2.start(22267, &|_| {}));
         gate.wait();
         lc.stop();
         gate.wait();
@@ -1175,10 +1248,10 @@ mod tests {
         }));
         let port = free_ephemeral_port(); // Round-1: 不用 22267（开发机可能跑着 ALAS）
         let lc1 = lc.clone();
-        let t1 = std::thread::spawn(move || lc1.start(port));
+        let t1 = std::thread::spawn(move || lc1.start(port, &|_| {}));
         std::thread::sleep(Duration::from_millis(300)); // t1 已 install + 进入真实等待
         let lc2 = lc.clone();
-        let t2 = std::thread::spawn(move || lc2.start(port));
+        let t2 = std::thread::spawn(move || lc2.start(port, &|_| {}));
         std::thread::sleep(Duration::from_millis(300)); // t2 已替换 child
         let pids = pids.lock().unwrap().clone();
         assert_eq!(pids.len(), 2, "two spawns happened");
@@ -1289,7 +1362,7 @@ mod tests {
     fn advance_intent_ttl_disarms_stale_start_via_lifecycle() {
         let lc = BackendLifecycle::new_with_spawner(ok_spawner());
         lc.begin_start();
-        lc.start(22267).unwrap();
+        lc.start(22267, &|_| {}).unwrap();
         // Fresh start: a dead scan keeps the intent armed (boot window).
         assert_eq!(
             lc.advance_intent_if_changed(Some(false)),
@@ -1457,7 +1530,7 @@ mod tests {
             cmd.arg("60");
             Ok(ManagedBackend::from_child_unchecked(cmd.group_spawn().unwrap()))
         });
-        let err = lc.start(port).unwrap_err();
+        let err = lc.start(port, &|_| {}).unwrap_err();
         assert!(err.to_string().contains("occupied by pid"), "got: {err}");
         let s = lc.snapshot();
         assert_eq!(s.status, BackendStatus::Stopped);
@@ -1475,7 +1548,7 @@ mod tests {
             cmd.arg("0"); // 立即退出
             Ok(ManagedBackend::from_child_unchecked(cmd.group_spawn().unwrap()))
         });
-        let err = lc.start(port).unwrap_err();
+        let err = lc.start(port, &|_| {}).unwrap_err();
         assert!(err.to_string().contains("exited before becoming ready"), "got: {err}");
         assert_eq!(lc.status(), BackendStatus::Stopped);
         assert!(lc.snapshot().start_failed);

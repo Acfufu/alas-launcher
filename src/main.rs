@@ -411,12 +411,54 @@ fn main() -> Result<()> {
                         if auto_start {
                             info!("Starting gui.py on {}", crate::backend::webui_url(port));
                             status_updater("Starting GUI");
-                            if let Err(e) = backend.start(port) {
-                                // Same as today: the splash stays on the "Starting GUI"
-                                // page, main window stays hidden. The module set
-                                // Stopped + start_failed so the tray shows the
-                                // localized start-failed label.
-                                error!("Failed to start backend: {e}");
+                            if let Err(e) = backend.start(port, &status_updater) {
+                                // FR3: typed stale-cleanup failures navigate
+                                // the splash to an actionable page (survivor
+                                // pids / foreign port owner) instead of
+                                // silently keeping "Starting GUI".
+                                if let Some(stale) =
+                                    e.downcast_ref::<crate::stale_cleanup::StaleCleanupError>()
+                                {
+                                    let content = match stale {
+                                        crate::stale_cleanup::StaleCleanupError::Survivors(
+                                            v,
+                                            rounds,
+                                        ) => {
+                                            let shown: Vec<String> = v
+                                                .iter()
+                                                .take(10)
+                                                .map(|i| format!("  pid {}: {}", i.pid, i.cmdline))
+                                                .collect();
+                                            let extra = if v.len() > 10 {
+                                                format!("\n  +{} more (see log)", v.len() - 10)
+                                            } else {
+                                                String::new()
+                                            };
+                                            tracing::error!(
+                                                "Survivors after {rounds} rounds: {v:?}"
+                                            );
+                                            format!("Failed to clean up stale ALAS processes after {rounds} attempts:\n{}\n{}Close these processes manually or change Deploy.Webui.WebuiPort in config/deploy.yaml, then relaunch.", shown.join("\n"), extra)
+                                        }
+                                        crate::stale_cleanup::StaleCleanupError::ForeignPortOwner {
+                                            port,
+                                            pid,
+                                            cmdline,
+                                        } => {
+                                            tracing::error!(
+                                                "Foreign port owner: port {port} pid {pid} cmdline {cmdline}"
+                                            );
+                                            format!("Port {port} is occupied by a non-ALAS process (pid {pid}: {cmdline}).\nChange Deploy.Webui.WebuiPort in config/deploy.yaml or close that program, then relaunch.")
+                                        }
+                                    };
+                                    let url = Url::parse(&text_to_splash(&content)).unwrap();
+                                    splash.navigate(url).unwrap();
+                                } else {
+                                    // Same as today: the splash stays on the "Starting GUI"
+                                    // page, main window stays hidden. The module set
+                                    // Stopped + start_failed so the tray shows the
+                                    // localized start-failed label.
+                                    error!("Failed to start backend: {e:#}");
+                                }
                                 // MAJOR-1 code-review assertion: same failure
                                 // hazard as the setup path above — the timed
                                 // poll's three gates all stay false after a

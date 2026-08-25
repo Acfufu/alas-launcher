@@ -425,7 +425,7 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
                 port,
                 labels.clone(),
                 guard,
-                shared.refresh.clone(),
+                Some(shared.refresh.clone()),
                 ws_available,
             );
         }
@@ -528,14 +528,14 @@ fn spawn_start_worker(
     port: u16,
     labels: ControlLabels,
     guard: InFlightGuard,
-    refresh: mpsc::Sender<()>,
+    refresh: Option<mpsc::Sender<()>>,
     ws_available: bool,
 ) {
     if let Err(e) = std::thread::Builder::new()
         .name("backend-start".into())
         .spawn(move || {
             let guard = guard;
-            match backend.start(port) {
+            match backend.start(port, &|_| {}) {
                 Ok(()) => {
                     navigate_main(&app, main_page_url(BackendStatus::Running, port, &labels));
                     // 后端就绪后，经控制 API 启动调度器（控制可用时）。有界重试（10×1.5s，
@@ -574,11 +574,41 @@ fn spawn_start_worker(
             // poll thread runs on this signal already sees the finished
             // state (spawn_scheduler_call ordering).
             drop(guard);
-            let _ = refresh.send(());
+            if let Some(sender) = refresh {
+                let _ = sender.send(());
+            }
         })
     {
         warn!("Failed to spawn backend-start worker: {e}");
     }
+}
+
+/// Restart the backend: stop the current instance (if any), then run the
+/// standard start sequence on the worker thread (BLOCKER-3: never two
+/// backends — stop() bumps the epoch BEFORE begin_start, so an in-flight
+/// start's readiness tail detects STOP_INTERVENED and disposes its child).
+/// Menu-driven (settings-restart-backend, wired in main.rs), so it resolves
+/// its own labels and in-flight guard instead of borrowing TrayShared.
+pub(crate) fn spawn_restart_worker(
+    app: AppHandle,
+    backend: Arc<BackendLifecycle>,
+    port: u16,
+    settings: &Arc<Mutex<crate::shell_settings::ShellSettings>>,
+    refresh: Option<mpsc::Sender<()>>,
+) {
+    let labels = load_control_labels(settings);
+    // Local in-flight flag: the worker's exit wake is all we need — the
+    // tray's own guard stays untouched (the poll thread rebuilds from the
+    // snapshot, which stop()/begin_start() already updated).
+    let flag = Arc::new(AtomicBool::new(false));
+    let Some(guard) = try_acquire_in_flight(&flag) else {
+        warn!("restart skipped: in-flight guard busy");
+        return;
+    };
+    backend.stop();
+    backend.begin_start();
+    let ws_available = crate::deploy_config::ws_control_available();
+    spawn_start_worker(app, backend, port, labels, guard, refresh, ws_available);
 }
 
 /// Rebuild the menu from the current state + task cache and re-attach it to
