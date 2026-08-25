@@ -410,7 +410,7 @@ mod tests {
             let managed = spawn_with_group(&mut cmd).unwrap();
             Ok(crate::backend::ManagedBackend::from_managed_child(managed))
         });
-        lc.start(22267).unwrap();
+        lc.start(22267, &|_| {}).unwrap();
         assert_eq!(lc.status(), crate::backend::BackendStatus::Running);
         cleanup_for_exit(&tray_stop, &poll_handle, &lc);
         cleanup_for_exit(&tray_stop, &poll_handle, &lc); // 第二遍：全 no-op
