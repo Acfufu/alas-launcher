@@ -332,6 +332,7 @@ pub fn kill_stale_alas(port: u16, progress: &dyn Fn(&str)) -> Result<(), StaleCl
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn kill_stale_alas_with_injection(
     port: u16,
     progress: &dyn Fn(&str),
