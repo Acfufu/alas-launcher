@@ -130,17 +130,35 @@ pub fn setup_alas_repo(mut status_updater: impl FnMut(&str)) -> Result<()> {
 /// included automatically, unlike a cone-mode allowlist. Fail-soft: old git
 /// (<2.25, no sparse-checkout) or a broken repo degrades to keeping webapp/
 /// instead of blocking the launch.
+/// Sparse-checkout denylist patterns (non-cone, gitignore semantics — the
+/// last matching pattern wins, so negations must follow `/*`).
+///
+/// `/*` includes every top-level entry so future upstream dirs appear
+/// automatically. `!webapp/` drops the dead Electron launcher (frozen
+/// upstream since 2022-01-16). `!webapp-tauri/src-tauri/` drops the PR #5885
+/// Tauri shell's Rust side while keeping `webapp-tauri/` frontend sources —
+/// the FastAPI webui serves its pages from `webapp-tauri/dist`, which is
+/// built from those sources (excluding the whole directory would leave the
+/// webui with no frontend to mount).
+fn sparse_checkout_patterns() -> Vec<&'static str> {
+    vec!["/*", "!webapp/", "!webapp-tauri/src-tauri/"]
+}
+
 fn apply_sparse_checkout(status_updater: &mut impl FnMut(&str)) {
-    status_updater("Excluding webapp (dead Electron launcher)");
+    status_updater("Excluding webapp and webapp-tauri/src-tauri (dead shells)");
     let dir = alas_repo_dir();
+    let mut args = vec!["sparse-checkout", "set", "--no-cone"];
+    args.extend(sparse_checkout_patterns());
     let status = Command::new("git")
         .current_dir(&dir)
-        .args(["sparse-checkout", "set", "--no-cone", "/*", "!webapp/"])
+        .args(&args)
         .status();
     match status {
-        Ok(s) if s.success() => info!("sparse checkout applied: excluded webapp/ in {:?}", dir),
-        Ok(s) => warn!("sparse checkout failed with {s}; keeping webapp/"),
-        Err(e) => warn!("sparse checkout failed: {e:#}; keeping webapp/"),
+        Ok(s) if s.success() => {
+            info!("sparse checkout applied: excluded webapp/ and webapp-tauri/src-tauri/ in {:?}", dir)
+        }
+        Ok(s) => warn!("sparse checkout failed with {s}; keeping excluded dirs present"),
+        Err(e) => warn!("sparse checkout failed: {e:#}; keeping excluded dirs present"),
     }
 }
 
@@ -344,5 +362,23 @@ mod tests {
         assert_eq!(Some(25), find_percentage("loading 25%..."));
         assert_eq!(Some(100), find_percentage("100%..."));
         assert_eq!(None, find_percentage("%1"));
+    }
+
+    #[test]
+    fn test_sparse_checkout_patterns() {
+        let patterns = sparse_checkout_patterns();
+        // `/*` first: non-cone denylist needs the include-all baseline up
+        // front, and gitignore semantics make later negations win over it.
+        assert_eq!(patterns.first(), Some(&"/*"));
+        assert!(patterns.contains(&"!webapp/"), "dead Electron launcher must stay excluded");
+        assert!(
+            patterns.contains(&"!webapp-tauri/src-tauri/"),
+            "PR #5885 Tauri shell's Rust side must be excluded"
+        );
+        // Frontend sources stay so webapp-tauri/dist can be built for webui.
+        assert!(
+            !patterns.iter().any(|p| p.contains("webapp-tauri") && !p.contains("src-tauri")),
+            "webapp-tauri/ frontend sources must not be excluded"
+        );
     }
 }

@@ -12,7 +12,7 @@
     "category": "Utility",
     "icon": ["icons/icon.icns", "icons/icon.ico", "icons/icon.png"],
     "macOS": {
-      "minimumSystemVersion": "10.13"
+      "minimumSystemVersion": "10.15"
     }
   },
   "app": {
