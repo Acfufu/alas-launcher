@@ -1,14 +1,23 @@
 //! Control API patch applier for the ALAS payload.
 //!
-//! Anchor: `module/webui/fastapi.py` (unchanged since 2022-04-14 per the
-//! payload git log). The patch injects two context-anchored fragments and
-//! drops `module/webui/control_api.py`; idempotency is tracked by a marker
+//! Anchor: `module/webui/api/__init__.py` — the FastAPI app factory
+//! (`create_api_app()`) introduced by the PR-5885 webui rewrite. The
+//! pre-rewrite anchor `module/webui/fastapi.py` no longer exists on that
+//! payload line. The patch injects two context-anchored fragments and drops
+//! `module/webui/control_api.py`; idempotency is tracked by a marker
 //! comment. Fail-closed: any mismatch surfaces as [`PatchOutcome::AnchorMismatch`]
 //! or `Err`, never a partial write — **write order is control_api.py FIRST,
-//! fastapi.py LAST** (a failed fastapi write leaves a harmless unused module;
-//! the reverse would leave fastapi.py importing a missing module and break
-//! the webui at startup). Both writes are atomic-replace via tmp + rename
-//! (Windows-safe: remove the destination before rename).
+//! __init__.py LAST** (a failed __init__ write leaves a harmless unused
+//! module; the reverse would leave __init__ importing a missing module and
+//! break the webui at startup). Both writes are atomic-replace via tmp +
+//! rename (Windows-safe: remove the destination before rename).
+//!
+//! Injection shape (mirrors `create_api_app()` in the payload):
+//!   1. import fragment inserted directly ABOVE `def create_api_app() -> FastAPI:`
+//!   2. `app.include_router(alas_control_router)` inserted directly BELOW
+//!      the last `app.include_router(events.router)` line — registration
+//!      order matters, the catch-all frontend mount at "/" comes later in
+//!      the file and must not shadow API routes.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,9 +30,9 @@ const INJECT_IMPORT: &str = include_str!("../assets/patches/fastapi.inject.py");
 /// Exposed crate-wide: the real-payload integration test (control_api.rs)
 /// asserts marker uniqueness on the installed payload.
 pub(crate) const MARKER: &str = "# === alas-launcher:control-api ===";
-const INJECT_EXTEND: &str = "    routes.extend(control_routes())\n";
-const ANCHOR_IMPORT: &str = "from starlette.staticfiles import StaticFiles";
-const ANCHOR_RETURN: &str = "    return Starlette(";
+const INJECT_INCLUDE: &str = "    app.include_router(alas_control_router)\n";
+const ANCHOR_DEF: &str = "def create_api_app() -> FastAPI:";
+const ANCHOR_INCLUDE: &str = "    app.include_router(events.router)";
 
 static PATCH_FAILED: AtomicBool = AtomicBool::new(false);
 
@@ -45,33 +54,33 @@ fn mark_patch_failed() {
     PATCH_FAILED.store(true, Ordering::Relaxed);
 }
 
-pub fn is_already_patched(fastapi_content: &str) -> bool {
-    fastapi_content.contains(MARKER)
+pub fn is_already_patched(init_content: &str) -> bool {
+    init_content.contains(MARKER)
 }
 
-pub fn verify_anchor(fastapi_content: &str) -> bool {
-    fastapi_content.contains(ANCHOR_IMPORT) && fastapi_content.contains(ANCHOR_RETURN)
+pub fn verify_anchor(init_content: &str) -> bool {
+    init_content.contains(ANCHOR_DEF) && init_content.contains(ANCHOR_INCLUDE)
 }
 
-/// Inject the import + routes.extend into fastapi.py content.
+/// Inject the import + include_router into api/__init__.py content.
 /// Context-anchored; fails when either anchor is missing or already patched.
-fn inject_fastapi(content: &str) -> Result<String> {
+fn inject_api_init(content: &str) -> Result<String> {
     if is_already_patched(content) {
-        bail!("fastapi.py already patched");
+        bail!("api/__init__.py already patched");
     }
     if !verify_anchor(content) {
-        bail!("fastapi.py anchor mismatch");
+        bail!("api/__init__.py anchor mismatch");
     }
-    let with_import = content.replacen(
-        ANCHOR_IMPORT,
-        &format!("{ANCHOR_IMPORT}\n{INJECT_IMPORT}"),
+    let with_import = content.replacen(ANCHOR_DEF, &format!("{INJECT_IMPORT}\n{ANCHOR_DEF}"), 1);
+    let with_include = with_import.replacen(
+        ANCHOR_INCLUDE,
+        &format!("{ANCHOR_INCLUDE}\n{INJECT_INCLUDE}"),
         1,
     );
-    let with_extend = with_import.replacen(ANCHOR_RETURN, &format!("{INJECT_EXTEND}{ANCHOR_RETURN}"), 1);
-    if with_extend == with_import {
-        bail!("extend injection produced no change");
+    if with_include == with_import {
+        bail!("include injection produced no change");
     }
-    Ok(with_extend)
+    Ok(with_include)
 }
 
 /// Atomic replace; Windows-safe (rename over an existing file fails on
@@ -86,34 +95,34 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
 
 pub fn apply_patch(alas_dir: &Path) -> Result<PatchOutcome> {
     let webui = alas_dir.join("module").join("webui");
-    let fastapi_path = webui.join("fastapi.py");
+    let init_path = webui.join("api").join("__init__.py");
     let control_path = webui.join("control_api.py");
-    let fastapi = match std::fs::read_to_string(&fastapi_path) {
+    let api_init = match std::fs::read_to_string(&init_path) {
         Ok(c) => c,
         Err(e) => {
             mark_patch_failed();
-            return Err(e).context("read fastapi.py");
+            return Err(e).context("read api/__init__.py");
         }
     };
-    if is_already_patched(&fastapi) {
+    if is_already_patched(&api_init) {
         info!("control API patch already applied");
         return Ok(PatchOutcome::AlreadyApplied);
     }
-    if !verify_anchor(&fastapi) {
-        warn!("control API patch anchor mismatch in fastapi.py; scheduler toggle will degrade");
+    if !verify_anchor(&api_init) {
+        warn!("control API patch anchor mismatch in api/__init__.py; scheduler toggle will degrade");
         mark_patch_failed();
         return Ok(PatchOutcome::AnchorMismatch);
     }
-    match inject_fastapi(&fastapi) {
+    match inject_api_init(&api_init) {
         Ok(injected) => {
             // Order matters: the module FIRST, the importer LAST. A failure
-            // writing control_api.py must leave fastapi.py untouched. Every
-            // error path MUST set the fail-closed flag (Round-2 MUST-FIX:
-            // `?` short-circuiting bypassed mark_patch_failed, leaving the
-            // tray armed while the API is actually dead).
+            // writing control_api.py must leave api/__init__.py untouched.
+            // Every error path MUST set the fail-closed flag (Round-2
+            // MUST-FIX: `?` short-circuiting bypassed mark_patch_failed,
+            // leaving the tray armed while the API is actually dead).
             atomic_write(&control_path, CONTROL_API_SRC)
                 .inspect_err(|_| mark_patch_failed())?;
-            atomic_write(&fastapi_path, &injected)
+            atomic_write(&init_path, &injected)
                 .inspect_err(|_| mark_patch_failed())?;
             info!("control API patch applied");
             Ok(PatchOutcome::Applied)
@@ -130,23 +139,28 @@ pub fn apply_patch(alas_dir: &Path) -> Result<PatchOutcome> {
 mod tests {
     use super::*;
 
-    const PRISTINE: &str = r#"from starlette.staticfiles import StaticFiles
+    const PRISTINE: &str = r#""""FastAPI-based REST + SSE API for the Svelte SPA frontend."""
 
-def asgi_app(
-    applications,
-    ...
-):
-    routes = webio_routes(...)
-    if static_dir:
-        routes.append(...)
-    routes.append(...)
-    return Starlette(
-        routes=routes, middleware=middleware, debug=debug, **starlette_settings
-    )
+import os
+import threading
+
+from fastapi import FastAPI
+
+from module.webui.api.routers import config, control, events, i18n, remote, scheduler, schema, status, theme, updater
+from module.webui.setting import State
+
+
+def create_api_app() -> FastAPI:
+    app = FastAPI(title="Alas API")
+
+    app.include_router(status.router)
+    app.include_router(events.router)
+
+    return app
 "#;
 
     #[test]
-    fn pristine_fastapi_passes_anchor() {
+    fn pristine_api_init_passes_anchor() {
         assert!(verify_anchor(PRISTINE));
     }
 
@@ -156,52 +170,76 @@ def asgi_app(
     }
 
     #[test]
-    fn patched_fastapi_is_detected_already_applied() {
-        let patched = format!("{PRISTINE}\n# === alas-launcher:control-api ===\nfrom module.webui.control_api import control_routes\n");
+    fn missing_include_anchor_fails_injection() {
+        // 删掉 events.router 注册行后：def 锚点还在、include 锚点缺失，
+        // 注入必须在第二步失败（防半截注入）。
+        let partial = PRISTINE.replace("    app.include_router(events.router)\n", "");
+        assert!(!partial.contains(ANCHOR_INCLUDE));
+        assert!(inject_api_init(&partial).is_err());
+    }
+
+    #[test]
+    fn patched_api_init_is_detected_already_applied() {
+        let patched = format!("{PRISTINE}\n{MARKER}\nfrom module.webui.control_api import router as alas_control_router\n");
         assert!(is_already_patched(&patched));
+    }
+
+    #[test]
+    fn injected_content_registers_router_before_return() {
+        let out = inject_api_init(PRISTINE).unwrap();
+        assert!(out.contains("from module.webui.control_api import router as alas_control_router"));
+        assert!(out.contains(INJECT_INCLUDE));
+        // include 必须仍位于 return app 之前（路由先注册，前端 catch-all mount 后挂载）
+        let include_pos = out.find("app.include_router(alas_control_router)").unwrap();
+        let return_pos = out.find("    return app").unwrap();
+        assert!(include_pos < return_pos);
+        // import 注入必须位于 def create_api_app 之前（模块级 import）
+        let import_pos = out.find("from module.webui.control_api import router").unwrap();
+        let def_pos = out.find(ANCHOR_DEF).unwrap();
+        assert!(import_pos < def_pos);
     }
 
     #[test]
     fn apply_patch_is_idempotent_and_writes_both_files() {
         let tmp = std::env::temp_dir().join(format!("patch-apply-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        let webui = tmp.join("module").join("webui");
-        std::fs::create_dir_all(&webui).unwrap();
-        std::fs::write(webui.join("fastapi.py"), PRISTINE).unwrap();
+        let api_dir = tmp.join("module").join("webui").join("api");
+        std::fs::create_dir_all(&api_dir).unwrap();
+        std::fs::write(api_dir.join("__init__.py"), PRISTINE).unwrap();
 
         let first = apply_patch(&tmp).expect("first apply");
         assert_eq!(first, PatchOutcome::Applied);
-        assert!(webui.join("control_api.py").exists());
-        assert!(std::fs::read_to_string(webui.join("fastapi.py")).unwrap().contains(MARKER));
+        assert!(tmp.join("module").join("webui").join("control_api.py").exists());
+        assert!(std::fs::read_to_string(api_dir.join("__init__.py")).unwrap().contains(MARKER));
 
         let second = apply_patch(&tmp).expect("second apply");
         assert_eq!(second, PatchOutcome::AlreadyApplied);
         // 注入不重复
-        let fastapi = std::fs::read_to_string(webui.join("fastapi.py")).unwrap();
-        assert_eq!(fastapi.matches(MARKER).count(), 1);
+        let init = std::fs::read_to_string(api_dir.join("__init__.py")).unwrap();
+        assert_eq!(init.matches(MARKER).count(), 1);
     }
 
     #[test]
     fn apply_patch_on_mismatched_anchor_degrades_not_blocks() {
         let tmp = std::env::temp_dir().join(format!("patch-anchor-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        let webui = tmp.join("module").join("webui");
-        std::fs::create_dir_all(&webui).unwrap();
-        std::fs::write(webui.join("fastapi.py"), "def something_else():\n    pass\n").unwrap();
+        let api_dir = tmp.join("module").join("webui").join("api");
+        std::fs::create_dir_all(&api_dir).unwrap();
+        std::fs::write(api_dir.join("__init__.py"), "def something_else():\n    pass\n").unwrap();
         assert_eq!(apply_patch(&tmp).unwrap(), PatchOutcome::AnchorMismatch);
         assert!(patch_failed());
-        assert!(!webui.join("control_api.py").exists());
+        assert!(!tmp.join("module").join("webui").join("control_api.py").exists());
     }
 
     #[test]
     fn apply_patch_write_failure_is_fail_closed() {
         let tmp = std::env::temp_dir().join(format!("patch-writefail-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        let webui = tmp.join("module").join("webui");
-        std::fs::create_dir_all(&webui).unwrap();
-        std::fs::write(webui.join("fastapi.py"), PRISTINE).unwrap();
+        let api_dir = tmp.join("module").join("webui").join("api");
+        std::fs::create_dir_all(&api_dir).unwrap();
+        std::fs::write(api_dir.join("__init__.py"), PRISTINE).unwrap();
         // control_api.py exists as a DIRECTORY: rename(tmp, path) fails on Unix.
-        std::fs::create_dir(webui.join("control_api.py")).unwrap();
+        std::fs::create_dir(tmp.join("module").join("webui").join("control_api.py")).unwrap();
 
         let result = apply_patch(&tmp);
         assert!(result.is_err());
@@ -214,7 +252,7 @@ def asgi_app(
     fn apply_patch_read_failure_is_fail_closed() {
         let tmp = std::env::temp_dir().join(format!("patch-readfail-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(tmp.join("module").join("webui")).unwrap();
+        std::fs::create_dir_all(tmp.join("module").join("webui").join("api")).unwrap();
 
         let result = apply_patch(&tmp);
         assert!(result.is_err());

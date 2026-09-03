@@ -447,11 +447,15 @@ mod real_payload_tests {
         //    is the production behavior — the launcher patches the real
         //    payload; the test exercises the same path. AnchorMismatch ->
         //    degraded mode -> the API cannot exist -> skip (documented).
-        let fastapi_path = payload.join("module").join("webui").join("fastapi.py");
+        let init_path = payload
+            .join("module")
+            .join("webui")
+            .join("api")
+            .join("__init__.py");
         let control_path = payload.join("module").join("webui").join("control_api.py");
-        let before = std::fs::read_to_string(&fastapi_path).unwrap_or_default();
+        let before = std::fs::read_to_string(&init_path).unwrap_or_default();
         eprintln!(
-            "fastapi.py patched marker before apply = {}",
+            "api/__init__.py patched marker before apply = {}",
             crate::patch::is_already_patched(&before)
         );
         match crate::patch::apply_patch(payload) {
@@ -462,7 +466,7 @@ mod real_payload_tests {
                 eprintln!("patch already applied (idempotent)");
             }
             Ok(crate::patch::PatchOutcome::AnchorMismatch) => {
-                eprintln!("patch anchor mismatch in fastapi.py; control API unavailable — skipping");
+                eprintln!("patch anchor mismatch in api/__init__.py; control API unavailable — skipping");
                 return;
             }
             Err(e) => {
@@ -476,13 +480,13 @@ mod real_payload_tests {
             crate::patch::PatchOutcome::AlreadyApplied,
             "second apply must be AlreadyApplied"
         );
-        let fastapi_after = std::fs::read_to_string(&fastapi_path).expect("read patched fastapi.py");
+        let init_after = std::fs::read_to_string(&init_path).expect("read patched api/__init__.py");
         assert!(
-            crate::patch::is_already_patched(&fastapi_after),
+            crate::patch::is_already_patched(&init_after),
             "marker missing after apply"
         );
         assert_eq!(
-            fastapi_after.matches(crate::patch::MARKER).count(),
+            init_after.matches(crate::patch::MARKER).count(),
             1,
             "marker must be unique (no double injection)"
         );
