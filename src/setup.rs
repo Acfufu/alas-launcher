@@ -57,13 +57,39 @@ fn prepend_path_to_env(key: &str, path: PathBuf) {
     std::env::set_var(key, std::env::join_paths(paths).unwrap());
 }
 
+/// PATH entries prepended for a payload, most-specific first. The classic
+/// portable `toolkit/` layout ships its own python+git; the PR #5885 payload
+/// has no toolkit and expects a uv-managed `.venv` inside the payload tree
+/// (created by `uv sync` at install/switch time), with `git`/`adb` resolved
+/// from the system PATH.
+fn payload_path_prepend(dir: &std::path::Path) -> Vec<PathBuf> {
+    #[cfg(unix)]
+    {
+        vec![
+            dir.join("toolkit").join("libexec").join("git-core"),
+            dir.join("toolkit").join("bin"),
+            dir.join(".venv").join("bin"),
+        ]
+    }
+    #[cfg(windows)]
+    {
+        vec![
+            dir.join("toolkit").join("git").join("cmd"),
+            dir.join("toolkit").join("Scripts"),
+            dir.join("toolkit"),
+            dir.join(".venv").join("Scripts"),
+        ]
+    }
+}
+
 #[cfg(unix)]
 pub fn setup_environment() -> Result<()> {
     let dir = alas_repo_dir();
     info!("ALAS dir is {:?}", &dir);
     set_current_dir(&dir)?;
-    prepend_path_to_env("PATH", dir.join("toolkit").join("libexec").join("git-core"));
-    prepend_path_to_env("PATH", dir.join("toolkit").join("bin"));
+    for path in payload_path_prepend(&dir) {
+        prepend_path_to_env("PATH", path);
+    }
     prepend_path_to_env("LD_LIBRARY_PATH", dir.join("toolkit").join("lib"));
     Ok(())
 }
@@ -73,9 +99,9 @@ pub fn setup_environment() -> Result<()> {
     let dir = alas_repo_dir();
     info!("ALAS dir is {:?}", &dir);
     set_current_dir(&dir)?;
-    prepend_path_to_env("PATH", dir.join("toolkit").join("git").join("cmd"));
-    prepend_path_to_env("PATH", dir.join("toolkit").join("Scripts"));
-    prepend_path_to_env("PATH", dir.join("toolkit"));
+    for path in payload_path_prepend(&dir) {
+        prepend_path_to_env("PATH", path);
+    }
     Ok(())
 }
 
@@ -362,6 +388,23 @@ mod tests {
         assert_eq!(Some(25), find_percentage("loading 25%..."));
         assert_eq!(Some(100), find_percentage("100%..."));
         assert_eq!(None, find_percentage("%1"));
+    }
+
+    #[test]
+    fn test_payload_path_prepend_includes_venv() {
+        let dir = std::path::Path::new("/repo");
+        let entries = payload_path_prepend(dir);
+        let rendered = format!("{:?}", entries);
+        // uv-managed venv resolves python for the PR #5885 payload...
+        if cfg!(unix) {
+            assert!(rendered.contains("\"/repo/.venv/bin\""), "{rendered}");
+        } else {
+            assert!(rendered.contains("\"/repo/.venv/Scripts\""), "{rendered}");
+        }
+        // ...while the classic toolkit layout keeps priority (prepended first).
+        let venv_pos = rendered.find(".venv").expect("venv entry present");
+        let toolkit_pos = rendered.find("toolkit").expect("toolkit entries present");
+        assert!(toolkit_pos < venv_pos, "toolkit must precede .venv: {rendered}");
     }
 
     #[test]
