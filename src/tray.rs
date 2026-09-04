@@ -54,6 +54,9 @@ const TRAY_POLL_INTERVAL_SECS: Duration = Duration::from_secs(3);
 /// toggles — only one scheduler click session at a time). `port_fail_count`
 /// is the poll thread's CONSECUTIVE failed-probe streak (MINOR-5): two
 /// misses mark the backend crashed, a success resets it.
+/// `icon_running` mirrors the icon currently shown (true = filled 实心 /
+/// scheduler alive, false = outlined 描边) so `rebuild_menu` only calls
+/// `set_icon` on a flip instead of every poll cycle.
 #[derive(Clone)]
 struct TrayShared {
     backend: Arc<BackendLifecycle>,
@@ -63,6 +66,7 @@ struct TrayShared {
     refresh: mpsc::Sender<()>,
     in_flight: Arc<AtomicBool>,
     port_fail_count: Arc<AtomicU8>,
+    icon_running: Arc<AtomicBool>,
 }
 
 /// Poll-thread-only notification baseline state (NOT shared across threads).
@@ -115,6 +119,10 @@ pub fn build_tray(
         refresh: refresh_tx.clone(),
         in_flight: Arc::new(AtomicBool::new(false)),
         port_fail_count: Arc::new(AtomicU8::new(0)),
+        // Startup state is Stopped (the initial snapshot below), so the
+        // outlined icon matches — filled only once the scheduler scan
+        // confirms alive.
+        icon_running: Arc::new(AtomicBool::new(false)),
     };
 
     let labels = load_control_labels(&shared.settings);
@@ -146,7 +154,9 @@ pub fn build_tray(
 
     let thread_shared = shared.clone();
     let tray = TrayIconBuilder::with_id("main-tray")
-        .icon(tauri::include_image!("icons/tray-icon.png"))
+        // Outlined 描边 icon: the startup snapshot is Stopped. `rebuild_menu`
+        // swaps to the filled 实心 icon when the scheduler scan confirms alive.
+        .icon(tauri::include_image!("icons/tray-icon-outline.png"))
         .icon_as_template(true)
         .menu(&menu)
         .show_menu_on_left_click(true)
@@ -653,6 +663,25 @@ fn rebuild_menu(app: &AppHandle, shared: &TrayShared, section: TaskSection, sche
     };
     if let Some(tray) = app.tray_by_id("main-tray") {
         let _ = tray.set_menu(Some(menu));
+        // 状态语义图标：实心 = 调度器确认存活（scheduler_alive == Some(true)），
+        // 描边 = 已停止 / 未知（后端未 Running、启动中、扫描无结果均归描边，
+        // 与状态行的保守判停一致）。AtomicBool 去重：只在翻转时调 set_icon，
+        // 不让每个 poll 周期都重设像素。
+        let running = scheduler_alive == Some(true);
+        if shared.icon_running.swap(running, Ordering::Relaxed) != running {
+            let icon = if running {
+                tauri::include_image!("icons/tray-icon.png")
+            } else {
+                tauri::include_image!("icons/tray-icon-outline.png")
+            };
+            let _ = tray.set_icon(Some(icon));
+            // tray-icon 0.20.1 hardcodes is_template=false inside set_icon
+            // (platform_impl/macos/mod.rs:117), so every swap wipes the
+            // template flag and the glyph renders raw black in dark mode.
+            // Re-assert the flag after each swap or the tint never comes back.
+            let _ = tray.set_icon_as_template(true);
+            info!(running, "tray icon switched (filled=alive / outlined=stopped)");
+        }
     }
 }
 

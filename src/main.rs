@@ -1,6 +1,10 @@
 // No default console window creation on Windows
 #![windows_subsystem = "windows"]
 
+// Tray-icon asset gate: cargo-test validation of the two PNGs tray.rs embeds
+// (template format / size / ink band). Cross-platform on purpose so every CI
+// run catches a blank or corrupted asset before it ships.
+mod icon_assets;
 // Consumed only by the macOS tray (tray.rs); gated so win/linux builds do not
 // compile an unused module (clippy -D warnings).
 #[cfg(target_os = "macos")]
