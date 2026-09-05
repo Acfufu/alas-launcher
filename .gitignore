@@ -22,3 +22,5 @@ node_modules/
 
 # Tooling artifacts (local agent state, not project files)
 .v2c/
+# Local security audit report (contains exploit paths; not published to the public repo)
+deepsec-security-report.html
