@@ -4,9 +4,16 @@
 //! already installs `Menu::default` on macOS at startup (tauri 2.5.1
 //! app.rs:2068 — probe: `app.menu()` returns Some, and osascript listed
 //! `Apple, alas-launcher, File, Edit, View, Window, Help`), so we keep that
-//! default menu and append a single 「外壳设置」 submenu (id `settings-menu`)
+//! default menu and attach a single 「外壳设置」 submenu (id `settings-menu`)
 //! instead of replacing the whole bar with a custom menu (strategy B would
 //! drop File/Edit/View/Window/Help for no benefit).
+//!
+//! The settings submenu is attached INSIDE the macOS app menu (the first
+//! submenu, titled with the app name, e.g. `alas-launcher`) — mirroring the
+//! platform convention of putting Preferences under the app menu — so the
+//! bar reads `Apple, alas-launcher (▸ 外壳设置), File, Edit, View, Window,
+//! Help` and Settings is reachable as a second-level menu item under
+//! `alas-launcher` rather than a top-level bar entry.
 //!
 //! Menu events are dispatched by the app-level `on_menu_event` wired in
 //! main.rs setup; the tray's own `TrayIconBuilder::on_menu_event` (tray-* ids)
@@ -408,6 +415,7 @@ pub struct SettingsMenuHandles {
     follow: CheckMenuItem<Wry>,
     check_update: MenuItem<Wry>,
     auto_start: CheckMenuItem<Wry>,
+    restart: MenuItem<Wry>,
     notify_master: CheckMenuItem<Wry>,
     notify_death: CheckMenuItem<Wry>,
     notify_task: CheckMenuItem<Wry>,
@@ -439,6 +447,7 @@ impl SettingsMenuHandles {
         self.check_update.set_text(labels.check_update.clone())?;
         self.auto_start.set_text(labels.auto_start.clone())?;
         self.auto_start.set_checked(settings.auto_start_backend)?;
+        self.restart.set_text(labels.restart_backend.clone())?;
         self.notify_master.set_text(labels.notify_master.clone())?;
         self.notify_master.set_checked(settings.notify_enabled)?;
         self.notify_death.set_text(labels.notify_death.clone())?;
@@ -547,6 +556,14 @@ pub fn build_settings_menu(
         None::<&str>,
     )?;
     let sep_after_auto_start = PredefinedMenuItem::separator(app)?;
+    let restart = MenuItem::with_id(
+        app,
+        "settings-restart-backend",
+        labels.restart_backend.clone(),
+        true,
+        None::<&str>,
+    )?;
+    let sep_after_restart = PredefinedMenuItem::separator(app)?;
     let notify_master = CheckMenuItem::with_id(
         app,
         "settings-notify-master",
@@ -579,6 +596,8 @@ pub fn build_settings_menu(
         &sep_after_check,
         &auto_start,
         &sep_after_auto_start,
+        &restart,
+        &sep_after_restart,
         &notify_master,
         &notify_death,
         &notify_task,
@@ -590,7 +609,16 @@ pub fn build_settings_menu(
         true,
         &items,
     )?;
-    menu.append(&settings_submenu)?;
+    // Attach the settings submenu INSIDE the macOS app menu (the first
+    // submenu of the bar, titled with the app name) — platform convention
+    // puts Preferences under the app menu. Fall back to the bar root if no
+    // submenu exists (exotic setups where Menu::default produced none).
+    let bar_items = menu.items()?;
+    let app_submenu = bar_items.iter().find_map(|item| item.as_submenu());
+    match app_submenu {
+        Some(app_menu) => app_menu.append(&settings_submenu)?,
+        None => menu.append(&settings_submenu)?,
+    }
 
     Ok(SettingsMenuHandles {
         menu,
@@ -600,6 +628,7 @@ pub fn build_settings_menu(
         follow,
         check_update,
         auto_start,
+        restart,
         notify_master,
         notify_death,
         notify_task,
