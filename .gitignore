@@ -19,3 +19,6 @@ docs/
 
 # Node
 node_modules/
+
+# Tooling artifacts (local agent state, not project files)
+.v2c/
