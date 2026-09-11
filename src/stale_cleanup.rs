@@ -706,7 +706,7 @@ mod tests {
         // anywhere in argv still fires E2.
         let c = Candidate {
             exe: Some(PathBuf::from("/opt/other/python")),
-            cmd: vec!["python".into(), "-x", "gui.py", "22267"].iter().map(OsString::from).collect(),
+            cmd: vec!["python".into(), "-x".into(), "gui.py".into(), "22267".into()],
             ..cand(107, Some(17))
         };
         assert_eq!(

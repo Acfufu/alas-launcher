@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feat/*"]
+  pull_request:
+
+jobs:
+  test:
+    # macOS-only self-use (D4/打包口径): one macOS job, no matrix. Extend to
+    # windows/ubuntu runners only when a distribution need appears.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --verbose
+
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Debug build keeps runner minutes low while still exercising the full
+      # bundler path (Info.plist, .app layout, bundle.targets=["app"]).
+      # The repo has no package.json (ui/ is a static frontendDist), so the
+      # CLI comes via npx; its bin is `tauri`, no extra subcommand.
+      - name: Tauri build (debug bundle)
+        run: npx -y @tauri-apps/cli build --debug

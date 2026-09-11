@@ -57,13 +57,39 @@ fn prepend_path_to_env(key: &str, path: PathBuf) {
     std::env::set_var(key, std::env::join_paths(paths).unwrap());
 }
 
+/// PATH entries prepended for a payload, most-specific first. The classic
+/// portable `toolkit/` layout ships its own python+git; the PR #5885 payload
+/// has no toolkit and expects a uv-managed `.venv` inside the payload tree
+/// (created by `uv sync` at install/switch time), with `git`/`adb` resolved
+/// from the system PATH.
+fn payload_path_prepend(dir: &std::path::Path) -> Vec<PathBuf> {
+    #[cfg(unix)]
+    {
+        vec![
+            dir.join("toolkit").join("libexec").join("git-core"),
+            dir.join("toolkit").join("bin"),
+            dir.join(".venv").join("bin"),
+        ]
+    }
+    #[cfg(windows)]
+    {
+        vec![
+            dir.join("toolkit").join("git").join("cmd"),
+            dir.join("toolkit").join("Scripts"),
+            dir.join("toolkit"),
+            dir.join(".venv").join("Scripts"),
+        ]
+    }
+}
+
 #[cfg(unix)]
 pub fn setup_environment() -> Result<()> {
     let dir = alas_repo_dir();
     info!("ALAS dir is {:?}", &dir);
     set_current_dir(&dir)?;
-    prepend_path_to_env("PATH", dir.join("toolkit").join("libexec").join("git-core"));
-    prepend_path_to_env("PATH", dir.join("toolkit").join("bin"));
+    for path in payload_path_prepend(&dir) {
+        prepend_path_to_env("PATH", path);
+    }
     prepend_path_to_env("LD_LIBRARY_PATH", dir.join("toolkit").join("lib"));
     Ok(())
 }
@@ -73,9 +99,9 @@ pub fn setup_environment() -> Result<()> {
     let dir = alas_repo_dir();
     info!("ALAS dir is {:?}", &dir);
     set_current_dir(&dir)?;
-    prepend_path_to_env("PATH", dir.join("toolkit").join("git").join("cmd"));
-    prepend_path_to_env("PATH", dir.join("toolkit").join("Scripts"));
-    prepend_path_to_env("PATH", dir.join("toolkit"));
+    for path in payload_path_prepend(&dir) {
+        prepend_path_to_env("PATH", path);
+    }
     Ok(())
 }
 
@@ -130,17 +156,35 @@ pub fn setup_alas_repo(mut status_updater: impl FnMut(&str)) -> Result<()> {
 /// included automatically, unlike a cone-mode allowlist. Fail-soft: old git
 /// (<2.25, no sparse-checkout) or a broken repo degrades to keeping webapp/
 /// instead of blocking the launch.
+/// Sparse-checkout denylist patterns (non-cone, gitignore semantics — the
+/// last matching pattern wins, so negations must follow `/*`).
+///
+/// `/*` includes every top-level entry so future upstream dirs appear
+/// automatically. `!webapp/` drops the dead Electron launcher (frozen
+/// upstream since 2022-01-16). `!webapp-tauri/src-tauri/` drops the PR #5885
+/// Tauri shell's Rust side while keeping `webapp-tauri/` frontend sources —
+/// the FastAPI webui serves its pages from `webapp-tauri/dist`, which is
+/// built from those sources (excluding the whole directory would leave the
+/// webui with no frontend to mount).
+fn sparse_checkout_patterns() -> Vec<&'static str> {
+    vec!["/*", "!webapp/", "!webapp-tauri/src-tauri/"]
+}
+
 fn apply_sparse_checkout(status_updater: &mut impl FnMut(&str)) {
-    status_updater("Excluding webapp (dead Electron launcher)");
+    status_updater("Excluding webapp and webapp-tauri/src-tauri (dead shells)");
     let dir = alas_repo_dir();
+    let mut args = vec!["sparse-checkout", "set", "--no-cone"];
+    args.extend(sparse_checkout_patterns());
     let status = Command::new("git")
         .current_dir(&dir)
-        .args(["sparse-checkout", "set", "--no-cone", "/*", "!webapp/"])
+        .args(&args)
         .status();
     match status {
-        Ok(s) if s.success() => info!("sparse checkout applied: excluded webapp/ in {:?}", dir),
-        Ok(s) => warn!("sparse checkout failed with {s}; keeping webapp/"),
-        Err(e) => warn!("sparse checkout failed: {e:#}; keeping webapp/"),
+        Ok(s) if s.success() => {
+            info!("sparse checkout applied: excluded webapp/ and webapp-tauri/src-tauri/ in {:?}", dir)
+        }
+        Ok(s) => warn!("sparse checkout failed with {s}; keeping excluded dirs present"),
+        Err(e) => warn!("sparse checkout failed: {e:#}; keeping excluded dirs present"),
     }
 }
 
@@ -344,5 +388,40 @@ mod tests {
         assert_eq!(Some(25), find_percentage("loading 25%..."));
         assert_eq!(Some(100), find_percentage("100%..."));
         assert_eq!(None, find_percentage("%1"));
+    }
+
+    #[test]
+    fn test_payload_path_prepend_includes_venv() {
+        let dir = std::path::Path::new("/repo");
+        let entries = payload_path_prepend(dir);
+        let rendered = format!("{:?}", entries);
+        // uv-managed venv resolves python for the PR #5885 payload...
+        if cfg!(unix) {
+            assert!(rendered.contains("\"/repo/.venv/bin\""), "{rendered}");
+        } else {
+            assert!(rendered.contains("\"/repo/.venv/Scripts\""), "{rendered}");
+        }
+        // ...while the classic toolkit layout keeps priority (prepended first).
+        let venv_pos = rendered.find(".venv").expect("venv entry present");
+        let toolkit_pos = rendered.find("toolkit").expect("toolkit entries present");
+        assert!(toolkit_pos < venv_pos, "toolkit must precede .venv: {rendered}");
+    }
+
+    #[test]
+    fn test_sparse_checkout_patterns() {
+        let patterns = sparse_checkout_patterns();
+        // `/*` first: non-cone denylist needs the include-all baseline up
+        // front, and gitignore semantics make later negations win over it.
+        assert_eq!(patterns.first(), Some(&"/*"));
+        assert!(patterns.contains(&"!webapp/"), "dead Electron launcher must stay excluded");
+        assert!(
+            patterns.contains(&"!webapp-tauri/src-tauri/"),
+            "PR #5885 Tauri shell's Rust side must be excluded"
+        );
+        // Frontend sources stay so webapp-tauri/dist can be built for webui.
+        assert!(
+            !patterns.iter().any(|p| p.contains("webapp-tauri") && !p.contains("src-tauri")),
+            "webapp-tauri/ frontend sources must not be excluded"
+        );
     }
 }
