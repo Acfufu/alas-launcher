@@ -1,6 +1,7 @@
 use std::{
     io,
     net::TcpStream,
+    path::Path,
     process::{Command, ExitStatus},
     sync::Mutex,
     thread::sleep,
@@ -129,14 +130,34 @@ pub struct ManagedBackend {
 }
 
 impl ManagedBackend {
-    /// Spawn gui.py as the leader of a new process group and register it with
-    /// the exit registry — the spawn-window safety net (spec §3.1): even before
-    /// the child is installed in state, an exit sweep can group-kill it.
+    /// Spawn the ALAS backend as the leader of a new process group and register
+    /// it with the exit registry — the spawn-window safety net (spec §3.1): even
+    /// before the child is installed in state, an exit sweep can group-kill it.
     /// No readiness wait: that lives in `BackendLifecycle::wait_for_ready`.
+    /// Entry point: `gui.py` on legacy payload trees; the PR-5885 fork removed it
+    /// in the 2026-09 reorg, so those trees spawn `python -m module.cli run web`.
     pub fn spawn(port: u16) -> Result<Self> {
         std::env::set_var("ALAS_LAUNCHER_PID", format!("{}", std::process::id()));
         let mut cmd = Command::new("python");
-        cmd.args(["gui.py", "--host", "127.0.0.1", "--port", &port.to_string()]);
+        if Path::new("gui.py").exists() {
+            cmd.args(["gui.py", "--host", "127.0.0.1", "--port", &port.to_string()]);
+        } else {
+            // cwd is the payload root (setup_environment), so the relative probe
+            // sees the payload tree. `--no-open` keeps browser opening ours.
+            // Note: stale-cleanup argv heuristics still key on "gui.py" and do
+            // not match this form; the exit-registry group-kill still covers it.
+            cmd.args([
+                "-m",
+                "module.cli",
+                "run",
+                "web",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+                "--no-open",
+            ]);
+        }
         let child = spawn_with_group(&mut cmd)?;
         register_for_exit(&child);
         Ok(Self {
