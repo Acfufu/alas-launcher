@@ -345,7 +345,7 @@
       <li class="cfg"><b>读「自动启动」门闩</b>（macOS）：<code>ShellSettings.auto_start_backend</code>（默认开）；非 macOS 恒为开。决定 Ready 线程走「自动启动」还是「只准备不启动」分支。</li>
       <li class="rust"><b>splash 窗口当进度条</b>：<code>text_to_splash()</code> 把文本包成一个自包含 HTML 再 base64 成 <code>data:</code> URL，<code>splash.navigate()</code> 即可换页——不需要静态资源服务器。然后 <code>setup_alas_repo()</code>：先跑 ALAS 自己的 <code>deploy.atomic.atomic_failure_cleanup('./config')</code> 清掉上次中断的残留（详见 §5），再跑 git 更新，进度实时刷到 splash；更新完成后用 sparse-checkout 排除两个废弃壳——<code>webapp/</code> 与 <code>webapp-tauri/src-tauri/</code>（保留 webapp-tauri 前端源码：FastAPI 网页的页面来自 webapp-tauri/dist）。随后应用控制 API 补丁（<code>apply_patch</code>，锚点 <code>module/webui/api/__init__.py</code>，详见 §8）；补丁失败只降级为进程级控制，不阻塞启动。</li>
       <li class="py"><b>拉起后端（<code>backend.start(port)</code>）</b>：置环境变量 <code>ALAS_LAUNCHER_PID=启动器pid</code>，spawn 进<b>独立进程组</b>——入口按树形二选一：payload 里有 <code>gui.py</code> → <code>python gui.py --host 127.0.0.1 --port &lt;端口&gt;</code>；PR-5885 fork 的树已删 gui.py → <code>python -m module.cli run web --host 127.0.0.1 --port &lt;端口&gt; --no-open</code>（stale-cleanup 的 argv 启发式同时认 gui.py 与 module.cli 两种形态、F 锚点接受 toolkit 与 .venv 解释器（与本入口保持同步））。然后每 100ms 试连 <code>127.0.0.1:端口</code>，最多 60 秒。连上后还要（探测工具可用时）<b>验证端口主人是自己人</b>（§4 端口所有权探测；工具缺失则 fail-open 跳过）——防止一个陈旧服务器占了端口还假装启动成功。另外 spawn 之前就有一步「清场」：<code>kill_stale_alas</code> 主动击杀上次启动器遗留的 ALAS 残留进程（10 轮 × 200ms），杀不动的幸存者或异主占口才走到「拒绝启动」（§4）。</li>
-      <li class="rust"><b>收尾分支</b>：成功 → 销毁 splash、main 窗口导航到 <code>http://127.0.0.1:端口/</code>、显示。<b>仓库准备失败</b>（git/清理阶段）→ splash 保留错误文本，<code>mark_stopped</code> 置回 Stopped 但<b>不置 start_failed</b>——这是「没启动成」，不是「启动失败」。<b>后端启动失败</b>（spawn/端口阶段）→ 状态机置 Stopped + <code>start_failed=true</code>，splash 保留「Starting GUI」页（stale-cleanup 类错误则导航到专属错误页），托盘显示本地化的启动失败文案。两条失败路径之后都要唤醒托盘刷新。自动启动关闭时 → 更新完仓库后同样 <code>mark_stopped</code>，把 main 窗口导航到<b>本地化「已停止」页</b>（也是 data: URL），托盘开关保持可用。</li>
+      <li class="rust"><b>收尾分支</b>：成功 → 销毁 splash、main 窗口导航到 <code>http://127.0.0.1:端口/</code>、显示。<b>仓库准备失败</b>（git/清理阶段）→ splash 保留错误文本，<code>mark_stopped</code> 置回 Stopped 但<b>不置 start_failed</b>——这是「没启动成」，不是「启动失败」。<b>后端启动失败</b>（spawn/端口阶段）→ 状态机置 Stopped + <code>start_failed=true</code>，<b>所有失败都导航 splash 到 <code>start_error_url()</code> 错误页</b>（stale-cleanup 类给幸存者 pid/换端口指引，其余给具体错误——R5 审计前非 stale 类只落日志、splash 永冻「Starting GUI」；托盘启动路径同样渲染），托盘显示本地化的启动失败文案。两条失败路径之后都要唤醒托盘刷新。自动启动关闭时 → 更新完仓库后同样 <code>mark_stopped</code>，把 main 窗口导航到<b>本地化「已停止」页</b>（也是 data: URL），托盘开关保持可用。</li>
     </ol>
     <div class="callout warn"><b>两个关键时序细节：</b>① <code>begin_start()</code> 必须早于 splash 之后的一切 I/O——初始化窗口内托盘开关禁用，是「绝不双开后端」的第一道保险；② 任何 <code>mark_stopped</code> 之后都要显式唤醒托盘轮询线程，因为轮询的「差异门控」不把状态迁移当变化，不唤醒就会卡在「启动中…」的假渲染上。</div>
   </div>
@@ -651,7 +651,7 @@
     </table>
     <p style="margin-top:14px"><b>ExitRequested 内部顺序（有讲究）：</b></p>
     <ol class="plain" style="font-size:13.5px;padding-left:20px">
-      <li>先置 <code>tray_stop=true</code> 并<b>同步 join 托盘轮询线程</b>（MAJOR-4：靠 join 而不是「下一圈退出」的标志位——轮询线程在收尾前还在做无害的状态读取，绝不允许对已销毁的托盘调 <code>set_menu</code>，那是崩溃源）。</li>
+      <li>先置 <code>tray_stop=true</code> 并经 <b>janitor 线程 join 托盘轮询线程（3 秒有界等待，超时放弃、随进程退出回收）</b>（MAJOR-4：靠 join 而不是「下一圈退出」的标志位——轮询线程在收尾前还在做无害的状态读取，绝不允许对已销毁的托盘调 <code>set_menu</code>。R4 审计：不能在主线程直接 join——菜单 API 从非主线程是「投递主线程 + 同步 recv」，退出处理冻结事件循环时二者互等死锁；poll_once 入口与重建前的 stop 复查把窗口压到 ms 级）。</li>
       <li><code>kill_registered_groups()</code>——杀掉更新/清理阶段登记的进程组（用户更新到一半关窗口，git/pip 树不孤儿）。</li>
       <li><code>backend.stop()</code>——状态置 Stopped + epoch 自增（打断任何在途 spawn），进程组 SIGTERM → 500ms → SIGKILL；ManagedBackend Drop 里 had_child 门控的 ALAS_LAUNCHER_PID 残留清扫随 Drop 触发。</li>
       <li><b>退出兜底再扫一遍</b>：<code>cleanup_for_exit</code> 最后<b>无条件</b>做一次全系统 ALAS_LAUNCHER_PID 清扫——防 setsid 守护化的孙进程不在注册表组内、Drop 清扫又被 had_child 门控跳过的组合漏网（ALAS 目前从不 setsid，纯防御）。</li>
@@ -666,20 +666,20 @@
   <div class="card">
     <table>
       <tr><th>文件</th><th>行数</th><th>是什么</th><th>你想找的东西</th></tr>
-      <tr><td><code>src/main.rs</code></td><td>640</td><td>入口 + 编排</td><td>Ready 线程、JS 注入、退出清理、save_as 命令</td></tr>
-      <tr><td><code>src/backend.rs</code></td><td>1579</td><td>后端生命周期状态机</td><td>三态流转、epoch 竞态、toggle_decision 矩阵、调度器存活规则</td></tr>
+      <tr><td><code>src/main.rs</code></td><td>694</td><td>入口 + 编排</td><td>Ready 线程、JS 注入、退出清理、save_as 命令</td></tr>
+      <tr><td><code>src/backend.rs</code></td><td>1605</td><td>后端生命周期状态机</td><td>三态流转、epoch 竞态、toggle_decision 矩阵、调度器存活规则</td></tr>
       <tr><td><code>src/child_process.rs</code> + <code>child_process/port.rs</code></td><td>641</td><td>进程组管家 + 端口探测</td><td>spawn/kill/wait 语义、退出注册表、lsof/ss/netstat 解析</td></tr>
-      <tr><td><code>src/setup.rs</code></td><td>427</td><td>环境 + 仓库准备</td><td>PATH 注入、git 进度解析、atomic 清理、sparse-checkout、apply_patch</td></tr>
-      <tr><td><code>src/deploy_config.rs</code></td><td>252</td><td>deploy.yaml 类型化读取</td><td>端口/语言/EnableReload/控制 API 可用性 + 缺省矩阵测试</td></tr>
-      <tr><td><code>src/tray.rs</code></td><td>1195</td><td>macOS 托盘</td><td>3 秒轮询、两连败崩溃判定、开关决策链、in-flight 去重</td></tr>
+      <tr><td><code>src/setup.rs</code></td><td>488</td><td>环境 + 仓库准备</td><td>PATH 注入、git 进度解析、atomic 清理、sparse-checkout、apply_patch</td></tr>
+      <tr><td><code>src/deploy_config.rs</code></td><td>325</td><td>deploy.yaml 类型化读取</td><td>端口/语言/EnableReload/控制 API 可用性 + 缺省矩阵测试</td></tr>
+      <tr><td><code>src/tray.rs</code></td><td>1345</td><td>macOS 托盘</td><td>3 秒轮询、两连败崩溃判定、开关决策链、in-flight 去重</td></tr>
       <tr><td><code>src/control_api.rs</code></td><td>632</td><td>控制 API HTTP 客户端</td><td>instances / scheduler start·stop、5s 超时、Locked 降级</td></tr>
-      <tr><td><code>src/patch.rs</code></td><td>263</td><td>控制 API 补丁注入</td><td>锚点校验、幂等 marker、fail-closed 写序</td></tr>
+      <tr><td><code>src/patch.rs</code></td><td>329</td><td>控制 API 补丁注入</td><td>锚点校验、幂等 marker、fail-closed 写序</td></tr>
       <tr><td><code>src/notify.rs</code></td><td>336</td><td>通知决策</td><td>死亡检测、任务完成 diff、liveness 闸门</td></tr>
-      <tr><td><code>src/menu_model.rs</code></td><td>1447</td><td>纯菜单模型</td><td>poll_decision、分组渲染、双语 label 表（含 i18n 覆盖）</td></tr>
+      <tr><td><code>src/menu_model.rs</code></td><td>1559</td><td>纯菜单模型</td><td>poll_decision、分组渲染、双语 label 表（含 i18n 覆盖）</td></tr>
       <tr><td><code>src/alas_tasks.rs</code></td><td>490</td><td>任务列表文件读取</td><td>alas.json 解析、Running/Queued/Waiting 分类</td></tr>
       <tr><td><code>src/shell_settings.rs</code></td><td>391</td><td>外壳设置持久化</td><td>settings.json 原子写、resolved_language</td></tr>
       <tr><td><code>src/shell_menu.rs</code></td><td>932</td><td>外壳设置菜单</td><td>检查更新 git 序列、muda 句柄原地改菜单</td></tr>
-      <tr><td><code>src/stale_cleanup.rs</code></td><td>1110</td><td>陈旧后端识别决策</td><td>纯函数判定「这是上次启动器遗留的 ALAS 后端吗」：X 否决 + toolkit 锚点 + E1-E4 证据</td></tr>
+      <tr><td><code>src/stale_cleanup.rs</code></td><td>1293</td><td>陈旧后端识别决策</td><td>纯函数判定「这是上次启动器遗留的 ALAS 后端吗」：X 否决 + toolkit 锚点 + E1-E4 证据</td></tr>
       <tr><td><code>src/icon_assets.rs</code></td><td>55</td><td>托盘图标资产测试门</td><td>嵌入 PNG 的格式/尺寸/墨水覆盖率断言（防全透明图标再上线）</td></tr>
       <tr><td><code>src/window_util.rs</code></td><td>45</td><td>Windows 无控制台窗口</td><td>CREATE_NO_WINDOW 门控</td></tr>
       <tr><td><code>tauri.conf.json</code></td><td>—</td><td>窗口/打包配置</td><td>splash 与 main 两个窗口、withGlobalTauri</td></tr>
