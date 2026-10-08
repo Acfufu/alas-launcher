@@ -333,7 +333,7 @@ fn kill_child(child: &mut Child) -> Option<std::process::ExitStatus> {
 /// Any step failing (no git / not a repo / no remote / network hang past the
 /// 15s timeout) degrades to 检查失败 — the plan's failure path.
 ///
-/// Mirrors `spawn_scheduler_call` (tray.rs:476): dedicated thread, UI thread
+/// Mirrors tray.rs `spawn_scheduler_call`: dedicated thread, UI thread
 /// never blocks, no settings lock held across the git I/O.
 pub fn spawn_check_update(
     app: &AppHandle,
