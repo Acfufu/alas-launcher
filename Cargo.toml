@@ -28,6 +28,11 @@ tauri-plugin-dialog = "2"
 tauri-plugin-notification = "=2.2.1"
 sysinfo = { version = "0.36.1", default-features = false, features = ["system"] }
 ctrlc = "3.5.0"
+# Native error dialog for the pre-Tauri setup_environment failure path
+# (main.rs): the splash error page needs a built window, which does not
+# exist yet at that point. Same 0.15.x line tauri-plugin-dialog resolves
+# to — no extra crate is compiled.
+rfd = "0.15"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.30", features = ["signal"] }

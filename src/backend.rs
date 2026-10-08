@@ -144,8 +144,9 @@ impl ManagedBackend {
         } else {
             // cwd is the payload root (setup_environment), so the relative probe
             // sees the payload tree. `--no-open` keeps browser opening ours.
-            // Note: stale-cleanup argv heuristics still key on "gui.py" and do
-            // not match this form; the exit-registry group-kill still covers it.
+            // stale-cleanup's L-B/E2 match the "module.cli" argv form and its
+            // F anchor accepts the payload's .venv interpreter — keep the two
+            // in sync (stale_cleanup.rs is_repo_interpreter / E2 shapes).
             cmd.args([
                 "-m",
                 "module.cli",
@@ -203,7 +204,14 @@ impl ManagedBackend {
                 warn!("gui.py didn't exit, killing it...");
             }
             // kill 失败 → 不注销：组可能还活着，registry 是退出兜底。
-            kill_group(&mut child)?;
+            // 尾部与循环内注销契约对齐（Ok **或 ESRCH** 都注销，同上方 match）：
+            // ESRCH ⟺ 组已死，`?` 早退会同时跳过注销（留陈旧条目）与 wait 的
+            // 收割；非 ESRCH 失败（如 EPERM）保持原语义——不注销、不 wait。
+            match kill_group(&mut child) {
+                Ok(_) => {}
+                Err(e) if e.raw_os_error() == Some(nix::errno::Errno::ESRCH as i32) => {}
+                Err(e) => return Err(e.into()),
+            }
             unregister_for_exit(pid);
             Ok(child.wait()?)
         } else {

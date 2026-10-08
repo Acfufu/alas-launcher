@@ -28,7 +28,7 @@ use tracing::warn;
 
 /// Persisted launcher shell settings.
 ///
-/// `language: None` = follow the ALAS deploy.yaml `Gui.Language`;
+/// `language: None` = follow the ALAS deploy.yaml `Deploy.Webui.Language`;
 /// `Some(code)` = explicit override (zh-CN / zh-TW / en-US / ja-JP).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShellSettings {

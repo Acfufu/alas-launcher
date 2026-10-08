@@ -81,7 +81,18 @@ impl ManagedChild {
 /// [`kill_group`] and the timeout path kill the whole tree (python plus its
 /// git/pip grandchildren), never leaving orphans.
 pub fn spawn_with_group(cmd: &mut Command) -> Result<ManagedChild> {
-    let child = cmd.group().create_no_window().spawn()?;
+    let mut builder = cmd.group();
+    // Windows: kill_on_drop(true) is what turns the job object into the
+    // kill-on-close variant the module doc promises — without
+    // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE a launcher crash (panic /
+    // TerminateProcess) closes the job handle WITHOUT killing the tree,
+    // orphaning the backend and any mid-update git/pip grandchildren. The
+    // method is compile-gated to Windows in command-group; on Unix
+    // GroupChild has no drop-kill at all — the exit registry and residue
+    // scans remain the crash net on that side.
+    #[cfg(windows)]
+    builder.kill_on_drop(true);
+    let child = builder.create_no_window().spawn()?;
     Ok(ManagedChild { child })
 }
 

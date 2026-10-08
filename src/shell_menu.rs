@@ -41,7 +41,7 @@
 //!
 //! The switch re-labels ONLY launcher-owned UI (this app menu, the tray, the
 //! launcher's stopped page). It deliberately does NOT touch the ALAS web
-//! page: that language follows `Gui.Language` in deploy.yaml and is resolved
+//! page: that language follows `Deploy.Webui.Language` in deploy.yaml and is resolved
 //! by the backend on startup. The two scopes are independent and MAY be out
 //! of sync — a switched launcher UI next to an unchanged web page is
 //! expected, not a bug.
@@ -502,7 +502,7 @@ pub fn build_settings_menu(
     // Exactly one is checked by construction (checked_id derives from
     // settings.language; None/unknown → follow). Scope note (MINOR-6): the
     // switch only re-labels LAUNCHER UI — the ALAS web page keeps its own
-    // deploy.yaml Gui.Language, so the two can be out of sync by design.
+    // deploy.yaml Deploy.Webui.Language, so the two can be out of sync by design.
     let mut lang_items = Vec::with_capacity(LANGS.len());
     for (i, lang) in LANGS.iter().enumerate() {
         lang_items.push(CheckMenuItem::with_id(

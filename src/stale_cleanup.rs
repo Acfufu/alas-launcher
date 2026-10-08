@@ -3,8 +3,9 @@
 // launcher run, and which evidence kind justifies killing it.
 //
 // Decision order (plan FR1.2): X vetoes first (own pid / own process group /
-// registry-known pid), then the F anchor (executable must live under the ALAS
-// repo's toolkit/), then evidence E1–E4. When the repo dir cannot be located
+// registry-known pid), then the F anchor (executable must live inside the ALAS
+// repo — the classic portable layout's toolkit/ or the PR #5885 payload's
+// uv-managed .venv/), then evidence E1–E4. When the repo dir cannot be located
 // (degraded mode) the F anchor is uncheckable, so only the strongest cmdline
 // evidence (E2) may fire.
 //
@@ -32,12 +33,23 @@ pub struct Candidate {
 pub enum EvidenceKind {
     /// Command line references the ALAS repo path.
     E1,
-    /// Command line runs gui.py with our --port.
+    /// Command line runs gui.py (or the PR #5885 fork's `python -m module.cli`
+    /// webui form) with our --port.
     E2,
     /// Working directory (or, on Windows, toolkit exe) is inside the repo.
     E3,
     /// Environment carries ALAS_LAUNCHER_PID= (launcher-spawned marker).
     E4,
+}
+
+/// F-anchor helper: true when `exe` is an interpreter inside the ALAS repo —
+/// the classic portable layout's `toolkit/` (python/adb/git), or the PR #5885
+/// payload's uv-managed `.venv/` (created by `uv sync` at install/switch
+/// time; `bin` on unix, `Scripts` on Windows). Both layouts mean "this
+/// process runs code the launcher installed", the trust level the anchor
+/// always carried.
+fn is_repo_interpreter(exe: &Path, repo: &Path) -> bool {
+    exe.starts_with(repo.join("toolkit")) || exe.starts_with(repo.join(".venv"))
 }
 
 /// Decide whether `c` is a stale ALAS backend process.
@@ -66,16 +78,15 @@ pub fn is_stale_candidate(
     if is_registered(c.pid) {
         return None;
     }
-    // F anchor: executable must sit under <repo>/toolkit. Unmet ⇒ not ours.
-    let exe_ok = c
-        .exe
-        .as_ref()
-        .map(|p| repo.map(|r| p.starts_with(r.join("toolkit"))).unwrap_or(false))
-        .unwrap_or(false);
+    // F anchor: executable must sit inside the ALAS repo — the classic
+    // portable layout's toolkit/ interpreter, or the PR #5885 payload's
+    // uv-managed .venv (repo-local on every platform). Unmet ⇒ not ours.
+    let exe_ok = c.exe.as_ref().map(|p| repo.map(|r| is_repo_interpreter(p, r)).unwrap_or(false)).unwrap_or(false);
     if repo.is_none() {
         // Degraded mode: repo dir unknown, F anchor unverifiable — keep only
         // the strongest cmdline evidence (E2), skip E1/E3/E4.
-        let has_e2 = c.cmd.iter().any(|s| s.to_string_lossy().contains("gui.py"))
+        let has_e2 = (c.cmd.iter().any(|s| s.to_string_lossy().contains("gui.py"))
+            || c.cmd.iter().any(|s| s.to_string_lossy().contains("module.cli")))
             && c.cmd.iter().any(|s| s.to_string_lossy() == format!("{port}"));
         return if has_e2 { Some(EvidenceKind::E2) } else { None };
     }
@@ -93,13 +104,21 @@ pub fn is_stale_candidate(
     let e1 = repo
         .map(|r| cmd_s.contains(r.to_string_lossy().as_ref()))
         .unwrap_or(false);
-    // E2: argv[?] == "gui.py" exactly, followed by an ADJACENT "--port <port>"
-    // pair (exact match — "--port=22267" or a detached value must not match).
-    let e2 = c.cmd.iter().any(|s| s.to_string_lossy() == "gui.py")
-        && c
+    // E2: the legacy script form (argv[?] == "gui.py" exactly) OR the PR
+    // #5885 fork's module form (argv[?] == "module.cli", i.e.
+    // `python -m module.cli run web`), in both cases followed by an ADJACENT
+    // "--port <port>" pair (exact match — "--port=22267" or a detached value
+    // must not match).
+    let has_port_pair = c
+        .cmd
+        .windows(2)
+        .any(|w| w[0].to_string_lossy() == "--port" && w[1].to_string_lossy() == port_s);
+    let e2 = (c.cmd.iter().any(|s| s.to_string_lossy() == "gui.py")
+        || c
             .cmd
-            .windows(2)
-            .any(|w| w[0].to_string_lossy() == "--port" && w[1].to_string_lossy() == port_s);
+            .iter()
+            .any(|s| s.to_string_lossy() == "module.cli"))
+        && has_port_pair;
     // E3: cwd is the repo root (Windows additionally accepts a toolkit exe,
     // where cwd probing is less reliable).
     let e3 = {
@@ -114,7 +133,7 @@ pub fn is_stale_candidate(
         {
             c.exe
                 .as_ref()
-                .map(|p| p.starts_with(repo.unwrap().join("toolkit")))
+                .map(|p| is_repo_interpreter(p, repo.unwrap()))
                 .unwrap_or(false)
                 || c.cwd.as_ref().map(|p| Some(p.as_path()) == repo).unwrap_or(false)
         }
@@ -160,13 +179,19 @@ pub fn collect_raw_candidates(
     let mut raw: Vec<Candidate> = all
         .into_iter()
         .filter(|c| {
-            // L-B: cmd contains gui.py AND an exact adjacent "--port <port>"
-            // pair (no substring matching, no glued "--port=<port>").
+            // L-B: cmd contains the legacy script (gui.py) or the PR #5885
+            // fork's module entry (module.cli) AND an exact adjacent
+            // "--port <port>" pair (no substring matching, no glued
+            // "--port=<port>"). Keep in sync with E2's argv shapes below.
             let has_port_pair = c
                 .cmd
                 .windows(2)
                 .any(|w| w[0].to_string_lossy() == "--port" && w[1].to_string_lossy() == port_s);
-            let is_lb = c.cmd.iter().any(|s| s.to_string_lossy().contains("gui.py"))
+            let is_lb = (c.cmd.iter().any(|s| s.to_string_lossy().contains("gui.py"))
+                || c
+                    .cmd
+                    .iter()
+                    .any(|s| s.to_string_lossy().contains("module.cli")))
                 && has_port_pair;
             // L-C heuristic: launcher-spawned marker in environ.
             let is_lc_hint = c
@@ -727,6 +752,159 @@ mod tests {
             ..cand(1, None)
         };
         assert!(is_stale_candidate(&own, None, PORT, 1, None, &|_| false).is_none());
+    }
+
+    // ---- R1 审计（A1/B1）：PR #5885 fork payload 的识别矩阵 ----------------
+    // 真实 argv 形态（backend.rs ManagedBackend::spawn）：
+    //   python -m module.cli run web --host 127.0.0.1 --port 22267 --no-open
+    // 解释器：uv 管理的 <repo>/.venv/bin/python（unix）/ .venv\Scripts（win）。
+
+    /// module.cli 形态 + .venv 解释器：F 锚点放行，E2 命中（E4 marker 同在时
+    /// 仍按优先级报 E2 —— e1→e2→e3→e4 的既定顺序）。
+    #[test]
+    fn module_cli_form_passes_f_anchor_and_fires_e2() {
+        let r = repo();
+        let c = Candidate {
+            exe: Some(r.join(".venv/bin/python")),
+            cwd: Some(r.clone()),
+            environ: vec!["ALAS_LAUNCHER_PID=9".into()],
+            cmd: vec![
+                "python".into(),
+                "-m".into(),
+                "module.cli".into(),
+                "run".into(),
+                "web".into(),
+                "--host".into(),
+                "127.0.0.1".into(),
+                "--port".into(),
+                "22267".into(),
+                "--no-open".into(),
+            ],
+            ..cand(110, Some(20))
+        };
+        assert_eq!(
+            is_stale_candidate(&c, Some(&r), PORT, 1, None, &|_| false),
+            Some(EvidenceKind::E2)
+        );
+    }
+
+    /// module.cli 形态但解释器在 repo 外：F 锚点必须仍然否决（argv 形态本身
+    /// 不是身份证明，放宽只到 repo 内解释器为止）。
+    #[test]
+    fn module_cli_form_still_requires_repo_anchor() {
+        let r = repo();
+        let c = Candidate {
+            exe: Some("/usr/bin/python3".into()),
+            cwd: Some(r.clone()),
+            environ: vec![],
+            cmd: vec![
+                "python3".into(),
+                "-m".into(),
+                "module.cli".into(),
+                "run".into(),
+                "web".into(),
+                "--port".into(),
+                "22267".into(),
+            ],
+            ..cand(111, Some(21))
+        };
+        assert!(is_stale_candidate(&c, Some(&r), PORT, 1, None, &|_| false).is_none());
+    }
+
+    /// 降级模式（repo 未知）同样认 module.cli 形态。
+    #[test]
+    fn degraded_mode_accepts_module_cli_form() {
+        let c = Candidate {
+            exe: Some(PathBuf::from("/opt/other/python")),
+            cmd: vec![
+                "python".into(),
+                "-m".into(),
+                "module.cli".into(),
+                "run".into(),
+                "web".into(),
+                "--port".into(),
+                "22267".into(),
+                "--no-open".into(),
+            ],
+            ..cand(112, Some(22))
+        };
+        assert_eq!(
+            is_stale_candidate(&c, None, PORT, 1, None, &|_| false),
+            Some(EvidenceKind::E2)
+        );
+    }
+
+    /// L-B 预过滤器必须把 module.cli 形态收进候选集（否则后续 F∧E 判定
+    /// 根本没机会运行——这是 fork payload 上整链失效的入口）。
+    #[test]
+    fn collect_raw_candidates_matches_module_cli_form() {
+        let r = repo();
+        let cand = Candidate {
+            pid: 120,
+            pgid: Some(12),
+            exe: Some(r.join(".venv/bin/python")),
+            cwd: Some(r.clone()),
+            environ: vec![], // 无 L-C marker：只能走 L-B
+            cmd: vec![
+                "python".into(),
+                "-m".into(),
+                "module.cli".into(),
+                "run".into(),
+                "web".into(),
+                "--port".into(),
+                "22267".into(),
+                "--no-open".into(),
+            ],
+        };
+        let raw = collect_raw_candidates(PORT, Some(&r), &|| vec![cand.clone()], &|_| None);
+        assert_eq!(raw.len(), 1, "module.cli form must pass the L-B pre-filter");
+        assert_eq!(raw[0].pid, 120);
+    }
+
+    /// .venv 解释器 + E4 marker（无 argv 证据，如 Manager 等子进程）：
+    /// F 放行后 E4 应命中——fork 的 multiprocessing 子进程没有 gui.py/module.cli
+    /// argv，全靠这一路。
+    #[test]
+    fn venv_interpreter_with_marker_alone_fires_e4() {
+        let r = repo();
+        let c = Candidate {
+            exe: Some(r.join(".venv/bin/python")),
+            cwd: Some(PathBuf::from("/elsewhere")),
+            environ: vec!["ALAS_LAUNCHER_PID=42".into()],
+            cmd: vec!["python".into(), "-c".into(), "from multiprocessing.manager import Server".into()],
+            ..cand(113, Some(23))
+        };
+        assert_eq!(
+            is_stale_candidate(&c, Some(&r), PORT, 1, None, &|_| false),
+            Some(EvidenceKind::E4)
+        );
+    }
+
+    /// Windows 形态的 .venv（Scripts 目录）同样满足 F 锚点（路径语义跨平台
+    /// 一致：starts_with(<repo>/.venv)）。
+    #[cfg(windows)]
+    #[test]
+    fn venv_scripts_interpreter_passes_f_anchor() {
+        let r = repo();
+        let c = Candidate {
+            exe: Some(r.join(".venv/Scripts/python.exe")),
+            cwd: Some(r.clone()),
+            environ: vec![],
+            cmd: vec![
+                "python".into(),
+                "-m".into(),
+                "module.cli".into(),
+                "run".into(),
+                "web".into(),
+                "--port".into(),
+                "22267".into(),
+            ],
+            ..cand(114, Some(24))
+        };
+        assert_eq!(
+            is_stale_candidate(&c, Some(&r), PORT, 1, None, &|_| false),
+            Some(EvidenceKind::E2)
+        );
     }
 
     #[test]

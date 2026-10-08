@@ -344,7 +344,7 @@
       <li class="rust"><b>Ready 事件 → 后台线程接管</b>：注册 Ctrl-C 处理器；然后立即 <code>backend.begin_start()</code>——把状态机置为 <b>Initializing</b>。这一步在任何模式下都先做，保证初始化窗口期内托盘开关是禁用的，用户不可能在 <code>./config</code> 被清理的中途点出第二个后端。</li>
       <li class="cfg"><b>读「自动启动」门闩</b>（macOS）：<code>ShellSettings.auto_start_backend</code>（默认开）；非 macOS 恒为开。决定 Ready 线程走「自动启动」还是「只准备不启动」分支。</li>
       <li class="rust"><b>splash 窗口当进度条</b>：<code>text_to_splash()</code> 把文本包成一个自包含 HTML 再 base64 成 <code>data:</code> URL，<code>splash.navigate()</code> 即可换页——不需要静态资源服务器。然后 <code>setup_alas_repo()</code>：先跑 ALAS 自己的 <code>deploy.atomic.atomic_failure_cleanup('./config')</code> 清掉上次中断的残留（详见 §5），再跑 git 更新，进度实时刷到 splash；更新完成后用 sparse-checkout 排除两个废弃壳——<code>webapp/</code> 与 <code>webapp-tauri/src-tauri/</code>（保留 webapp-tauri 前端源码：FastAPI 网页的页面来自 webapp-tauri/dist）。随后应用控制 API 补丁（<code>apply_patch</code>，锚点 <code>module/webui/api/__init__.py</code>，详见 §8）；补丁失败只降级为进程级控制，不阻塞启动。</li>
-      <li class="py"><b>拉起后端（<code>backend.start(port)</code>）</b>：置环境变量 <code>ALAS_LAUNCHER_PID=启动器pid</code>，spawn 进<b>独立进程组</b>——入口按树形二选一：payload 里有 <code>gui.py</code> → <code>python gui.py --host 127.0.0.1 --port &lt;端口&gt;</code>；PR-5885 fork 的树已删 gui.py → <code>python -m module.cli run web --host 127.0.0.1 --port &lt;端口&gt; --no-open</code>（stale-cleanup 的 argv 启发式仍只认 gui.py，是已知局限；退出注册表的组杀仍兜底）。然后每 100ms 试连 <code>127.0.0.1:端口</code>，最多 60 秒。连上后还要（探测工具可用时）<b>验证端口主人是自己人</b>（§4 端口所有权探测；工具缺失则 fail-open 跳过）——防止一个陈旧服务器占了端口还假装启动成功。另外 spawn 之前就有一步「清场」：<code>kill_stale_alas</code> 主动击杀上次启动器遗留的 ALAS 残留进程（10 轮 × 200ms），杀不动的幸存者或异主占口才走到「拒绝启动」（§4）。</li>
+      <li class="py"><b>拉起后端（<code>backend.start(port)</code>）</b>：置环境变量 <code>ALAS_LAUNCHER_PID=启动器pid</code>，spawn 进<b>独立进程组</b>——入口按树形二选一：payload 里有 <code>gui.py</code> → <code>python gui.py --host 127.0.0.1 --port &lt;端口&gt;</code>；PR-5885 fork 的树已删 gui.py → <code>python -m module.cli run web --host 127.0.0.1 --port &lt;端口&gt; --no-open</code>（stale-cleanup 的 argv 启发式同时认 gui.py 与 module.cli 两种形态、F 锚点接受 toolkit 与 .venv 解释器（与本入口保持同步））。然后每 100ms 试连 <code>127.0.0.1:端口</code>，最多 60 秒。连上后还要（探测工具可用时）<b>验证端口主人是自己人</b>（§4 端口所有权探测；工具缺失则 fail-open 跳过）——防止一个陈旧服务器占了端口还假装启动成功。另外 spawn 之前就有一步「清场」：<code>kill_stale_alas</code> 主动击杀上次启动器遗留的 ALAS 残留进程（10 轮 × 200ms），杀不动的幸存者或异主占口才走到「拒绝启动」（§4）。</li>
       <li class="rust"><b>收尾分支</b>：成功 → 销毁 splash、main 窗口导航到 <code>http://127.0.0.1:端口/</code>、显示。<b>仓库准备失败</b>（git/清理阶段）→ splash 保留错误文本，<code>mark_stopped</code> 置回 Stopped 但<b>不置 start_failed</b>——这是「没启动成」，不是「启动失败」。<b>后端启动失败</b>（spawn/端口阶段）→ 状态机置 Stopped + <code>start_failed=true</code>，splash 保留「Starting GUI」页（stale-cleanup 类错误则导航到专属错误页），托盘显示本地化的启动失败文案。两条失败路径之后都要唤醒托盘刷新。自动启动关闭时 → 更新完仓库后同样 <code>mark_stopped</code>，把 main 窗口导航到<b>本地化「已停止」页</b>（也是 data: URL），托盘开关保持可用。</li>
     </ol>
     <div class="callout warn"><b>两个关键时序细节：</b>① <code>begin_start()</code> 必须早于 splash 之后的一切 I/O——初始化窗口内托盘开关禁用，是「绝不双开后端」的第一道保险；② 任何 <code>mark_stopped</code> 之后都要显式唤醒托盘轮询线程，因为轮询的「差异门控」不把状态迁移当变化，不唤醒就会卡在「启动中…」的假渲染上。</div>
@@ -522,7 +522,7 @@
     <table>
       <tr><th>字段</th><th>路径</th><th>缺省 / 语义</th><th>谁在用</th></tr>
       <tr><td><code>webui_port</code></td><td><code>Deploy.Webui.WebuiPort</code></td><td>22267；非整数/浮点/字符串都回落缺省（只告警一次）</td><td>所有 URL、spawn、探测</td></tr>
-      <tr><td><code>language</code></td><td><code>Gui.Language</code></td><td><code>None</code>（空串保留为 <code>Some("")</code>，下游再做 zh-CN 回落）</td><td>托盘/菜单文案、任务显示名</td></tr>
+      <tr><td><code>language</code></td><td><code>Deploy.Webui.Language</code>（回退旧版 <code>Gui.Language</code>）</td><td><code>None</code>（空串保留为 <code>Some("")</code>，下游再做 zh-CN 回落）</td><td>托盘/菜单文案、任务显示名</td></tr>
       <tr><td><code>enable_reload</code></td><td><code>Deploy.Update.EnableReload</code></td><td>true（ALAS 默认）</td><td>调度器存活探测的进程树形态</td></tr>
       <tr><td><code>ws_control_available</code></td><td><code>Deploy.Webui.Password / WebuiSSLKey / WebuiSSLCert</code></td><td>三处都无<b>非空字符串</b>才算可用；null/缺失/空串都不算配了凭据</td><td>托盘开关降级判定的<b>凭据半边</b>（配了密码/SSL → 控制 API 被服务端 401）；另一半是补丁失败 <code>patch_failed()</code>，两条件并列见 §7</td></tr>
     </table>
@@ -604,7 +604,7 @@
       </tr>
       <tr>
         <td><b>语言生效规则</b></td>
-        <td><code>resolved_language</code>：显式设置 &gt; ALAS 的 deploy.yaml <code>Gui.Language</code> &gt; zh-CN</td>
+        <td><code>resolved_language</code>：显式设置 &gt; ALAS 的 deploy.yaml <code>Deploy.Webui.Language</code>（旧版回退 <code>Gui.Language</code>）&gt; zh-CN</td>
         <td>语言切换<b>只改启动器自己的 UI</b>（应用菜单、托盘、停止页）；ALAS 网页语言永远跟 deploy.yaml——两边可能不同步，<b>这是设计语义不是 bug</b>（模块文档 MINOR-6 写明）</td>
       </tr>
       <tr>

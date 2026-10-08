@@ -10,7 +10,7 @@ mod icon_assets;
 #[cfg(target_os = "macos")]
 mod alas_tasks;
 mod backend;
-// Typed reads of config/deploy.yaml (WebuiPort / Gui.Language /
+// Typed reads of config/deploy.yaml (WebuiPort / Deploy.Webui.Language /
 // EnableReload / ws credentials). Cross-platform — setup.rs
 // `get_deploy_config` is ungated, so this module is too.
 mod deploy_config;
@@ -82,7 +82,22 @@ fn main() -> Result<()> {
         HAS_CONSOLE.store(AttachConsole(ATTACH_PARENT_PROCESS) != 0, Ordering::Relaxed);
     }
     tracing_subscriber::fmt::init();
-    setup_environment()?;
+    if let Err(e) = setup_environment() {
+        error!("{e:#}");
+        // The Tauri windows do not exist yet (the builder has not run), so
+        // the splash error page is unreachable here — surface the failure
+        // through a native dialog instead of exiting with an invisible
+        // stderr line (the Windows release build has no console).
+        rfd::MessageDialog::new()
+            .set_title("alas-launcher")
+            .set_level(rfd::MessageLevel::Error)
+            .set_description(format!(
+                "Cannot find the ALAS repo folder.\n\n{e:#}\n\nRestore the AzurLaneAutoScript \
+                 folder next to the executable (or reinstall the app), then relaunch."
+            ))
+            .show();
+        return Err(e);
+    }
 
     let port = crate::deploy_config::webui_port();
 

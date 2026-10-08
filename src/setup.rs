@@ -48,6 +48,19 @@ pub(crate) fn alas_repo_dir() -> PathBuf {
     try_alas_repo_dir().unwrap_or_else(|| panic!("Cannot find ALAS repo folder"))
 }
 
+/// Fallible [`setup_environment`]: `Err` when no portable layout matches, so
+/// main can surface a user-visible error (native dialog — the Tauri windows
+/// do not exist yet) instead of panicking without any UI on a broken
+/// install (moved/renamed folder next to the executable).
+fn alas_repo_dir_or_err() -> Result<PathBuf> {
+    try_alas_repo_dir().ok_or_else(|| {
+        anyhow!(
+            "Cannot find the ALAS repo folder.\nPortable layout: deploy/installer.py next to \
+             the executable.\nmacOS: ALAS.app/Contents/AzurLaneAutoScript."
+        )
+    })
+}
+
 fn prepend_path_to_env(key: &str, path: PathBuf) {
     let mut paths = Vec::new();
     paths.push(path);
@@ -84,7 +97,7 @@ fn payload_path_prepend(dir: &std::path::Path) -> Vec<PathBuf> {
 
 #[cfg(unix)]
 pub fn setup_environment() -> Result<()> {
-    let dir = alas_repo_dir();
+    let dir = alas_repo_dir_or_err()?;
     info!("ALAS dir is {:?}", &dir);
     set_current_dir(&dir)?;
     for path in payload_path_prepend(&dir) {
@@ -96,7 +109,7 @@ pub fn setup_environment() -> Result<()> {
 
 #[cfg(windows)]
 pub fn setup_environment() -> Result<()> {
-    let dir = alas_repo_dir();
+    let dir = alas_repo_dir_or_err()?;
     info!("ALAS dir is {:?}", &dir);
     set_current_dir(&dir)?;
     for path in payload_path_prepend(&dir) {
@@ -120,10 +133,20 @@ pub fn setup_alas_repo(mut status_updater: impl FnMut(&str)) -> Result<()> {
     #[cfg(target_os = "linux")]
     setup_git_ca_bundle();
     // Similar setup to deploy/installer.py
+    // Fail-closed (R1 审计)：patch 步骤之前的任何早退都意味着 control API
+    // 从未被确认就绪——PATCH_FAILED 若保持 false，托盘 WS 门控会放行一个
+    // 可能不存在的端点（2300839 要消除的空转重试即复活）。git reset --hard
+    // 会还原被注入的 __init__.py，"update 失败但补丁幸存"不可安全假设。
     status_updater("Cleaning up config files");
-    atomic_failure_cleanup("./config")?;
+    if let Err(e) = atomic_failure_cleanup("./config") {
+        crate::patch::mark_patch_failed();
+        return Err(e);
+    }
     status_updater("Updating ALAS");
-    git_update(&mut status_updater)?;
+    if let Err(e) = git_update(&mut status_updater) {
+        crate::patch::mark_patch_failed();
+        return Err(e);
+    }
     apply_sparse_checkout(&mut status_updater);
     status_updater("Applying control API patch");
     match crate::patch::apply_patch(&alas_repo_dir()) {
@@ -357,10 +380,16 @@ fn atomic_failure_cleanup(path: &str) -> Result<()> {
         path,
     ]);
     // Same group + timeout treatment as git_update: a wedged cleanup script
-    // must fail the setup loudly, not hang the splash forever. The exit
-    // status stays unchecked — as before, only spawn/timeout errors fail.
+    // must fail the setup loudly, not hang the splash forever.
     let mut child = spawn_with_group(&mut cmd)?;
-    let _ = wait_with_timeout(&mut child, GIT_UPDATE_TIMEOUT)?;
+    let status = wait_with_timeout(&mut child, GIT_UPDATE_TIMEOUT)?;
+    // A non-success exit most often means the payload no longer ships
+    // `deploy/atomic` (the fork reorg already removed gui.py) — the config
+    // repair silently did nothing. Loud in the log, but NOT a setup
+    // failure: a skipped repair step must not block the launch.
+    if !status.success() {
+        warn!("atomic_failure_cleanup exited with {status}; config repair skipped");
+    }
     Ok(())
 }
 

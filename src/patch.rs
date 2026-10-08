@@ -47,13 +47,18 @@ pub enum PatchOutcome {
 pub fn patch_failed() -> bool {
     PATCH_FAILED.load(Ordering::Relaxed)
 }
-// Round-3 NIT：`patch_failed()` 仅被 macOS 门控的 tray.rs 消费——win/linux target 上
-// 是死代码（cargo clippy --target win/linux 会告警）。若未来跑跨 target clippy，
-// 给 reader 函数加 `#[cfg(target_os = "macos")]`（writer 在 apply_patch 内部，跨平台保留）。
 
-fn mark_patch_failed() {
+/// Fail-closed flag, also raised by `setup_alas_repo` when a PRE-patch step
+/// (config cleanup / git update) aborts the setup: `patch_failed()` means
+/// "control API not confirmed ready", not merely "apply_patch errored" —
+/// `git reset --hard` reverts the injected `__init__.py`, so assuming the
+/// patch survived a failed update is unsafe.
+pub(crate) fn mark_patch_failed() {
     PATCH_FAILED.store(true, Ordering::Relaxed);
 }
+// Round-3 NIT：`patch_failed()` 仅被 macOS 门控的 tray.rs 消费——win/linux target 上
+// 是死代码（cargo clippy --target win/linux 会告警）。若未来跑跨 target clippy，
+// 给 reader 函数加 `#[cfg(target_os = "macos")]`（writer 在 apply_patch/setUp 内部，跨平台保留）。
 
 pub fn is_already_patched(init_content: &str) -> bool {
     init_content.contains(MARKER)
@@ -106,6 +111,19 @@ pub fn apply_patch(alas_dir: &Path) -> Result<PatchOutcome> {
         }
     };
     if is_already_patched(&api_init) {
+        // Marker present — but the injected module itself can go missing:
+        // control_api.py is untracked (a user `git clean -fd` drops it), and
+        // a future fork shipping its own control_api.py would overwrite it
+        // on `git reset --hard`. api/__init__.py imports the module
+        // unconditionally, so a missing file breaks the whole webui at
+        // import time while the launcher believes it is patched. Repair by
+        // re-writing the module; keep the AlreadyApplied fast path otherwise.
+        if !control_path.exists() {
+            info!("control API marker present but control_api.py missing; re-writing module");
+            atomic_write(&control_path, CONTROL_API_SRC)
+                .inspect_err(|_| mark_patch_failed())?;
+            return Ok(PatchOutcome::Applied);
+        }
         info!("control API patch already applied");
         return Ok(PatchOutcome::AlreadyApplied);
     }
@@ -139,6 +157,10 @@ pub fn apply_patch(alas_dir: &Path) -> Result<PatchOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PATCH_FAILED 是进程级全局：断言其"未被置位"的测试必须与所有置位型
+    /// 测试串行，否则 cargo test 的默认并行会互相污染。
+    static PATCH_FLAG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     const PRISTINE: &str = r#""""FastAPI-based REST + SSE API for the Svelte SPA frontend."""
 
@@ -220,8 +242,38 @@ def create_api_app() -> FastAPI:
         assert_eq!(init.matches(MARKER).count(), 1);
     }
 
+    /// R1 审计（B3）：marker 在而注入模块缺失（git clean -fd 丢未跟踪文件 /
+    /// fork 收编该路径后被 reset --hard 覆盖）时，幂等早退不得放行——必须
+    /// 修复性重写 control_api.py 并报 Applied。
+    #[test]
+    fn apply_patch_rewrites_missing_module_despite_marker() {
+        let _g = PATCH_FLAG_TEST_LOCK.lock().unwrap();
+        // 全局标志是粘性的：先清零，断言"修复路径保持 fail-open"才有效
+        // （前置的置位型测试可能刚把它置 true）。
+        PATCH_FAILED.store(false, Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!("patch-repair-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let api_dir = tmp.join("module").join("webui").join("api");
+        std::fs::create_dir_all(&api_dir).unwrap();
+        let patched = format!("{PRISTINE}\n{MARKER}\nfrom module.webui.control_api import router as alas_control_router\n");
+        std::fs::write(api_dir.join("__init__.py"), patched).unwrap();
+        // control_api.py 不存在（被 clean 掉）。
+        assert!(!tmp.join("module").join("webui").join("control_api.py").exists());
+
+        let outcome = apply_patch(&tmp).expect("repair apply");
+        assert_eq!(outcome, PatchOutcome::Applied);
+        assert!(tmp.join("module").join("webui").join("control_api.py").exists());
+        assert!(!patch_failed(), "successful repair must stay fail-open");
+        // 修完后再次 apply 回到幂等快路径。
+        let again = apply_patch(&tmp).expect("second apply");
+        assert_eq!(again, PatchOutcome::AlreadyApplied);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn apply_patch_on_mismatched_anchor_degrades_not_blocks() {
+        let _g = PATCH_FLAG_TEST_LOCK.lock().unwrap();
         let tmp = std::env::temp_dir().join(format!("patch-anchor-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let api_dir = tmp.join("module").join("webui").join("api");
@@ -234,6 +286,7 @@ def create_api_app() -> FastAPI:
 
     #[test]
     fn apply_patch_write_failure_is_fail_closed() {
+        let _g = PATCH_FLAG_TEST_LOCK.lock().unwrap();
         let tmp = std::env::temp_dir().join(format!("patch-writefail-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let api_dir = tmp.join("module").join("webui").join("api");
@@ -251,6 +304,7 @@ def create_api_app() -> FastAPI:
 
     #[test]
     fn apply_patch_read_failure_is_fail_closed() {
+        let _g = PATCH_FLAG_TEST_LOCK.lock().unwrap();
         let tmp = std::env::temp_dir().join(format!("patch-readfail-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("module").join("webui").join("api")).unwrap();
