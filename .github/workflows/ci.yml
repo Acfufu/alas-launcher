@@ -20,6 +20,12 @@ jobs:
       - name: Test
         run: cargo test --verbose
 
+      # R5 审计：注入补丁的 Python 语法是 CI 盲区——唯一的 roundtrip 测试是
+      # #[ignore] 的真实 payload 集成测试，语法坏档会让 cargo test 全绿放行、
+      # payload 侧 webui 启动即崩。
+      - name: Patch syntax check
+        run: python3 -m py_compile assets/patches/control_api.py assets/patches/fastapi.inject.py
+
       - name: Lint
         run: cargo clippy --all-targets -- -D warnings
 

@@ -439,7 +439,7 @@ mod tests {
         lc.start(22267, &|_| {}).unwrap();
         assert_eq!(lc.status(), crate::backend::BackendStatus::Running);
         cleanup_for_exit(&tray_stop, &poll_handle, &lc);
-        cleanup_for_exit(&tray_stop, &poll_handle, &lc); // 第二遍：全 no-op
+        cleanup_for_exit(&tray_stop, &poll_handle, &lc); // 第二遍：join/registry/stop 均 no-op（残留清扫重扫一遍，幂等）
         assert!(tray_stop.load(Ordering::Relaxed), "tray stop flag stays set");
         assert_eq!(lc.status(), crate::backend::BackendStatus::Stopped);
         assert!(!lc.snapshot().start_failed);

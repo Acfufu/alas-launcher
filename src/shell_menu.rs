@@ -33,7 +33,7 @@
 //! [`build_settings_menu`] returns owned [`SettingsMenuHandles`] — the muda
 //! item handles are Arc-backed native items, so mutating them in place
 //! (`set_text` / `set_checked`) updates the macOS bar live. main.rs keeps the
-//! handles and calls [`SettingsMenuHandles::apply_labels`] on a language
+//! handles and calls `SettingsMenuHandles::apply_labels` on a language
 //! click; the tray wake + stopped-page re-navigation stay in main.rs (it
 //! owns backend + port + the tray refresh sender).
 //!
@@ -121,7 +121,7 @@ pub fn handle_auto_start_click(settings: &Arc<Mutex<ShellSettings>>) -> ShellSet
 /// [`handle_auto_start_click`] (save AFTER the lock drops; a failed save only
 /// warns — the in-memory value applies this session). The caller (main.rs)
 /// re-checks the installed CheckMenuItems in place via
-/// [`SettingsMenuHandles::apply_labels`].
+/// `SettingsMenuHandles::apply_labels`.
 pub fn handle_notify_master_click(settings: &Arc<Mutex<ShellSettings>>) -> ShellSettings {
     let updated = {
         let mut guard = settings.lock().unwrap();
@@ -183,7 +183,7 @@ pub fn checked_language_id(language: &Option<String>) -> &'static str {
 /// (no file I/O under the lock); a failed save only warns — the in-memory
 /// language still applies for this session (plan failure path). The caller
 /// (main.rs) computes the new labels from the returned settings and re-renders
-/// the menus (app menu via [`SettingsMenuHandles::apply_labels`], tray via
+/// the menus (app menu via `SettingsMenuHandles::apply_labels`, tray via
 /// its refresh wake, stopped page via re-navigation).
 pub fn handle_language_click(
     settings: &Arc<Mutex<ShellSettings>>,
@@ -460,7 +460,7 @@ impl SettingsMenuHandles {
 
     /// Re-check the installed auto-start item in place after a toggle click
     /// (muda Arc-backed native item — the macOS bar updates live; no
-    /// re-install, the same locked-tauri-2.5.1 constraint as [`apply_labels`]).
+    /// re-install, the same locked-tauri-2.5.1 constraint as `apply_labels`).
     /// No menu rebuild, no relabel — only the check state changes.
     pub fn apply_auto_start(&self, settings: &ShellSettings) -> tauri::Result<()> {
         self.auto_start.set_checked(settings.auto_start_backend)?;

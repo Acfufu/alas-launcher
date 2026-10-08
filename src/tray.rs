@@ -186,6 +186,13 @@ pub fn build_tray(
             }
             "tray-show" => {
                 if let Some(window) = app.get_webview_window("main") {
+                    // R5 审计（A4）：非 Running 时主窗可能仍是初始 about:blank
+                    // （setup 长耗期间从未被导航）——直接 show 是一块纯白空白，
+                    // 观感即"卡死"。先导航到本地化停止页再 show。
+                    if shared.backend.status() != BackendStatus::Running {
+                        let labels = load_control_labels(&shared.settings);
+                        navigate_main(app, main_page_url(BackendStatus::Stopped, port, &labels));
+                    }
                     let _ = window.unminimize();
                     let _ = window.show();
                     let _ = window.set_focus();
@@ -662,7 +669,13 @@ fn spawn_start_worker(
                     }
                 }
                 Err(e) => {
-                    warn!("Failed to start backend: {e}");
+                    warn!("Failed to start backend: {e:#}");
+                    // R5 审计（A3）：托盘启动失败也渲染 FR3 详情页——kill -9 后
+                    // 最自然的恢复入口是托盘，ForeignPortOwner 的 pid/换端口指引
+                    // 此前 log-only。splash 已被销毁（常规路径）时自然 no-op。
+                    if let Some(splash) = app.get_webview_window("splash") {
+                        let _ = splash.navigate(crate::start_error_url(&e));
+                    }
                     // Status is now Stopped (+ start_failed unless a stop
                     // intervened — set inside the module); the wake below
                     // re-renders the retryable toggle.
@@ -791,7 +804,7 @@ fn rebuild_menu(app: &AppHandle, shared: &TrayShared, section: TaskSection, sche
 /// completes, refresh.send wakes this poll, and the 处理中… toggle rendered by
 /// the tail rebuild must be replaced by the real state even when scheduler
 /// liveness did not change since the previous poll (see
-/// [`menu_model::poll_needs_rebuild`] for the full rationale).
+/// `menu_model::poll_needs_rebuild` for the full rationale).
 ///
 /// `notif` is the poll-thread-exclusive notification baseline (see
 /// [`PollNotifState`]): this cycle's task cache diff and scheduler-death

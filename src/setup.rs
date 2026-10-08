@@ -130,6 +130,23 @@ fn setup_git_ca_bundle() {
     }
 }
 
+/// Setup 子进程 spawn 失败的可行动化包装（R5 审计 A2）：裸目录/拷贝不全的
+/// payload 树上 PATH 里没有 unversioned `python`（由 payload 的 toolkit/ 或
+/// uv 管理的 .venv 提供），原始错误只有 os error 2，对用户毫无指向性。
+fn explain_spawn_error(e: anyhow::Error) -> anyhow::Error {
+    let not_found = e
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound);
+    if not_found {
+        e.context(
+            "`python` was not found on PATH — the ALAS payload tree must provide it \
+             (the classic toolkit/ layout, or the uv-managed .venv created by `uv sync`)",
+        )
+    } else {
+        e
+    }
+}
+
 pub fn setup_alas_repo(mut status_updater: impl FnMut(&str)) -> Result<()> {
     info!("Starting setup for ALAS repository...");
     #[cfg(target_os = "linux")]
@@ -142,12 +159,12 @@ pub fn setup_alas_repo(mut status_updater: impl FnMut(&str)) -> Result<()> {
     status_updater("Cleaning up config files");
     if let Err(e) = atomic_failure_cleanup("./config") {
         crate::patch::mark_patch_failed();
-        return Err(e);
+        return Err(explain_spawn_error(e));
     }
     status_updater("Updating ALAS");
     if let Err(e) = git_update(&mut status_updater) {
         crate::patch::mark_patch_failed();
-        return Err(e);
+        return Err(explain_spawn_error(e));
     }
     apply_sparse_checkout(&mut status_updater);
     status_updater("Applying control API patch");

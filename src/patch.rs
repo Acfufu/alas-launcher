@@ -222,6 +222,17 @@ def create_api_app() -> FastAPI:
         assert!(import_pos < def_pos);
     }
 
+    /// R5 审计（B1）：control_api.py 的 `router` 符号是 fastapi.inject.py
+    /// 的 import 契约（`from module.webui.control_api import router`）——
+    /// 改名即整包 webui import 失效，而 CI 只跑 py_compile 挡语法、不挡符号。
+    #[test]
+    fn control_api_source_exposes_the_injected_router_symbol() {
+        assert!(
+            CONTROL_API_SRC.contains("router = APIRouter"),
+            "fastapi.inject.py imports `router` — the symbol contract broke"
+        );
+    }
+
     #[test]
     fn apply_patch_is_idempotent_and_writes_both_files() {
         let tmp = std::env::temp_dir().join(format!("patch-apply-{}", std::process::id()));
