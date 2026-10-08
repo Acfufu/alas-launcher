@@ -14,6 +14,9 @@
 #![allow(dead_code)]
 
 use std::ffi::OsString;
+
+#[cfg(windows)]
+use crate::window_util::CreateNoWindow as _; // taskkill 黑窗防护（unix 无此路径）
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -318,8 +321,10 @@ pub(crate) fn real_kill(pid: u32) -> std::io::Result<()> {
     }
     #[cfg(windows)]
     {
+        // create_no_window：GUI 进程派生 taskkill 会闪可见黑窗（R4 审计 P1）。
         let out = std::process::Command::new("taskkill")
             .args(["/F", "/T", "/PID", &pid.to_string()])
+            .create_no_window()
             .output();
         match out {
             Ok(o) if o.status.success() => Ok(()),

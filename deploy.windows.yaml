@@ -33,6 +33,9 @@ Deploy:
     # Filepath of python executable `python.exe`
     # [Easy installer] Use './toolkit/python.exe'
     # [Other] Use you own python, and its version should be 3.7.6 64bit
+    # NOTE (R4 audit): points at the classic toolkit interpreter. The PR #5885
+    # uv payload (no toolkit) is unix-only today; when the Windows .venv layout
+    # lands, switch to ./.venv/Scripts/python.exe.
     PythonExecutable: ./toolkit/python.exe
     # URL of pypi mirror
     # [CN user] Use 'https://mirrors.aliyun.com/pypi/simple' for faster and more stable download

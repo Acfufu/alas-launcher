@@ -168,11 +168,11 @@ pub fn kill_registered_groups() {
 /// table right after the run-event handler returns, so any `set_menu` still
 /// in flight would touch disposed resources and panic (#12534). Taking the
 /// `JoinHandle` out of `poll_handle` and joining makes that impossible:
-/// once joined, no `set_menu` can ever run again. The join is bounded in
-/// practice — the poll loop wakes at most every 3s (`recv_timeout`) plus one
-/// in-flight `poll_once` (ms-scale; worst ~5s control-api timeout), and the
-/// poll thread never blocks on the main thread, so no deadlock. On
-/// non-macOS the slot is never filled and the join is a no-op.
+/// once joined, no `set_menu` can ever run again. The join runs on a janitor
+/// thread with a 3s bounded wait (R4 审计 P0：菜单 API 从非主线程是「投递主
+/// 线程 + recv 同步等待」，退出处理冻结事件循环期间直接 join 会与轮询线程
+/// 互等死锁；poll 侧另有 stop 复查把窗口压到 ms 级，超时即放弃、随进程退
+/// 出回收). On non-macOS the slot is never filled and the join is a no-op.
 ///
 /// Idempotent by construction: `tray_stop` is a plain store, `poll_handle` is
 /// `take`n (second call sees `None`), the registry is `mem::take`d, and
@@ -190,18 +190,33 @@ pub fn cleanup_for_exit(
     backend: &crate::backend::BackendLifecycle,
 ) {
     tray_stop.store(true, Ordering::Relaxed);
-    // MAJOR-4: join BEFORE killing the backend — the poll thread is still
-    // doing harmless backend-status reads during the join; the tray itself is
-    // alive until tauri's cleanup_before_exit, which runs after we return.
+    // MAJOR-4: join the poll thread BEFORE killing the backend — but from a
+    // janitor thread with a bounded wait (R4 审计 P0)：tauri 的菜单 API
+    // （MenuItem::with_id / set_menu / set_icon）从非主线程调用时是「投递主
+    // 线程 + rx.recv() 同步等待」（tauri 2.5.1 run_item_main_thread 宏，已核
+    // 源码），而退出处理运行期间事件循环不再泵消息——若此刻轮询线程正在重建
+    // 菜单，主线程 join ⟷ 轮询线程 recv 互等死锁。janitor 把 join 挪离主
+    // 线程；3s 有界等待覆盖常态（轮询线程最迟 3s 醒来、见 stop 即退），超时
+    // 则放弃等待继续清算——卡住的轮询线程随进程退出被回收，后端清算不受影响。
+    // poll_once 入口与重建前的 stop 复查（tray.rs）把窗口进一步压到「已进入
+    // 单次菜单调用」的 ms 级。
     if let Some(handle) = poll_handle.lock().unwrap().take() {
-        let _ = handle.join();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let _ = handle.join();
+            let _ = done_tx.send(());
+        });
+        let _ = done_rx.recv_timeout(Duration::from_secs(3));
     }
     kill_registered_groups();
     backend.stop();
     // Round-4 (Oracle 2)：setsid 守护化孙进程不在 registry 组内、且 terminate 路径的
-    // Drop 清扫被 had_child 门控跳过 → 正常退出会漏。退出时进程将亡，无并发 start
-    // 交叉风险，可安全补一次无条件 ALAS_LAUNCHER_PID 清扫（best-effort，见 spec §8）。
-    // ALAS 当前从不 setsid，此为防御性兜底。
+    // Drop 清扫被 had_child 门控跳过 → 正常退出会漏。退出时补一次无条件
+    // ALAS_LAUNCHER_PID 清扫（best-effort，见 spec §8）。R4 审计修正：原注释
+    // 声称「无并发 start 交叉风险」不实——MAJOR-2 刻意把 start 放在 worker
+    // 线程，退出与 in-flight start 的 spawn 落在本扫描快照之后的 ms 级窗口
+    // 仍然存在（孤儿由下次启动的 stale-cleanup 自愈）；此处是防御性兜底而非
+    // 完备保证。ALAS 当前从不 setsid。
     let sys = sysinfo::System::new_all();
     for (pid, process) in sys.processes() {
         for var in process.environ() {

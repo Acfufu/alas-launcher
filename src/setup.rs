@@ -1,4 +1,6 @@
 use anyhow::{anyhow, Result};
+
+use crate::window_util::CreateNoWindow as _;
 use serde_json::Value as JsonValue;
 use std::env::set_current_dir;
 use std::fs;
@@ -201,6 +203,8 @@ fn apply_sparse_checkout(status_updater: &mut impl FnMut(&str)) {
     let status = Command::new("git")
         .current_dir(&dir)
         .args(&args)
+        // Windows GUI 进程派生控制台程序会弹可见黑窗（R4 审计 P1）；unix no-op。
+        .create_no_window()
         .status();
     match status {
         Ok(s) if s.success() => {
@@ -380,8 +384,19 @@ fn atomic_failure_cleanup(path: &str) -> Result<()> {
         path,
     ]);
     // Same group + timeout treatment as git_update: a wedged cleanup script
-    // must fail the setup loudly, not hang the splash forever.
+    // must fail the setup loudly, not hang the splash forever. Registered for
+    // exit too (R4 审计：此前未注册——脚本卡住时用户退出，registry 没有它、
+    // ALAS_LAUNCHER_PID 兜底也扫不到（setup 阶段尚未 spawn 过 backend），
+    // 修复进程会脱离超时约束继续跑）。
     let mut child = spawn_with_group(&mut cmd)?;
+    register_for_exit(&child);
+    struct ExitGuard(u32);
+    impl Drop for ExitGuard {
+        fn drop(&mut self) {
+            unregister_for_exit(self.0);
+        }
+    }
+    let _guard = ExitGuard(child.id());
     let status = wait_with_timeout(&mut child, GIT_UPDATE_TIMEOUT)?;
     // A non-success exit most often means the payload no longer ships
     // `deploy/atomic` (the fork reorg already removed gui.py) — the config

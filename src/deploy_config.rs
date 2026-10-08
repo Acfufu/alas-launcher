@@ -115,10 +115,13 @@ impl DeployConfig {
             cur.map(|v| match v {
                 Value::Null => false,
                 Value::String(s) => !s.is_empty(),
-                // 非字符串真值（YAML 里 `Password: 123` 这类漏引号）：Python
-                // 网关按真值判锁、直接 401——客户端必须同样降级（R3 审计：
-                // 旧语义 as_str-only 会放行，调度器点击永远 401 而只有 warn）。
-                _ => true,
+                // R4 审计：精确对齐 Python 真值语义（`_locked()` 的
+                // bool(v) 判定即 PasswordGate 的锁门条件）——bool 0 是假、
+                // 数字 0 是假、空序列/映射是假，其余非 null 一律按已配置。
+                Value::Bool(b) => *b,
+                Value::Number(n) => n.as_f64() != Some(0.0),
+                Value::Array(a) => !a.is_empty(),
+                Value::Object(o) => !o.is_empty(),
             })
             .unwrap_or(false)
         };
@@ -306,13 +309,16 @@ mod tests {
         assert!(!cert.ws_control_available());
     }
 
-    /// R3 审计（B4）：非字符串真值按「已配置」降级——Python 网关按真值
-    /// 判锁（bool(123) → 401），客户端不同步降级会让调度器点击永远失败。
+    /// R3/R4 审计：非字符串凭据精确对齐 Python 真值——123 降级、0/false
+    /// 不降级、null/缺失/空串不降级。
     #[test]
-    fn non_string_credential_values_degrade_ws_control() {
-        let cfg = typed(json!({"Deploy": {"Webui": {"Password": 123}}}));
-        assert!(!cfg.ws_control_available());
-        // 显式 null 仍算未配置。
+    fn non_string_credential_values_follow_python_truthiness() {
+        let truthy = typed(json!({"Deploy": {"Webui": {"Password": 123}}}));
+        assert!(!truthy.ws_control_available());
+        let zero = typed(json!({"Deploy": {"Webui": {"Password": 0}}}));
+        assert!(zero.ws_control_available());
+        let falsey = typed(json!({"Deploy": {"Webui": {"Password": false}}}));
+        assert!(falsey.ws_control_available());
         let null_cfg = typed(json!({"Deploy": {"Webui": {"Password": null}}}));
         assert!(null_cfg.ws_control_available());
     }

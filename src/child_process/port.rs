@@ -4,6 +4,8 @@
 use std::process::Command;
 use tracing::warn;
 
+use crate::window_util::CreateNoWindow as _;
+
 /// Pid of the process listening on `port`, if determinable.
 ///
 /// Platform probe (Momus ADVISORY-1): macOS `lsof -tiTCP:<port>
@@ -39,6 +41,8 @@ pub fn port_owner_pid(port: u16) -> Option<u32> {
 fn probe_command(port: u16) -> Command {
     let mut cmd = Command::new("lsof");
     cmd.args([format!("-tiTCP:{port}"), "-sTCP:LISTEN".to_owned()]);
+    // Windows 闪窗防护在 unix 是 no-op（R4 审计 P1：netstat 同理）。
+    cmd.create_no_window();
     cmd
 }
 
@@ -46,6 +50,7 @@ fn probe_command(port: u16) -> Command {
 fn probe_command(port: u16) -> Command {
     let mut cmd = Command::new("ss");
     cmd.args(["-ltnp", &format!("sport = :{port}")]);
+    cmd.create_no_window();
     cmd
 }
 
@@ -53,6 +58,8 @@ fn probe_command(port: u16) -> Command {
 fn probe_command(port: u16) -> Command {
     let mut cmd = Command::new("netstat");
     cmd.args(["-ano"]);
+    // GUI 进程派生 netstat 会闪可见黑窗（R4 审计 P1）。
+    cmd.create_no_window();
     cmd
 }
 

@@ -448,7 +448,14 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
     // 败者会把托盘钉死在 处理中…/Running（diff 门控对 stale 渲染永不再触发，
     // 无法自愈）。跳过后标签滞后 ≤1 个 poll 周期，由 worker 的 wake 强制
     // 重绘真实状态。
-    let mut skip_tail_rebuild = false;
+    // R4 审计（R3-B2 同根因收尾）：尾部重建只保留给 StartBackend 臂——
+    // StopBackend 与调度器两臂的 worker 都是「drop(guard) 后 refresh.send」，
+    // 事件线程尾部 rebuild 若被拖延（load_control_labels 磁盘 I/O），wake-poll
+    // 的 set_menu 先入队、尾部 rebuild（此刻 guard 未释放 → 渲染 处理中…）
+    // 后落，败者钉死且 diff 门控不再自愈。worker wake 已保证 ≤1 poll 周期
+    // 重绘真实状态。StartBackend 臂无此窗口：worker 要跑满整个 spawn 窗口
+    // （秒级），尾部 rebuild 远早于 guard 释放。
+    let tail_rebuild = matches!(action, ToggleAction::StartBackend);
     match action {
         // Initializing -> NoOp (the item is disabled anyway; this also makes
         // a second click during a 60s start window a no-op — BLOCKER-3:
@@ -460,7 +467,6 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
             // 同一 MAJOR-2 理由挪到 worker；结束 wake 让轮询重绘真实状态。
             // 注：stop_labels 是点击时刻的语言快照——~1s worker 窗口内恰好
             // 切语言的话停止页会定格旧语言，属可接受的一帧滞后（R3 审计附注）。
-            skip_tail_rebuild = true;
             let backend = Arc::clone(&shared.backend);
             let app_handle = app.clone();
             let refresh = shared.refresh.clone();
@@ -486,6 +492,7 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
                 guard,
                 Some(shared.refresh.clone()),
                 ws_available,
+                false,
             );
         }
         ToggleAction::StopScheduler | ToggleAction::StartScheduler => {
@@ -508,6 +515,7 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
                 scheduler_action,
                 guard,
                 shared.refresh.clone(),
+                Arc::clone(&shared.backend),
             );
         }
     }
@@ -518,7 +526,7 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
     // a Stop click (scheduler still alive at click time) shows 停止 until
     // the worker's click lands, a Start shows 启动 — the poll thread
     // corrects within one cycle.
-    if !skip_tail_rebuild {
+    if tail_rebuild {
         let tasks = shared.tasks.lock().unwrap().clone();
         rebuild_menu(
             app,
@@ -554,7 +562,7 @@ fn try_acquire_in_flight(flag: &Arc<AtomicBool>) -> Option<InFlightGuard> {
 /// moves into the closure; the refresh wake forces a poll rebuild so the
 /// 处理中… toggle is replaced by the real state (same contract as the old
 /// control-API click worker).
-fn spawn_scheduler_call(port: u16, action: crate::control_api::SchedulerAction, guard: InFlightGuard, refresh: mpsc::Sender<()>) {
+fn spawn_scheduler_call(port: u16, action: crate::control_api::SchedulerAction, guard: InFlightGuard, refresh: mpsc::Sender<()>, backend: Arc<BackendLifecycle>) {
     std::thread::spawn(move || {
         let result = match action {
             crate::control_api::SchedulerAction::Start => crate::control_api::api_scheduler_start(port, "alas"),
@@ -562,7 +570,15 @@ fn spawn_scheduler_call(port: u16, action: crate::control_api::SchedulerAction, 
         };
         match result {
             Ok(state) => info!(target: "control_api", "scheduler {action:?} ok, state={}", state.state),
-            Err(e) => warn!("control API scheduler {action:?} failed: {e}"),
+            Err(e) => {
+                warn!("control API scheduler {action:?} failed: {e}");
+                // R4 审计：调用失败回滚意图——陈旧的 Stop 意图会永久压制
+                // 「调度器异常死亡」通知的主通道（gates_ok 要求 intent==None，
+                // 而 Stop 不参与 TTL/扫描解除）。失败即调用未生效，None 的
+                // 渲染语义两侧都恰好正确：Start 失败 → 调度器没起来（异常
+                // 停止）；Stop 失败 → 调度器还在跑（运行中）。
+                backend.set_scheduler_intent(SchedulerIntent::None);
+            }
         }
         drop(guard);
         let _ = refresh.send(());
@@ -583,6 +599,7 @@ fn spawn_scheduler_call(port: u16, action: crate::control_api::SchedulerAction, 
 /// ready; the guard is released right after spawning it (the process-tree
 /// scan corrects the status within two polls, and the SchedulerIntent::Start
 /// TTL covers the window).
+#[allow(clippy::too_many_arguments)] // start 的正交输入；结构体会遮蔽调用点
 fn spawn_start_worker(
     app: AppHandle,
     backend: Arc<BackendLifecycle>,
@@ -591,14 +608,34 @@ fn spawn_start_worker(
     guard: InFlightGuard,
     refresh: Option<mpsc::Sender<()>>,
     ws_available: bool,
+    // R4 审计（P1）：true = 重启语义——stop()（epoch bump）与 begin_start()
+    // 都在 worker 内做（stop 可阻塞 ~1s，不能冻结菜单事件线程，与 StopBackend
+    // 臂同一 MAJOR-2 理由）；false = 托盘 start 语义——调用方已在事件线程
+    // begin_start（即时 Initializing 渲染）。
+    stop_first: bool,
 ) {
     if let Err(e) = std::thread::Builder::new()
         .name("backend-start".into())
         .spawn(move || {
             let guard = guard;
+            if stop_first {
+                backend.stop();
+                backend.begin_start();
+            }
             match backend.start(port, &|_| {}) {
                 Ok(()) => {
                     navigate_main(&app, main_page_url(BackendStatus::Running, port, &labels));
+                    // R4 审计（P1）：重启场景的成功路径必须自己收拾 UI——
+                    // splash 可能停在 setup 失败错误页（main 从未 show），只
+                    // navigate 不 show 等于「点了没反应」。窗口已就绪的常规
+                    // 路径下两者皆 no-op（splash 已不存在、show 幂等）。
+                    if let Some(splash) = app.get_webview_window("splash") {
+                        let _ = splash.destroy();
+                    }
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
                     // 后端就绪后，经控制 API 启动调度器（控制可用时）。有界重试（10×1.5s，
                     // 镜像旧 SCHEDULER_CLICK_TIMEOUT 15s 预算）；耗尽仅 warn——用户可再点托盘开关。
                     if ws_available {
@@ -666,13 +703,15 @@ pub(crate) fn spawn_restart_worker(
         warn!("restart skipped: in-flight guard busy");
         return;
     };
-    backend.stop();
-    backend.begin_start();
     // Same gating as handle_toggle (shared predicate): a failed/anchor-
     // mismatched patch means the start-after-backend call would just spin
     // the 15s retry thread against a dead endpoint.
     let ws_available = scheduler_control_available();
-    spawn_start_worker(app, backend, port, labels, guard, refresh, ws_available);
+    // R4 审计（P1）：stop+begin_start 挪进 worker（stop_first=true）——原先
+    // 同步跑在菜单事件线程，stop 的 ~1s SIGTERM 宽限直接冻结 UI，与
+    // StopBackend 臂双标准；成功路径另有 splash.destroy + main.show 收拾
+    // setup 失败后的卡死画面（见 spawn_start_worker）。
+    spawn_start_worker(app, backend, port, labels, guard, refresh, ws_available, true);
 }
 
 /// Rebuild the menu from the current state + task cache and re-attach it to
@@ -766,6 +805,12 @@ fn poll_once(
     force_rebuild: bool,
     notif: &mut PollNotifState,
 ) {
+    // R4 审计（P0）：退出置位后立即放弃本轮——loop 顶的 stop 检查挡不住
+    // 「已排队 refresh 唤醒的这拍」，而菜单 API 会同步汇合主线程（退出处理
+    // 期间事件循环不泵消息 → 与 join 成环死锁）。入口 + 重建前双重复查。
+    if shared.stop.load(Ordering::Relaxed) {
+        return;
+    }
     // (a) status snapshot — no I/O under the backend lock (the lock is
     // internal to BackendLifecycle; status() takes it briefly).
     let mut status = shared.backend.status();
@@ -937,6 +982,11 @@ fn poll_once(
     let status_line_changed = scheduler != *last_scheduler;
     *last_scheduler = scheduler;
     if poll_needs_rebuild(force_rebuild, outcome.changed, status_line_changed) {
+        // 重建前最后一道 stop 复查（见函数入口注释）：把「退出 vs 重建中的
+        // 主线程汇合」窗口从整轮 poll 的 I/O 时长压到菜单调用本身。
+        if shared.stop.load(Ordering::Relaxed) {
+            return;
+        }
         rebuild_menu(app, shared, outcome.section, scheduler);
         *last_section = outcome.section;
     }

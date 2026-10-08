@@ -137,8 +137,13 @@ impl ManagedBackend {
     /// Entry point: `gui.py` on legacy payload trees; the PR-5885 fork removed it
     /// in the 2026-09 reorg, so those trees spawn `python -m module.cli run web`.
     pub fn spawn(port: u16) -> Result<Self> {
-        std::env::set_var("ALAS_LAUNCHER_PID", format!("{}", std::process::id()));
         let mut cmd = Command::new("python");
+        // 注入 launcher 标记到子进程 environ（stale-cleanup 的 L-C/E4 证据）。
+        // R4 审计：原实现是进程级 std::env::set_var——在 worker 线程上改 C
+        // environ 与并发 Command spawn 的 environ 读取构成数据竞争（glibc
+        // 非线程安全；macOS/Windows 实现有锁）；改为只注入本子进程，读取方
+        // （sysinfo 的子进程 environ 扫描）不受影响。
+        cmd.env("ALAS_LAUNCHER_PID", format!("{}", std::process::id()));
         if Path::new("gui.py").exists() {
             cmd.args(["gui.py", "--host", "127.0.0.1", "--port", &port.to_string()]);
         } else {
