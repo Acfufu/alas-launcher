@@ -33,8 +33,8 @@ pub const TASK_GROUP_MAX: usize = 3;
 /// One renderable row of the tray's task section.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskMenuItem {
-    /// Non-empty status-group header (disabled; 运行中/队列中/等待中).
-    GroupHeader { id: String, text: &'static str },
+    /// Non-empty status-group header (disabled; localized 运行中/队列中/等待中).
+    GroupHeader { id: String, text: String },
     /// One task row (disabled; `task-{i}`, text `"{name} — {time}"`).
     TaskItem { id: String, text: String },
     /// Native separator line between two non-empty groups.
@@ -49,15 +49,16 @@ pub enum TaskMenuItem {
 /// tasks — the input slice is sorted by `next_time` ascending, so the first
 /// items of a group are the soonest. Empty groups render NO header. Empty
 /// input → empty output (the caller renders the "No tasks" empty state
-/// instead).
-pub fn task_section_items(tasks: &[Task]) -> Vec<TaskMenuItem> {
+/// instead). Group headers come from `labels` (R2 审计：不再硬编码中文——
+/// en/ja 用户此前看到中英混杂的任务区).
+pub fn task_section_items(tasks: &[Task], labels: &ControlLabels) -> Vec<TaskMenuItem> {
     let mut items = Vec::new();
     let mut index = 0usize;
     let mut emitted_group = false;
     for (status, id, text) in [
-        (alas_tasks::TaskStatus::Running, "group-running", "运行中"),
-        (alas_tasks::TaskStatus::Queued, "group-queued", "队列中"),
-        (alas_tasks::TaskStatus::Waiting, "group-waiting", "等待中"),
+        (alas_tasks::TaskStatus::Running, "group-running", &labels.group_running),
+        (alas_tasks::TaskStatus::Queued, "group-queued", &labels.group_queued),
+        (alas_tasks::TaskStatus::Waiting, "group-waiting", &labels.group_waiting),
     ] {
         let group: Vec<&Task> = tasks.iter().filter(|t| t.status == status).collect();
         if group.is_empty() {
@@ -69,7 +70,7 @@ pub fn task_section_items(tasks: &[Task]) -> Vec<TaskMenuItem> {
         emitted_group = true;
         items.push(TaskMenuItem::GroupHeader {
             id: id.to_string(),
-            text,
+            text: text.clone(),
         });
         for task in group.into_iter().take(TASK_GROUP_MAX) {
             // Full NextRun string: the webui renders `str(func.next_run)`
@@ -216,6 +217,22 @@ pub fn toggle_label(
     }
 }
 
+/// Degraded-aware toggle label (R2 审计 P1)：降级模式下 Running 后端的行为
+/// 无条件是 `StopBackend`（进程级停止，与调度器死活无关）——标签必须同步
+/// 显示「停止」，否则用户看到「启动」、点下去却杀掉整个后端。控制可用时
+/// 退回 [`toggle_label`] 的调度器语义。
+pub fn toggle_label_for_control(
+    status: BackendStatus,
+    scheduler_alive: Option<bool>,
+    labels: &ControlLabels,
+    control_available: bool,
+) -> String {
+    if status == BackendStatus::Running && !control_available {
+        return labels.stop.clone();
+    }
+    toggle_label(status, scheduler_alive, labels)
+}
+
 /// Whether the toggle item is clickable for the given status: disabled while
 /// initializing (a 60s spawn window can never get a second toggle) or while a
 /// scheduler-control click is in flight (the 处理中… state).
@@ -229,10 +246,13 @@ pub fn toggle_enabled(status: BackendStatus, processing: bool) -> bool {
 /// SCHEDULER: `scheduler_alive` is the process-tree discriminator result
 /// (Some), or None when no process handle / scan result exists — conservative
 /// stopped (evidence task-3: unknown must never claim running).
-/// `ws_available` carries the degraded-mode flag (password/SSL configured in
-/// deploy.yaml): when false the line appends the localized degraded hint
-/// (process-level control only). The flag is a config property, not part of
-/// the backend snapshot — callers read `deploy_config::ws_control_available()`.
+/// `ws_available` carries the degraded-mode flag (scheduler control
+/// unavailable: webui password/SSL configured in deploy.yaml, or the control
+/// API patch not confirmed ready): when false the line appends the localized
+/// degraded hint (process-level control only). The flag is a config
+/// property, not part of the backend snapshot — callers read the SAME
+/// predicate the toggle decision uses (tray.rs `scheduler_control_available`),
+/// or the line says "normal" while a click degrades to a process-level stop.
 pub fn status_line_for(
     snapshot: &BackendStateSnapshot,
     scheduler_alive: Option<bool>,
@@ -290,9 +310,18 @@ pub struct ControlLabels {
     pub processing: String,
     pub sep: String,
     /// Launcher-owned copy appended to the status line in degraded mode
-    /// (ws unavailable: password/SSL configured). NEVER overridden from the
-    /// ALAS i18n file — the webui has no equivalent string.
+    /// (control unavailable: password/SSL or patch failed). NEVER overridden
+    /// from the ALAS i18n file — the webui has no equivalent string.
     pub degraded_hint: String,
+    // ---- R2 审计（A4）：托盘铬文案入 i18n 表（此前硬编码英文/中文混杂）----
+    pub refresh: String,
+    pub show_window: String,
+    pub quit: String,
+    pub tasks_empty: String,
+    pub tasks_degraded: String,
+    pub group_running: String,
+    pub group_queued: String,
+    pub group_waiting: String,
 }
 
 /// Built-in label table, keyed by webui language; any unknown or empty
@@ -356,6 +385,19 @@ fn builtin_labels(lang: &str) -> ControlLabels {
                 "（密码/SSL 已配置，仅进程级控制）",
             ),
         };
+    // Tray chrome strings (R2 审计 A4)：先前散落在 tray.rs / task_section_items
+    // 的硬编码，与调度器控制标签同语言回落规则。
+    let (refresh, show_window, quit, tasks_empty, tasks_degraded, group_running, group_queued, group_waiting) =
+        match lang {
+            "zh-TW" => (
+                "重新整理", "顯示視窗", "結束", "無任務", "任務：不可用", "執行中", "佇列中", "等待中",
+            ),
+            "en-US" => ("Refresh", "Show Window", "Quit", "No tasks", "Tasks: unavailable", "Running", "Queued", "Waiting"),
+            "ja-JP" => (
+                "再読み込み", "ウィンドウを表示", "終了", "タスクなし", "タスク: 利用不可", "実行中", "待機列", "待機中",
+            ),
+            _ => ("刷新", "显示窗口", "退出", "暂无任务", "任务：不可用", "运行中", "队列中", "等待中"),
+        };
     ControlLabels {
         scheduler: scheduler.into(),
         running: running.into(),
@@ -368,6 +410,14 @@ fn builtin_labels(lang: &str) -> ControlLabels {
         processing: processing.into(),
         sep: sep.into(),
         degraded_hint: degraded_hint.into(),
+        refresh: refresh.into(),
+        show_window: show_window.into(),
+        quit: quit.into(),
+        tasks_empty: tasks_empty.into(),
+        tasks_degraded: tasks_degraded.into(),
+        group_running: group_running.into(),
+        group_queued: group_queued.into(),
+        group_waiting: group_waiting.into(),
     }
 }
 
@@ -826,6 +876,10 @@ mod tests {
 
     /// Expected full label set per language, from the REAL ALAS payload
     /// cross-check (evidence task-1: zero delta vs the built-in table).
+    fn zh() -> ControlLabels {
+        builtin_labels("zh-CN")
+    }
+
     fn expected_labels(lang: &str) -> ControlLabels {
         let (scheduler, running, stopped, initializing, failed, crashed, start, stop, processing, sep, degraded_hint) =
             match lang {
@@ -833,6 +887,13 @@ mod tests {
                 "en-US" => ("Scheduler", "Running", "stopped", "initializing…", "start failed", "stopped unexpectedly", "Start", "Stop", "Processing…", ": ", " (password/SSL configured, process-level control only)"),
                 "ja-JP" => ("スケジューラー", "実行中", "停止済み", "起動中…", "起動失敗", "異常停止", "実行", "中止", "処理中…", ": ", "（パスワード/SSL 設定済み、プロセスレベル制御のみ）"),
                 _ => ("调度器", "运行中", "已停止", "启动中…", "启动失败", "异常停止", "启动", "停止", "处理中…", "：", "（密码/SSL 已配置，仅进程级控制）"),
+            };
+        let (refresh, show_window, quit, tasks_empty, tasks_degraded, group_running, group_queued, group_waiting) =
+            match lang {
+                "zh-TW" => ("重新整理", "顯示視窗", "結束", "無任務", "任務：不可用", "執行中", "佇列中", "等待中"),
+                "en-US" => ("Refresh", "Show Window", "Quit", "No tasks", "Tasks: unavailable", "Running", "Queued", "Waiting"),
+                "ja-JP" => ("再読み込み", "ウィンドウを表示", "終了", "タスクなし", "タスク: 利用不可", "実行中", "待機列", "待機中"),
+                _ => ("刷新", "显示窗口", "退出", "暂无任务", "任务：不可用", "运行中", "队列中", "等待中"),
             };
         ControlLabels {
             scheduler: scheduler.into(),
@@ -846,6 +907,14 @@ mod tests {
             processing: processing.into(),
             sep: sep.into(),
             degraded_hint: degraded_hint.into(),
+            refresh: refresh.into(),
+            show_window: show_window.into(),
+            quit: quit.into(),
+            tasks_empty: tasks_empty.into(),
+            tasks_degraded: tasks_degraded.into(),
+            group_running: group_running.into(),
+            group_queued: group_queued.into(),
+            group_waiting: group_waiting.into(),
         }
     }
 
@@ -914,6 +983,48 @@ mod tests {
     }
 
     #[test]
+    fn toggle_label_for_control_degraded_running_says_stop() {
+        // R2 审计（A1）：降级（控制不可用）+ Running 时行为无条件是进程级
+        // StopBackend——标签必须显示「停止」，与调度器死活无关；控制可用时
+        // 退回调度器语义（死 → 启动）。
+        let labels = zh();
+        assert_eq!(
+            toggle_label_for_control(BackendStatus::Running, Some(false), &labels, false),
+            labels.stop,
+            "degraded Running: the click stops the BACKEND, the label must say so"
+        );
+        assert_eq!(
+            toggle_label_for_control(BackendStatus::Running, None, &labels, false),
+            labels.stop
+        );
+        assert_eq!(
+            toggle_label_for_control(BackendStatus::Running, Some(true), &labels, false),
+            labels.stop
+        );
+        // 控制可用：调度器语义不变（死调度器 → 启动）。
+        assert_eq!(
+            toggle_label_for_control(BackendStatus::Running, Some(false), &labels, true),
+            labels.start
+        );
+        // Stopped 在两种模式下都显示启动。
+        assert_eq!(
+            toggle_label_for_control(BackendStatus::Stopped, None, &labels, false),
+            labels.start
+        );
+    }
+
+    #[test]
+    fn tray_chrome_labels_localized_not_hardcoded() {
+        // R2 审计（A4）：铬文案随语言回落，不再硬编码。
+        assert_eq!(zh().refresh, "刷新");
+        assert_eq!(builtin_labels("en-US").refresh, "Refresh");
+        assert_eq!(builtin_labels("ja-JP").quit, "終了");
+        assert_eq!(builtin_labels("zh-TW").group_queued, "佇列中");
+        assert_eq!(builtin_labels("en-US").tasks_degraded, "Tasks: unavailable");
+        assert_eq!(builtin_labels("unknown-lang").group_running, "运行中", "未知语言回落 zh-CN");
+    }
+
+    #[test]
     fn task_section_items_all_three_groups() {
         let tasks = vec![
             Task {
@@ -935,23 +1046,23 @@ mod tests {
                 next_time: Some("2026-08-11 00:00:00".into()),
             },
         ];
-        let items = task_section_items(&tasks);
+        let items = task_section_items(&tasks, &zh());
         assert_eq!(
             items,
             vec![
-                TaskMenuItem::GroupHeader { id: "group-running".into(), text: "运行中" },
+                TaskMenuItem::GroupHeader { id: "group-running".into(), text: "运行中".into() },
                 TaskMenuItem::TaskItem {
                     id: "task-0".into(),
                     text: "战术学院 — 2026-08-10 20:14:24".into(),
                 },
                 TaskMenuItem::Separator,
-                TaskMenuItem::GroupHeader { id: "group-queued".into(), text: "队列中" },
+                TaskMenuItem::GroupHeader { id: "group-queued".into(), text: "队列中".into() },
                 TaskMenuItem::TaskItem {
                     id: "task-1".into(),
                     text: "大舰队 — 2026-08-10 21:00:00".into(),
                 },
                 TaskMenuItem::Separator,
-                TaskMenuItem::GroupHeader { id: "group-waiting".into(), text: "等待中" },
+                TaskMenuItem::GroupHeader { id: "group-waiting".into(), text: "等待中".into() },
                 TaskMenuItem::TaskItem {
                     id: "task-2".into(),
                     text: "演习 — 2026-08-11 00:00:00".into(),
@@ -976,11 +1087,11 @@ mod tests {
                 next_time: Some("2026-08-11 06:00:00".into()),
             },
         ];
-        let items = task_section_items(&tasks);
+        let items = task_section_items(&tasks, &zh());
         assert_eq!(
             items,
             vec![
-                TaskMenuItem::GroupHeader { id: "group-waiting".into(), text: "等待中" },
+                TaskMenuItem::GroupHeader { id: "group-waiting".into(), text: "等待中".into() },
                 TaskMenuItem::TaskItem {
                     id: "task-0".into(),
                     text: "演习 — 2026-08-11 00:00:00".into(),
@@ -995,7 +1106,7 @@ mod tests {
 
     #[test]
     fn task_section_items_empty_is_empty_vec() {
-        assert_eq!(task_section_items(&[]), vec![]);
+        assert_eq!(task_section_items(&[], &zh()), vec![]);
     }
 
     #[test]
@@ -1020,7 +1131,7 @@ mod tests {
                 next_time: Some("2026-08-11 00:00:00".into()),
             },
         ];
-        let items = task_section_items(&tasks);
+        let items = task_section_items(&tasks, &zh());
         let ids: Vec<&str> = items
             .iter()
             .filter_map(|item| match item {
@@ -1043,11 +1154,11 @@ mod tests {
                 next_time: Some(format!("2026-08-11 0{i}:00:00")),
             })
             .collect();
-        let items = task_section_items(&tasks);
+        let items = task_section_items(&tasks, &zh());
         assert_eq!(items.len(), 1 + TASK_GROUP_MAX); // one header + 3 tasks
         assert_eq!(
             items[0],
-            TaskMenuItem::GroupHeader { id: "group-waiting".into(), text: "等待中" }
+            TaskMenuItem::GroupHeader { id: "group-waiting".into(), text: "等待中".into() }
         );
         let ids: Vec<&str> = items
             .iter()
@@ -1076,17 +1187,17 @@ mod tests {
                 next_time: Some("2026-08-11 00:00:00".into()),
             },
         ];
-        let items = task_section_items(&tasks);
+        let items = task_section_items(&tasks, &zh());
         assert_eq!(
             items,
             vec![
-                TaskMenuItem::GroupHeader { id: "group-running".into(), text: "运行中" },
+                TaskMenuItem::GroupHeader { id: "group-running".into(), text: "运行中".into() },
                 TaskMenuItem::TaskItem {
                     id: "task-0".into(),
                     text: "战术学院 — 2026-08-10 20:14:24".into(),
                 },
                 TaskMenuItem::Separator,
-                TaskMenuItem::GroupHeader { id: "group-waiting".into(), text: "等待中" },
+                TaskMenuItem::GroupHeader { id: "group-waiting".into(), text: "等待中".into() },
                 TaskMenuItem::TaskItem {
                     id: "task-1".into(),
                     text: "演习 — 2026-08-11 00:00:00".into(),
@@ -1116,7 +1227,7 @@ mod tests {
                 next_time: Some("2026-08-11 00:00:00".into()),
             },
         ];
-        let items = task_section_items(&tasks);
+        let items = task_section_items(&tasks, &zh());
         let separator_count = items
             .iter()
             .filter(|i| **i == TaskMenuItem::Separator)
@@ -1142,7 +1253,7 @@ mod tests {
         }
         let tasks =
             alas_tasks::fetch_tasks(payload, &alas_tasks::now_str().unwrap(), "zh-CN").unwrap();
-        for item in task_section_items(&tasks) {
+        for item in task_section_items(&tasks, &zh()) {
             match item {
                 TaskMenuItem::GroupHeader { id, text } => println!("[{id}] {text}"),
                 TaskMenuItem::TaskItem { id, text } => println!("[{id}] {text}"),

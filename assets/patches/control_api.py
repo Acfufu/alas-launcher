@@ -15,9 +15,18 @@ router = APIRouter(tags=["alas-launcher-control"])
 
 
 def _locked() -> bool:
-    """Webui password/SSL configured -> refuse (launcher degrades client-side too)."""
+    """Webui password/SSL configured -> refuse (launcher degrades client-side too).
+
+    MUST stay in lockstep with the Rust-side ws_control_available predicate
+    (src/deploy_config.rs): all three of Password / WebuiSSLKey / WebuiSSLCert
+    non-empty count as locked. R2 audit: WebuiSSLCert was missing here, so an
+    SSLCert-only config saw the client degrade while this side stayed open."""
     cfg = State.deploy_config
-    return bool(getattr(cfg, "Password", None) or getattr(cfg, "WebuiSSLKey", None))
+    return bool(
+        getattr(cfg, "Password", None)
+        or getattr(cfg, "WebuiSSLKey", None)
+        or getattr(cfg, "WebuiSSLCert", None)
+    )
 
 
 def _local_host(request: Request) -> bool:

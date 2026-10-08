@@ -190,9 +190,10 @@ impl ManagedBackend {
                             Ok(_) => unregister_for_exit(pid),
                             // Round-5 终审（Momus+Oracle 一致）：libc 非直接依赖（Cargo.toml
                             // 仅 nix 0.30 cfg(unix)），裸 libc::ESRCH 编译 E0433。改用
-                            // nix::errno::Errno::ESRCH as i32——Errno 全平台 #[repr(i32)]，
-                            // errno 模块无 feature 门控，仓库既有模式 child_process.rs:192。
-                            Err(e) if e.raw_os_error() == Some(nix::errno::Errno::ESRCH as i32) => {
+                            // nix::errno::Errno::ESRCH as i32（模块常量 ESRCH_RAW，R2 起
+                            // 两处共用）——Errno 全平台 #[repr(i32)]，errno 模块无
+                            // feature 门控，仓库既有模式 child_process.rs:192。
+                            Err(e) if e.raw_os_error() == Some(ESRCH_RAW) => {
                                 unregister_for_exit(pid)
                             }
                             Err(_) => {}
@@ -209,7 +210,7 @@ impl ManagedBackend {
             // 收割；非 ESRCH 失败（如 EPERM）保持原语义——不注销、不 wait。
             match kill_group(&mut child) {
                 Ok(_) => {}
-                Err(e) if e.raw_os_error() == Some(nix::errno::Errno::ESRCH as i32) => {}
+                Err(e) if e.raw_os_error() == Some(ESRCH_RAW) => {}
                 Err(e) => return Err(e.into()),
             }
             unregister_for_exit(pid);
@@ -765,6 +766,16 @@ fn terminate_old(old: Option<ManagedBackend>) {
 /// Error text for a start interrupted by [`BackendLifecycle::stop`] (the exit
 /// race) — the caller must not treat it as a start failure.
 const STOP_INTERVENED: &str = "stop intervened during backend start";
+
+/// Raw errno for the terminate() unregister contract (Ok **or ESRCH** both
+/// unregister). `nix` is a unix-only dependency (R2 审计 B1：裸引用曾把
+/// Windows 目标编译打穿), so the sentinel is per-target: on Windows kill
+/// errors never equal it and the non-Ok arm keeps the no-unregister
+/// semantics (job-kill errors there are not ESRCH anyway).
+#[cfg(unix)]
+const ESRCH_RAW: i32 = nix::errno::Errno::ESRCH as i32;
+#[cfg(windows)]
+const ESRCH_RAW: i32 = -1;
 
 /// The webui root URL for `port` (owns the port concept; plain String, no
 /// tauri dependency).

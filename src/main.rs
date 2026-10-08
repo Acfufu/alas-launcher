@@ -88,14 +88,30 @@ fn main() -> Result<()> {
         // the splash error page is unreachable here — surface the failure
         // through a native dialog instead of exiting with an invisible
         // stderr line (the Windows release build has no console).
-        rfd::MessageDialog::new()
-            .set_title("alas-launcher")
-            .set_level(rfd::MessageLevel::Error)
-            .set_description(format!(
+        // R2 审计（B4）：无头环境守卫——SSH/CI 会话里同步对话框在 Windows 上
+        // 无限阻塞（MessageBoxW 等点击）、在 macOS 无 WindowServer 时直接
+        // abort；检测到 SSH 会话则只落日志退出。桌面路径用独立线程 + 有界
+        // 等待（5 分钟）：给足阅读时间，又保证无人值守环境不会永久挂起。
+        let headless = std::env::var_os("SSH_CONNECTION").is_some()
+            || std::env::var_os("SSH_TTY").is_some();
+        if !headless {
+            // 先把错误渲染成文案再进线程：`e` 还要用于返回值，不能被
+            // closure 按 move 捕获。
+            let message = format!(
                 "Cannot find the ALAS repo folder.\n\n{e:#}\n\nRestore the AzurLaneAutoScript \
                  folder next to the executable (or reinstall the app), then relaunch."
-            ))
-            .show();
+            );
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+            std::thread::spawn(move || {
+                rfd::MessageDialog::new()
+                    .set_title("alas-launcher")
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_description(message)
+                    .show();
+                let _ = done_tx.send(());
+            });
+            let _ = done_rx.recv_timeout(std::time::Duration::from_secs(300));
+        }
         return Err(e);
     }
 

@@ -36,13 +36,23 @@ use crate::{
     menu_model::{
         control_labels, poll_decision, poll_needs_rebuild,
         status_line_for, task_section, task_section_items,
-        toggle_enabled, toggle_label, ControlLabels, TaskMenuItem, TaskSection,
+        toggle_enabled, toggle_label_for_control,
+        ControlLabels, TaskMenuItem, TaskSection,
     },
 };
 
 /// Poll cadence for the task section; also bounds each idle wait of the poll
 /// thread (a refresh signal wakes it early, never later than this).
 const TRAY_POLL_INTERVAL_SECS: Duration = Duration::from_secs(3);
+
+/// Scheduler-control availability — the ONE predicate every consumer shares:
+/// the toggle decision (`handle_toggle`, `spawn_restart_worker`), the status
+/// line's degraded hint (`rebuild_menu`, the initial build) and the toggle
+/// label (`build_menu`). R2 审计（B3）：状态行此前漏了 `!patch_failed()` 合取，
+/// d0d5fc8 把置位面扩到"git 瞬断"后，状态行会显示正常而点击走进程级停止。
+fn scheduler_control_available() -> bool {
+    crate::deploy_config::ws_control_available() && !crate::patch::patch_failed()
+}
 
 /// Everything the tray menu needs beyond the AppHandle: the backend state
 /// (shared with main.rs), the cached task list, the shared shell settings
@@ -83,6 +93,10 @@ struct PollNotifState {
     // liveness streak=2 落在相邻两个 poll 周期时，第二个通道不再补发；
     // 复活（now_alive == Some(true)）或后端停止运行才复位。
     death_notified: bool,
+    // R2 审计（A3）：上轮任务显示语言指纹。menu_diff 刻意不比 name（防
+    // webui 侧语言切换误报），这里显式检测 launcher 侧语言切换并把新语言
+    // 的任务名冲进缓存，否则切换后任务行无限期停留旧语言。
+    last_task_language: Option<String>,
 }
 
 /// Build the macOS menu-bar tray icon with its native menu.
@@ -132,6 +146,7 @@ pub fn build_tray(
         crashed: false,
         scheduler_intent: SchedulerIntent::None,
     };
+    let control_available = scheduler_control_available();
     let menu = build_menu(
         app.handle(),
         &initial,
@@ -146,10 +161,11 @@ pub fn build_tray(
             &initial,
             None,
             &labels,
-            crate::deploy_config::ws_control_available(),
+            control_available,
         ),
         // No click in flight at startup.
         false,
+        control_available,
     )?;
 
     let thread_shared = shared.clone();
@@ -242,10 +258,11 @@ pub fn build_tray(
 /// item's text/enabled follow the state machine (Initializing disables it
 /// entirely; `processing` — a scheduler-control click in flight — shows the
 /// localized 处理中… label and disables the item; the toggle text otherwise
-/// follows the scheduler scan — `scheduler_alive` None on the initial build).
+/// follows the scheduler scan, or degrades to 停止 when `control_available`
+/// is false — R2 审计：降级 Running 的行为是进程级停止，标签必须一致).
 /// Task items are read-only (disabled): group headers id
 /// `group-running|queued|waiting`, task rows id `task-{i}`.
-#[allow(clippy::too_many_arguments)] // 8 orthogonal render inputs; a struct would obscure the call sites
+#[allow(clippy::too_many_arguments)] // 9 orthogonal render inputs; a struct would obscure the call sites
 fn build_menu(
     app: &AppHandle,
     snapshot: &BackendStateSnapshot,
@@ -255,12 +272,13 @@ fn build_menu(
     scheduler_alive: Option<bool>,
     status_line: &str,
     processing: bool,
+    control_available: bool,
 ) -> tauri::Result<Menu<tauri::Wry>> {
     let status = MenuItem::with_id(app, "tray-status", status_line, false, None::<&str>)?;
     let toggle_text = if processing {
         labels.processing.clone()
     } else {
-        toggle_label(snapshot.status, scheduler_alive, labels)
+        toggle_label_for_control(snapshot.status, scheduler_alive, labels, control_available)
     };
     let toggle = MenuItem::with_id(
         app,
@@ -274,14 +292,16 @@ fn build_menu(
     let mut section_items: Vec<Box<dyn IsMenuItem<tauri::Wry>>> = Vec::new();
     match section {
         TaskSection::Degraded => {
-            push_row(app, &mut section_items, "tasks-degraded".into(), "Tasks: unavailable")?
+            push_row(app, &mut section_items, "tasks-degraded".into(), &labels.tasks_degraded)?
         }
-        TaskSection::Empty => push_row(app, &mut section_items, "tasks-empty".into(), "No tasks")?,
+        TaskSection::Empty => {
+            push_row(app, &mut section_items, "tasks-empty".into(), &labels.tasks_empty)?
+        }
         TaskSection::Tasks => {
-            for item in task_section_items(tasks) {
+            for item in task_section_items(tasks, labels) {
                 match item {
                     TaskMenuItem::GroupHeader { id, text } => {
-                        push_row(app, &mut section_items, id, text)?
+                        push_row(app, &mut section_items, id, &text)?
                     }
                     TaskMenuItem::TaskItem { id, text } => {
                         push_row(app, &mut section_items, id, &text)?
@@ -294,10 +314,10 @@ fn build_menu(
         }
     }
 
-    let refresh = MenuItem::with_id(app, "tray-refresh", "Refresh", true, None::<&str>)?;
+    let refresh = MenuItem::with_id(app, "tray-refresh", &labels.refresh, true, None::<&str>)?;
     let separator_after_refresh = PredefinedMenuItem::separator(app)?;
-    let show = MenuItem::with_id(app, "tray-show", "Show Window", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "tray-quit", "Quit", true, None::<&str>)?;
+    let show = MenuItem::with_id(app, "tray-show", &labels.show_window, true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "tray-quit", &labels.quit, true, None::<&str>)?;
 
     let mut items: Vec<&dyn IsMenuItem<tauri::Wry>> = vec![&status, &toggle, &separator_after_toggle];
     items.extend(
@@ -383,25 +403,35 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
     };
 
     // 密码/SSL 或控制补丁未应用 → 控制 API 不可用，退回进程级控制。
-    let ws_available = crate::deploy_config::ws_control_available()
-        && !crate::patch::patch_failed();
+    let ws_available = scheduler_control_available();
     if !ws_available {
         warn!("scheduler control unavailable (webui password/SSL configured or control API patch failed); falling back to process-level toggle");
     }
 
     // Click-time scheduler liveness — a lock-free re-scan (never the poll
-    // cache), plus a 100ms port probe: a dead port while the snapshot still
+    // cache), plus a port probe: a dead port while the snapshot still
     // says Running means the backend itself is gone (todo 3d), so fold to
     // Stopped and let the decision take the StartBackend path.
+    // R2 审计（A2）：探测与轮询同用双击判定（间隔 100ms 复测）——单次
+    // connect 失败可能是 uvicorn accept 积压的瞬时抖动，单发判定会把健康
+    // 后端折成 crashed、把这次点击变成一次全量重启。
     let mut snapshot = shared.backend.snapshot();
-    let scheduler_alive = if snapshot.status == BackendStatus::Running && backend_port_alive(port) {
+    let port_alive = if snapshot.status == BackendStatus::Running {
+        backend_port_alive(port) || {
+            std::thread::sleep(Duration::from_millis(100));
+            backend_port_alive(port)
+        }
+    } else {
+        false
+    };
+    let scheduler_alive = if snapshot.status == BackendStatus::Running && port_alive {
         shared
             .backend
             .backend_pid()
             .map(|pid| scheduler_alive(uvicorn_alive_child_count(pid, crate::deploy_config::enable_reload())))
             .unwrap_or(false)
     } else if snapshot.status == BackendStatus::Running {
-        // Backend died on its own (dead port despite a Running snapshot) —
+        // Backend died on its own (dead port twice despite a Running snapshot) —
         // mark the abnormal stop so the status line shows 异常停止, not a
         // plain stop.
         shared.backend.mark_stopped_crashed();
@@ -419,9 +449,21 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
         // never two backends).
         ToggleAction::NoOp => return,
         ToggleAction::StopBackend => {
-            // Degraded fallback: legacy process-level stop.
-            shared.backend.stop();
-            navigate_main(app, main_page_url(BackendStatus::Stopped, port, &labels));
+            // Degraded fallback: legacy process-level stop. R2 审计（A5）：
+            // stop() 可阻塞 ~1s（SIGTERM 宽限 + Drop 残留清扫）——与 start
+            // 同一 MAJOR-2 理由挪到 worker；结束 wake 让轮询重绘真实状态。
+            let backend = Arc::clone(&shared.backend);
+            let app_handle = app.clone();
+            let refresh = shared.refresh.clone();
+            let stop_labels = labels.clone();
+            std::thread::spawn(move || {
+                backend.stop();
+                drop(guard);
+                let _ = refresh.send(());
+                navigate_main(&app_handle, main_page_url(BackendStatus::Stopped, port, &stop_labels));
+            });
+            // 事件线程尾部重建照常运行：此刻快照可能仍是 Running（worker 尚未
+            // 完成停机），渲染短暂滞后一个 poll 周期由 wake 修正。
         }
         ToggleAction::StartBackend => {
             // Show "initializing…" (and make re-entry a no-op) for the whole
@@ -617,11 +659,10 @@ pub(crate) fn spawn_restart_worker(
     };
     backend.stop();
     backend.begin_start();
-    // Same gating as handle_toggle: a failed/anchor-mismatched patch means
-    // the start-after-backend call would just spin the 15s retry thread
-    // against a dead endpoint.
-    let ws_available = crate::deploy_config::ws_control_available()
-        && !crate::patch::patch_failed();
+    // Same gating as handle_toggle (shared predicate): a failed/anchor-
+    // mismatched patch means the start-after-backend call would just spin
+    // the 15s retry thread against a dead endpoint.
+    let ws_available = scheduler_control_available();
     spawn_start_worker(app, backend, port, labels, guard, refresh, ws_available);
 }
 
@@ -643,11 +684,12 @@ fn rebuild_menu(app: &AppHandle, shared: &TrayShared, section: TaskSection, sche
     let snapshot = shared.backend.snapshot();
     let tasks = shared.tasks.lock().unwrap().clone();
     let labels = load_control_labels(&shared.settings);
+    let control_available = scheduler_control_available();
     let status_line = status_line_for(
         &snapshot,
         scheduler_alive,
         &labels,
-        crate::deploy_config::ws_control_available(),
+        control_available,
     );
     // Processing = a scheduler-control click is in flight; rebuilds during
     // that window render the disabled 处理中… toggle instead of the real one.
@@ -661,6 +703,7 @@ fn rebuild_menu(app: &AppHandle, shared: &TrayShared, section: TaskSection, sche
         scheduler_alive,
         &status_line,
         processing,
+        control_available,
     )
     else {
         return;
@@ -724,8 +767,8 @@ fn poll_once(
     // StartBackend instead of showing a stuck Running state. The probe is
     // lock-free. MINOR-5: the marking needs TWO CONSECUTIVE failures — one
     // missed connect can be transient (bind races, packet loss); a success in
-    // between resets the streak. The click-time toggle probe stays
-    // single-shot: that is a real-time decision on the user's click.
+    // between resets the streak. The click-time toggle probe applies the
+    // same two-strike rule (one probe + one 100ms-later recheck, R2 审计 A2).
     if status == BackendStatus::Running && !backend_port_alive(port) {
         let streak = shared.port_fail_count.fetch_add(1, Ordering::Relaxed) + 1;
         if should_mark_crashed(streak) {
@@ -743,6 +786,7 @@ fn poll_once(
     // all-Waiting menu (the 9999-12-31 sentinel bug). Tasks are read from the
     // payload files (config/alas.json + i18n — the ALAS webui has no JSON
     // API, see alas_tasks module doc).
+    let mut language_changed = false;
     let fetched: Result<Vec<Task>, ()> = if status == BackendStatus::Running {
         let alas_dir = std::env::current_dir().unwrap_or_default();
         // Effective UI language for task display names: resolved under a
@@ -755,6 +799,9 @@ fn poll_once(
             .lock()
             .unwrap()
             .resolved_language(deploy_lang.as_deref());
+        // R2 审计（A3）：语言指纹变化 → 强制缓存替换（见 PollNotifState）。
+        language_changed = notif.last_task_language.as_deref() != Some(task_language.as_str());
+        notif.last_task_language = Some(task_language.clone());
         match alas_tasks::now_str() {
             // Clock failure -> Err(()) like a fetch failure (now_str already
             // logged the real error); poll_decision degrades the section.
@@ -762,6 +809,7 @@ fn poll_once(
             Err(_) => Err(()),
         }
     } else {
+        notif.last_task_language = None;
         Err(())
     };
 
@@ -795,7 +843,12 @@ fn poll_once(
                     crate::notify::NotifyEvent::SchedulerDeath { name } =>
                         nlabels.notify_death_body.replace("{name}", name),
                 };
-                let _ = app.notification().builder().title("ALAS").body(body).show();
+                // R2 审计（A6）：发送失败（典型：macOS 通知权限被拒后从此
+                // 静默 no-op）至少落日志，否则设置里开关勾着而通知永不出现、
+                // 零诊断。
+                if let Err(e) = app.notification().builder().title("ALAS").body(body).show() {
+                    warn!("notification send failed: {e}");
+                }
             }
         }
     }
@@ -838,16 +891,28 @@ fn poll_once(
     if died {
         let ev = crate::notify::NotifyEvent::SchedulerDeath { name: "alas".into() };
         if crate::notify::should_notify(&ev, &settings) {
-            let _ = app.notification().builder()
+            if let Err(e) = app.notification().builder()
                 .title("ALAS")
                 .body(nlabels.notify_death_body.replace("{name}", "alas"))
-                .show();
+                .show()
+            {
+                warn!("death notification send failed: {e}");
+            }
         }
     }
 
     // Decision is pure (menu_model::poll_decision): the clock string and the
     // fetch result are injected, so this call site carries no decision logic.
-    let outcome = poll_decision(status, fetched, *last_section, &shared.tasks.lock().unwrap());
+    let mut outcome = poll_decision(status, fetched.clone(), *last_section, &shared.tasks.lock().unwrap());
+    // R2 审计（A3）：语言切换唤醒的这轮 poll，把新语言任务名冲进缓存并强制
+    // 重建——diff 门控不比 name，否则这里算出 changed=false、菜单以旧缓存
+    // 重绘，任务行停留旧语言直到下次数据变化。
+    if language_changed {
+        if let Ok(tasks) = &fetched {
+            outcome.replace_cache = Some(tasks.clone());
+            outcome.changed = true;
+        }
+    }
     if let Some(tasks) = outcome.replace_cache {
         *shared.tasks.lock().unwrap() = tasks;
     }
@@ -871,8 +936,8 @@ fn backend_port_alive(port: u16) -> bool {
 /// TWO CONSECUTIVE failed port probes. `fail_count` is the caller's current
 /// consecutive-failure streak (incremented BEFORE the call); a success in
 /// between resets it to 0, so one transient miss never kills a Running
-/// backend. The click-time toggle probe stays single-shot — that is a
-/// real-time decision on the user's click.
+/// backend. The click-time toggle probe mirrors the rule with an immediate
+/// probe plus one 100ms-later recheck (R2 审计 A2).
 fn should_mark_crashed(fail_count: u8) -> bool {
     fail_count >= 2
 }
