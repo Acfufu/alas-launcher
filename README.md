@@ -74,7 +74,7 @@ xattr -dr com.apple.quarantine AzurLaneAutoScript.app   # 移除隔离属性，�
 Web UI 默认监听端口为 `22267`，启动器启动时读取 `config/deploy.yaml`，端口在其中的 `Deploy.Webui.WebuiPort` 修改。
 
 - **语言**：语言切换只影响启动器 UI（菜单栏、托盘、停止页）；ALAS 网页语言跟随 `config/deploy.yaml` 的 `Deploy.Webui.Language`（旧版树回退 `Gui.Language`），二者可能不同步（设计如此）。
-- **密码 / SSL**：为 WebUI 配置 `Deploy.Webui.Password` / `WebuiSSLKey` / `WebuiSSLCert` 后，菜单栏调度器开关退化为进程级控制（无法通过控制 API 驱动调度器），托盘状态行会追加「密码/SSL 已配置，仅进程级控制」降级提示。
+- **密码 / SSL**：为 WebUI 配置 `Deploy.Webui.Password` / `WebuiSSLKey` / `WebuiSSLCert` 后，菜单栏调度器开关退化为进程级控制（无法通过控制 API 驱动调度器），托盘状态行会追加「控制通道不可用，仅进程级控制」降级提示（成因中性——控制 API 补丁未就绪同样触发）。
 
 ## 构建与发布
 
@@ -141,7 +141,7 @@ gh release create v0.1.0 release/AzurLaneAutoScript.app --title "v0.1.0" --notes
 - 启动器外壳不含 ALAS payload，需要手动拼装（见[构建与发布](#构建与发布)）。
 - macOS 应用未签名，首次打开需要手动解除 quarantine。
 - 菜单栏速览（任务列表/调度器启停）仅在 macOS 上启用。
-- 调度器启停依赖对 ALAS 的 control API 补丁（锚点为 `module/webui/fastapi.py`，自 2022-04-14 起未变）；若锚点失效，托盘调度器开关降级为进程级控制（非静默 no-op）。
+- 调度器启停依赖对 ALAS 的 control API 补丁（锚点为 `module/webui/api/__init__.py` 的 `create_api_app()`，PR-5885 webui 重写引入；旧锚点 `module/webui/fastapi.py` 已随该重写删除）；若锚点失效，托盘调度器开关降级为进程级控制（非静默 no-op）。
 - Linux 依赖 `libwebkit2gtk-4.1` 与较新的 `glibc`。
 - adb 重启/替换未实现；pip 自动更新已禁用。
 - 远程 Release 为草稿，尚未声明为稳定公开安装包。

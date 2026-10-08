@@ -74,7 +74,7 @@ xattr -dr com.apple.quarantine AzurLaneAutoScript.app   # remove the quarantine 
 The Web UI listens on port `22267` by default; the launcher reads `config/deploy.yaml` at startup, and the port is set in `Deploy.Webui.WebuiPort`.
 
 - **Language**: the language switch only affects launcher UI (menu bar, tray, stop page); the ALAS web page language follows `Deploy.Webui.Language` in `config/deploy.yaml` (legacy fallback `Gui.Language`), and the two may be out of sync (by design).
-- **Password / SSL**: after configuring `Deploy.Webui.Password` / `WebuiSSLKey` / `WebuiSSLCert`, the menu-bar scheduler toggle degrades to process-level control (the control API can no longer drive the scheduler), and the tray status line appends a "password/SSL configured, process-level control only" notice.
+- **Password / SSL**: after configuring `Deploy.Webui.Password` / `WebuiSSLKey` / `WebuiSSLCert`, the menu-bar scheduler toggle degrades to process-level control (the control API can no longer drive the scheduler), and the tray status line appends a cause-neutral "scheduler control unavailable, process-level control only" notice (a not-ready control patch triggers the same degradation).
 
 ## Build and release
 
@@ -141,7 +141,7 @@ The launcher adds the following environment variables:
 - The launcher shell does not contain the ALAS payload; it must be assembled manually (see [Build and release](#build-and-release)).
 - The macOS app is unsigned; the first launch requires manually clearing quarantine.
 - The menu-bar overview (task list / scheduler toggle) is enabled only on macOS.
-- The scheduler toggle depends on the ALAS control API patch (anchor: `module/webui/fastapi.py`, unchanged since 2022-04-14); if the anchor breaks, the tray scheduler toggle degrades to process-level control (not a silent no-op).
+- The scheduler toggle depends on the ALAS control API patch (anchor: `create_api_app()` in `module/webui/api/__init__.py`, introduced by the PR-5885 webui rewrite; the old anchor `module/webui/fastapi.py` no longer exists on that payload line); if the anchor breaks, the tray scheduler toggle degrades to process-level control (not a silent no-op).
 - Linux requires `libwebkit2gtk-4.1` and a recent `glibc`.
 - adb restart/replacement is not implemented; pip auto-update is disabled.
 - The remote Release is a draft, not yet declared a stable public install package.
