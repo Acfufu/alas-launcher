@@ -524,7 +524,7 @@
       <tr><td><code>webui_port</code></td><td><code>Deploy.Webui.WebuiPort</code></td><td>22267；非整数/浮点/字符串都回落缺省（只告警一次）</td><td>所有 URL、spawn、探测</td></tr>
       <tr><td><code>language</code></td><td><code>Deploy.Webui.Language</code>（回退旧版 <code>Gui.Language</code>）</td><td><code>None</code>（空串保留为 <code>Some("")</code>，下游再做 zh-CN 回落）</td><td>托盘/菜单文案、任务显示名</td></tr>
       <tr><td><code>enable_reload</code></td><td><code>Deploy.Update.EnableReload</code></td><td>true（ALAS 默认）</td><td>调度器存活探测的进程树形态</td></tr>
-      <tr><td><code>ws_control_available</code></td><td><code>Deploy.Webui.Password / WebuiSSLKey / WebuiSSLCert</code></td><td>三处都无<b>非空字符串</b>才算可用；null/缺失/空串都不算配了凭据</td><td>托盘开关降级判定的<b>凭据半边</b>（配了密码/SSL → 控制 API 被服务端 401）；另一半是补丁失败 <code>patch_failed()</code>，两条件并列见 §7</td></tr>
+      <tr><td><code>ws_control_available</code></td><td><code>Deploy.Webui.Password / WebuiSSLKey / WebuiSSLCert</code></td><td>三处都无<b>非空值</b>才算可用——null/缺失/空串不算配了凭据，<b>非字符串真值（如 YAML 里漏引号的 <code>Password: 123</code>）按已配置降级</b>，与 Python 网关 <code>_locked()</code> 的真值判定对齐（R3 审计）</td><td>托盘开关降级判定的<b>凭据半边</b>（配了密码/SSL → 控制 API 被服务端 401）；另一半是补丁失败 <code>patch_failed()</code>，两条件并列见 §7</td></tr>
     </table>
     <p style="font-size:13px;color:var(--muted);margin-bottom:0">解析核心是纯函数 <code>DeployConfig::from_value(Option&lt;Value&gt;)</code>——不碰文件，所以「缺字段/空值/坏类型」的缺省矩阵可以拿手工构造的 JSON 做单元测试全覆盖。</p>
   </div>
@@ -551,8 +551,8 @@
     <p style="margin-top:0"><b>开关点击（handle_toggle）的完整决策链：</b></p>
     <ol class="plain" style="font-size:13.5px;padding-left:20px">
       <li><b>去重</b>：<code>try_acquire_in_flight</code>（compare_exchange 抢一个 AtomicBool）。抢不到 → 忽略并告警「上一次点击还在进行中」。守卫对象随 worker 闭包移动，所有退出路径都释放。</li>
-      <li><b>降级检查</b>：<code>ws_control_available()</code> 为假（配了密码/SSL），或控制 API 补丁失败（<code>patch_failed()</code>）→ 告警并走进程级控制。</li>
-      <li><b>点击时刻重新扫描</b>（不用轮询缓存）：端口探测 + 调度器进程树扫描，得到此刻的真相；端口死了 → 先 <code>mark_stopped_crashed</code> 再决策。</li>
+      <li><b>降级检查</b>：统一谓词 <code>scheduler_control_available()</code>（凭据与补丁双条件）为假 → 告警并走进程级控制；该停止也挪到 worker 线程执行（stop 可阻塞 ~1s），结束 wake 强制轮询重绘（R2/R3 审计）。</li>
+      <li><b>点击时刻重新扫描</b>（不用轮询缓存）：端口探测 + 调度器进程树扫描，得到此刻的真相；端口死了 → 先 <code>mark_stopped_crashed</code> 再决策。（探测同轮询一样是双击判定：首拍失败后隔 100ms 复测，瞬时抖动不再把健康后端折成异常停止）</li>
       <li><b>查矩阵 <code>toggle_decision</code></b>：</li>
     </ol>
     <table>

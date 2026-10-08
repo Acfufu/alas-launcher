@@ -192,7 +192,7 @@ impl ManagedBackend {
                             // 仅 nix 0.30 cfg(unix)），裸 libc::ESRCH 编译 E0433。改用
                             // nix::errno::Errno::ESRCH as i32（模块常量 ESRCH_RAW，R2 起
                             // 两处共用）——Errno 全平台 #[repr(i32)]，errno 模块无
-                            // feature 门控，仓库既有模式 child_process.rs:192。
+                            // feature 门控（仓库既有模式：child_process.rs signal_process_group）。
                             Err(e) if e.raw_os_error() == Some(ESRCH_RAW) => {
                                 unregister_for_exit(pid)
                             }
@@ -691,7 +691,7 @@ impl BackendLifecycle {
     /// Record the user's last scheduler Start/Stop request (see
     /// [`SchedulerIntent`]); `None` disarms. A non-Start intent also clears
     /// the MINOR-2 TTL clock: the start (if any) is no longer in flight.
-    /// `Start` armed here (scheduler-only WS clicks) leaves the clock
+    /// `Start` armed here (scheduler-only control-API clicks) leaves the clock
     /// untouched — `begin_start`/`start` are the recorded TTL origins.
     pub fn set_scheduler_intent(&self, intent: SchedulerIntent) {
         let mut state = self.state.lock().unwrap();
@@ -739,8 +739,8 @@ impl BackendLifecycle {
     /// scheduler probe. Brief lock, no handle out.
     ///
     /// During Initializing (the port wait) this returns `Some(live child)` —
-    /// expected by design; consumers (tray.rs:379,702) all gate on
-    /// `status == Running` before acting on the pid.
+    /// expected by design; consumers (tray.rs handle_toggle / poll_once)
+    /// all gate on `status == Running` before acting on the pid.
     pub fn backend_pid(&self) -> Option<u32> {
         self.state
             .lock()
@@ -790,17 +790,17 @@ pub fn webui_url(port: u16) -> String {
 /// disabled anyway; this also makes a second click during a 60s start window
 /// a no-op — BLOCKER-3: never two backends).
 ///
-/// Since todo 6 the toggle drives the ALAS SCHEDULER through the webui
-/// WebSocket when it can, and falls back to process-level control when it
-/// cannot:
-/// - `StopScheduler` / `StartScheduler`: scheduler-only control (the webui
-///   stays alive; no window navigation).
+/// Since todo 6 the toggle drives the ALAS SCHEDULER through the HTTP
+/// control API (injected into the payload webui) when it can, and falls
+/// back to process-level control when it cannot:
+/// - `StopScheduler` / `StartScheduler`: scheduler-only control over the
+///   control API (the webui stays alive; no window navigation).
 /// - `StartBackend`: the backend is down (or Stopped) — bring the whole
-///   backend up, then optionally start the scheduler over WS (the caller
-///   decides that tail based on `ws_available`).
-/// - `StopBackend`: DEGRADED mode only (webui password/SSL configured, so WS
-///   control is impossible) — the legacy semantics, Running → stop the
-///   backend process. Kept as an explicit variant (plan option A) instead of
+///   backend up, then optionally start the scheduler over the control API
+///   (the caller decides that tail based on `ws_available`).
+/// - `StopBackend`: DEGRADED mode only (scheduler control unavailable:
+///   webui credentials or patch failure) — the legacy semantics, Running →
+///   stop the backend process. Kept as an explicit variant (plan option A) instead of
 ///   mapping `StopScheduler`→`StopBackend` in the caller: the variant makes
 ///   the degraded behavior a first-class, testable decision cell rather than
 ///   a hidden rewrite.
@@ -808,7 +808,8 @@ pub fn webui_url(port: u16) -> String {
 pub(crate) enum ToggleAction {
     NoOp,
     StartBackend,
-    /// Degraded mode (no WS available): process-level stop, legacy semantics.
+    /// Degraded mode (scheduler control unavailable): process-level stop,
+    /// legacy semantics.
     StopBackend,
     StopScheduler,
     StartScheduler,
@@ -826,7 +827,8 @@ pub(crate) enum ToggleAction {
 ///
 /// `scheduler_alive` is the click-time process-tree liveness (re-scanned by
 /// the caller outside any lock, never the poll cache); `ws_available` is the
-/// password/SSL degradation flag.
+/// degradation flag: webui credentials configured OR the control patch not
+/// ready (tray.rs `scheduler_control_available`).
 pub(crate) fn toggle_decision(
     snapshot: &BackendStateSnapshot,
     scheduler_alive: bool,

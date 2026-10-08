@@ -26,3 +26,4 @@ node_modules/
 .video_agent/
 # Local security audit report (contains exploit paths; not published to the public repo)
 deepsec-security-report.html
+__pycache__/

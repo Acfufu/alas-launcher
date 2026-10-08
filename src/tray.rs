@@ -60,7 +60,7 @@ fn scheduler_control_available() -> bool {
 /// build / poll so a live language switch re-renders the tray), the stop
 /// flag (shared with main.rs so ExitRequested can halt the poll thread),
 /// the refresh signal channel (manual Refresh menu item, and the todo-4
-/// language-switch wake) and the WS in-flight flag (dedups concurrent
+/// language-switch wake) and the control-API in-flight flag (dedups concurrent
 /// toggles — only one scheduler click session at a time). `port_fail_count`
 /// is the poll thread's CONSECUTIVE failed-probe streak (MINOR-5): two
 /// misses mark the backend crashed, a success resets it.
@@ -443,6 +443,12 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
 
     let action = toggle_decision(&snapshot, scheduler_alive, ws_available);
     let labels = load_control_labels(&shared.settings);
+    // R3 审计（B2）：StopBackend 臂跳过尾部重建——worker 提前释放 guard 后，
+    // 「事件线程尾部 rebuild vs wake-poll rebuild」的 set_menu 落序是竞态，
+    // 败者会把托盘钉死在 处理中…/Running（diff 门控对 stale 渲染永不再触发，
+    // 无法自愈）。跳过后标签滞后 ≤1 个 poll 周期，由 worker 的 wake 强制
+    // 重绘真实状态。
+    let mut skip_tail_rebuild = false;
     match action {
         // Initializing -> NoOp (the item is disabled anyway; this also makes
         // a second click during a 60s start window a no-op — BLOCKER-3:
@@ -452,6 +458,9 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
             // Degraded fallback: legacy process-level stop. R2 审计（A5）：
             // stop() 可阻塞 ~1s（SIGTERM 宽限 + Drop 残留清扫）——与 start
             // 同一 MAJOR-2 理由挪到 worker；结束 wake 让轮询重绘真实状态。
+            // 注：stop_labels 是点击时刻的语言快照——~1s worker 窗口内恰好
+            // 切语言的话停止页会定格旧语言，属可接受的一帧滞后（R3 审计附注）。
+            skip_tail_rebuild = true;
             let backend = Arc::clone(&shared.backend);
             let app_handle = app.clone();
             let refresh = shared.refresh.clone();
@@ -462,8 +471,6 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
                 let _ = refresh.send(());
                 navigate_main(&app_handle, main_page_url(BackendStatus::Stopped, port, &stop_labels));
             });
-            // 事件线程尾部重建照常运行：此刻快照可能仍是 Running（worker 尚未
-            // 完成停机），渲染短暂滞后一个 poll 周期由 wake 修正。
         }
         ToggleAction::StartBackend => {
             // Show "initializing…" (and make re-entry a no-op) for the whole
@@ -511,13 +518,15 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
     // a Stop click (scheduler still alive at click time) shows 停止 until
     // the worker's click lands, a Start shows 启动 — the poll thread
     // corrects within one cycle.
-    let tasks = shared.tasks.lock().unwrap().clone();
-    rebuild_menu(
-        app,
-        shared,
-        task_section(shared.backend.snapshot().status, Ok(tasks)),
-        Some(scheduler_alive),
-    );
+    if !skip_tail_rebuild {
+        let tasks = shared.tasks.lock().unwrap().clone();
+        rebuild_menu(
+            app,
+            shared,
+            task_section(shared.backend.snapshot().status, Ok(tasks)),
+            Some(scheduler_alive),
+        );
+    }
 }
 
 /// RAII in-flight guard: clears the shared flag on drop, so the flag can
@@ -544,7 +553,7 @@ fn try_acquire_in_flight(flag: &Arc<AtomicBool>) -> Option<InFlightGuard> {
 /// Worker-thread scheduler control via the control API. The in-flight guard
 /// moves into the closure; the refresh wake forces a poll rebuild so the
 /// 处理中… toggle is replaced by the real state (same contract as the old
-/// WS click worker).
+/// control-API click worker).
 fn spawn_scheduler_call(port: u16, action: crate::control_api::SchedulerAction, guard: InFlightGuard, refresh: mpsc::Sender<()>) {
     std::thread::spawn(move || {
         let result = match action {
@@ -787,6 +796,7 @@ fn poll_once(
     // payload files (config/alas.json + i18n — the ALAS webui has no JSON
     // API, see alas_tasks module doc).
     let mut language_changed = false;
+    let mut task_language_opt: Option<String> = None;
     let fetched: Result<Vec<Task>, ()> = if status == BackendStatus::Running {
         let alas_dir = std::env::current_dir().unwrap_or_default();
         // Effective UI language for task display names: resolved under a
@@ -800,12 +810,17 @@ fn poll_once(
             .unwrap()
             .resolved_language(deploy_lang.as_deref());
         // R2 审计（A3）：语言指纹变化 → 强制缓存替换（见 PollNotifState）。
+        // R3 审计（B3）：指纹只在冲刷成功后提交（见下方 if language_changed），
+        // 否则「切换当拍 fetch 失败」会把指纹吞掉、恢复后旧语言名永久残留。
         language_changed = notif.last_task_language.as_deref() != Some(task_language.as_str());
-        notif.last_task_language = Some(task_language.clone());
+        task_language_opt = Some(task_language);
         match alas_tasks::now_str() {
             // Clock failure -> Err(()) like a fetch failure (now_str already
             // logged the real error); poll_decision degrades the section.
-            Ok(now) => alas_tasks::fetch_tasks(&alas_dir, &now, &task_language).map_err(|_| ()),
+            Ok(now) => {
+                let lang = task_language_opt.clone().unwrap_or_default();
+                alas_tasks::fetch_tasks(&alas_dir, &now, &lang).map_err(|_| ())
+            }
             Err(_) => Err(()),
         }
     } else {
@@ -907,10 +922,13 @@ fn poll_once(
     // R2 审计（A3）：语言切换唤醒的这轮 poll，把新语言任务名冲进缓存并强制
     // 重建——diff 门控不比 name，否则这里算出 changed=false、菜单以旧缓存
     // 重绘，任务行停留旧语言直到下次数据变化。
+    // R3 审计（B3）：冲刷成功才提交指纹；fetch 失败的拍保留旧指纹，恢复后
+    // 第一拍重检语言变化。
     if language_changed {
         if let Ok(tasks) = &fetched {
             outcome.replace_cache = Some(tasks.clone());
             outcome.changed = true;
+            notif.last_task_language = task_language_opt.clone();
         }
     }
     if let Some(tasks) = outcome.replace_cache {

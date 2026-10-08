@@ -73,7 +73,7 @@ xattr -dr com.apple.quarantine AzurLaneAutoScript.app   # remove the quarantine 
 
 The Web UI listens on port `22267` by default; the launcher reads `config/deploy.yaml` at startup, and the port is set in `Deploy.Webui.WebuiPort`.
 
-- **Language**: the language switch only affects launcher UI (menu bar, tray, stop page); the ALAS web page language always follows `Gui.Language` in `config/deploy.yaml`, and the two may be out of sync (by design).
+- **Language**: the language switch only affects launcher UI (menu bar, tray, stop page); the ALAS web page language follows `Deploy.Webui.Language` in `config/deploy.yaml` (legacy fallback `Gui.Language`), and the two may be out of sync (by design).
 - **Password / SSL**: after configuring `Deploy.Webui.Password` / `WebuiSSLKey` / `WebuiSSLCert`, the menu-bar scheduler toggle degrades to process-level control (the control API can no longer drive the scheduler), and the tray status line appends a "password/SSL configured, process-level control only" notice.
 
 ## Build and release

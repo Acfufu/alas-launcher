@@ -310,8 +310,9 @@ pub struct ControlLabels {
     pub processing: String,
     pub sep: String,
     /// Launcher-owned copy appended to the status line in degraded mode
-    /// (control unavailable: password/SSL or patch failed). NEVER overridden
-    /// from the ALAS i18n file — the webui has no equivalent string.
+    /// (control unavailable — webui credentials OR patch failure; R3 审计：
+    /// 文案保持成因中性，不指认密码/SSL). NEVER overridden from the ALAS
+    /// i18n file — the webui has no equivalent string.
     pub degraded_hint: String,
     // ---- R2 审计（A4）：托盘铬文案入 i18n 表（此前硬编码英文/中文混杂）----
     pub refresh: String,
@@ -340,7 +341,7 @@ fn builtin_labels(lang: &str) -> ControlLabels {
                 "停止",
                 "處理中…",
                 "：",
-                "（密碼/SSL 已配置，僅進程級控制）",
+                "（控制通道不可用，僅進程級控制）",
             ),
             "en-US" => (
                 "Scheduler",
@@ -354,7 +355,7 @@ fn builtin_labels(lang: &str) -> ControlLabels {
                 "Processing…",
                 ": ",
                 // Leading space: appended after the status word, en template.
-                " (password/SSL configured, process-level control only)",
+                " (scheduler control unavailable, process-level control only)",
             ),
             "ja-JP" => (
                 "スケジューラー",
@@ -368,7 +369,7 @@ fn builtin_labels(lang: &str) -> ControlLabels {
                 "処理中…",
                 // Half-width ": " (en template), NOT the full-width "：".
                 ": ",
-                "（パスワード/SSL 設定済み、プロセスレベル制御のみ）",
+                "（制御チャネル利用不可、プロセスレベル制御のみ）",
             ),
             // zh-CN doubles as the fallback for any unknown or empty language.
             _ => (
@@ -382,7 +383,7 @@ fn builtin_labels(lang: &str) -> ControlLabels {
                 "停止",
                 "处理中…",
                 "：",
-                "（密码/SSL 已配置，仅进程级控制）",
+                "（控制通道不可用，仅进程级控制）",
             ),
         };
     // Tray chrome strings (R2 审计 A4)：先前散落在 tray.rs / task_section_items
@@ -753,10 +754,10 @@ mod tests {
         // line carries the localized degraded hint; one assertion per
         // language, plus a Running case to prove the hint rides any word.
         let cases = [
-            ("zh-CN", "调度器：已停止（密码/SSL 已配置，仅进程级控制）"),
-            ("zh-TW", "調度器：已停止（密碼/SSL 已配置，僅進程級控制）"),
-            ("en-US", "Scheduler: stopped (password/SSL configured, process-level control only)"),
-            ("ja-JP", "スケジューラー: 停止済み（パスワード/SSL 設定済み、プロセスレベル制御のみ）"),
+            ("zh-CN", "调度器：已停止（控制通道不可用，仅进程级控制）"),
+            ("zh-TW", "調度器：已停止（控制通道不可用，僅進程級控制）"),
+            ("en-US", "Scheduler: stopped (scheduler control unavailable, process-level control only)"),
+            ("ja-JP", "スケジューラー: 停止済み（制御チャネル利用不可、プロセスレベル制御のみ）"),
         ];
         for (lang, expected) in cases {
             let labels = expected_labels(lang);
@@ -772,7 +773,7 @@ mod tests {
         };
         assert_eq!(
             status_line_for(&running, Some(true), &zh, false),
-            "调度器：运行中（密码/SSL 已配置，仅进程级控制）"
+            "调度器：运行中（控制通道不可用，仅进程级控制）"
         );
     }
 
@@ -883,10 +884,10 @@ mod tests {
     fn expected_labels(lang: &str) -> ControlLabels {
         let (scheduler, running, stopped, initializing, failed, crashed, start, stop, processing, sep, degraded_hint) =
             match lang {
-                "zh-TW" => ("調度器", "執行中", "已停止", "啟動中…", "啟動失敗", "異常停止", "啟動", "停止", "處理中…", "：", "（密碼/SSL 已配置，僅進程級控制）"),
-                "en-US" => ("Scheduler", "Running", "stopped", "initializing…", "start failed", "stopped unexpectedly", "Start", "Stop", "Processing…", ": ", " (password/SSL configured, process-level control only)"),
-                "ja-JP" => ("スケジューラー", "実行中", "停止済み", "起動中…", "起動失敗", "異常停止", "実行", "中止", "処理中…", ": ", "（パスワード/SSL 設定済み、プロセスレベル制御のみ）"),
-                _ => ("调度器", "运行中", "已停止", "启动中…", "启动失败", "异常停止", "启动", "停止", "处理中…", "：", "（密码/SSL 已配置，仅进程级控制）"),
+                "zh-TW" => ("調度器", "執行中", "已停止", "啟動中…", "啟動失敗", "異常停止", "啟動", "停止", "處理中…", "：", "（控制通道不可用，僅進程級控制）"),
+                "en-US" => ("Scheduler", "Running", "stopped", "initializing…", "start failed", "stopped unexpectedly", "Start", "Stop", "Processing…", ": ", " (scheduler control unavailable, process-level control only)"),
+                "ja-JP" => ("スケジューラー", "実行中", "停止済み", "起動中…", "起動失敗", "異常停止", "実行", "中止", "処理中…", ": ", "（制御チャネル利用不可、プロセスレベル制御のみ）"),
+                _ => ("调度器", "运行中", "已停止", "启动中…", "启动失败", "异常停止", "启动", "停止", "处理中…", "：", "（控制通道不可用，仅进程级控制）"),
             };
         let (refresh, show_window, quit, tasks_empty, tasks_degraded, group_running, group_queued, group_waiting) =
             match lang {

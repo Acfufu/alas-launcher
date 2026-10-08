@@ -175,7 +175,7 @@ mod real_payload_tests {
         std::env::set_var(key, std::env::join_paths(paths).unwrap());
     }
 
-    /// Replicate src/setup.rs:52-60 (unix `setup_environment`): cwd becomes
+    /// Mirror src/setup.rs setup_environment (PATH prepend order) (unix `setup_environment`): cwd becomes
     /// the payload dir and PATH/LD_LIBRARY_PATH gain the toolkit entries.
     fn setup_payload_env(payload: &Path) {
         std::env::set_current_dir(payload).expect("set cwd to payload");

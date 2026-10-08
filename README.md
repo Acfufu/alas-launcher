@@ -73,7 +73,7 @@ xattr -dr com.apple.quarantine AzurLaneAutoScript.app   # 移除隔离属性，�
 
 Web UI 默认监听端口为 `22267`，启动器启动时读取 `config/deploy.yaml`，端口在其中的 `Deploy.Webui.WebuiPort` 修改。
 
-- **语言**：语言切换只影响启动器 UI（菜单栏、托盘、停止页）；ALAS 网页语言始终跟随 `config/deploy.yaml` 的 `Gui.Language`，二者可能不同步（设计如此）。
+- **语言**：语言切换只影响启动器 UI（菜单栏、托盘、停止页）；ALAS 网页语言跟随 `config/deploy.yaml` 的 `Deploy.Webui.Language`（旧版树回退 `Gui.Language`），二者可能不同步（设计如此）。
 - **密码 / SSL**：为 WebUI 配置 `Deploy.Webui.Password` / `WebuiSSLKey` / `WebuiSSLCert` 后，菜单栏调度器开关退化为进程级控制（无法通过控制 API 驱动调度器），托盘状态行会追加「密码/SSL 已配置，仅进程级控制」降级提示。
 
 ## 构建与发布

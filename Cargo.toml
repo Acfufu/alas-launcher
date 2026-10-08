@@ -9,7 +9,11 @@ edition = "2021"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["devtools", "webview-data-url"] }
+# image-png lives in the BASE feature set (not just the macOS target line):
+# icon_assets.rs compiles ungated and its tests decode PNGs via
+# tauri::image::Image::from_bytes, which is feature-gated — without this,
+# `cargo test` fails to compile on win/linux (R3 审计 A2).
+tauri = { version = "2", features = ["devtools", "webview-data-url", "image-png"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -38,7 +42,10 @@ rfd = "0.15"
 nix = { version = "0.30", features = ["signal"] }
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["consoleapi", "processenv", "winbase", "winuser"] }
+# wincon: main.rs AttachConsole; winbase: window_util CREATE_NO_WINDOW.
+# (R3 审计 A1：wincon 缺失把 Windows 目标整体编译打穿——winapi 的 feature
+# 互不依赖，传递依赖也带不进来。) consoleapi/processenv/winuser 无人使用，移除。
+winapi = { version = "0.3", features = ["winbase", "wincon"] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-single-instance = "2"
@@ -47,7 +54,9 @@ tauri-plugin-single-instance = "2"
 openssl-probe = "0.1.6"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
+# image-png moved to the base feature set (see above); tray-icon stays
+# macOS-only — the tray module tree is cfg-gated to macOS in main.rs.
+tauri = { version = "2", features = ["tray-icon"] }
 
 [profile.release]
 strip = true

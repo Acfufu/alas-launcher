@@ -22,11 +22,13 @@
 //!   downstream.
 //! - `enable_reload`: bool `Deploy.Update.EnableReload`; anything else →
 //!   `true` (the ALAS default, deploy.yaml:86).
-//! - `ws_control_available`: true unless a NON-EMPTY string sits in
-//!   `Deploy.Webui.Password` / `WebuiSSLKey` / `WebuiSSLCert`; null, missing,
-//!   empty and non-string all count as "no credential" (ALAS skips login for
-//!   an empty password). A missing config file → available (no credentials
-//!   can be configured without a file).
+//! - `ws_control_available`: true unless a non-empty value sits in
+//!   `Deploy.Webui.Password` / `WebuiSSLKey` / `WebuiSSLCert` — non-empty
+//!   strings AND non-string truthy values both count as configured; null,
+//!   missing and empty-string count as "no credential" (R3 审计：与 Python
+//!   网关 `_locked()` 的真值判定对齐，非字符串曾导致客户端放行而服务端
+//!   401). A missing config file → available (no credentials can be
+//!   configured without a file).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -110,9 +112,15 @@ impl DeployConfig {
                     return false;
                 }
             }
-            cur.and_then(|v| v.as_str())
-                .map(|s| !s.is_empty())
-                .unwrap_or(false)
+            cur.map(|v| match v {
+                Value::Null => false,
+                Value::String(s) => !s.is_empty(),
+                // 非字符串真值（YAML 里 `Password: 123` 这类漏引号）：Python
+                // 网关按真值判锁、直接 401——客户端必须同样降级（R3 审计：
+                // 旧语义 as_str-only 会放行，调度器点击永远 401 而只有 warn）。
+                _ => true,
+            })
+            .unwrap_or(false)
         };
         let ws_control_available = !(configured(&["Deploy", "Webui", "Password"])
             || configured(&["Deploy", "Webui", "WebuiSSLKey"])
@@ -298,9 +306,14 @@ mod tests {
         assert!(!cert.ws_control_available());
     }
 
+    /// R3 审计（B4）：非字符串真值按「已配置」降级——Python 网关按真值
+    /// 判锁（bool(123) → 401），客户端不同步降级会让调度器点击永远失败。
     #[test]
-    fn non_string_credential_values_do_not_degrades_ws_control() {
+    fn non_string_credential_values_degrade_ws_control() {
         let cfg = typed(json!({"Deploy": {"Webui": {"Password": 123}}}));
-        assert!(cfg.ws_control_available());
+        assert!(!cfg.ws_control_available());
+        // 显式 null 仍算未配置。
+        let null_cfg = typed(json!({"Deploy": {"Webui": {"Password": null}}}));
+        assert!(null_cfg.ws_control_available());
     }
 }
