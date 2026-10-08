@@ -15,7 +15,8 @@
 //! Injection shape (mirrors `create_api_app()` in the payload):
 //!   1. import fragment inserted directly ABOVE `def create_api_app() -> FastAPI:`
 //!   2. `app.include_router(alas_control_router)` inserted directly BELOW
-//!      the last `app.include_router(events.router)` line — registration
+//!      the `app.include_router(events.router)` line (replacen takes the
+//!      first match; the current payload has exactly one) — registration
 //!      order matters, the catch-all frontend mount at "/" comes later in
 //!      the file and must not shadow API routes.
 

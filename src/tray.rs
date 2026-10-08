@@ -617,7 +617,11 @@ pub(crate) fn spawn_restart_worker(
     };
     backend.stop();
     backend.begin_start();
-    let ws_available = crate::deploy_config::ws_control_available();
+    // Same gating as handle_toggle: a failed/anchor-mismatched patch means
+    // the start-after-backend call would just spin the 15s retry thread
+    // against a dead endpoint.
+    let ws_available = crate::deploy_config::ws_control_available()
+        && !crate::patch::patch_failed();
     spawn_start_worker(app, backend, port, labels, guard, refresh, ws_available);
 }
 
