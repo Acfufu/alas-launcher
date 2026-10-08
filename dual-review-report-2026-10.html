@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ALAS Launcher 五轮高精度双审核报告（2026-10）</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel2: #1c2128;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --green: #3fb950;
+    --yellow: #d29922;
+    --orange: #e07b39;
+    --red: #f85149;
+    --blue: #58a6ff;
+    --purple: #bc8cff;
+    --mono: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, "PingFang SC", "Segoe UI", "Helvetica Neue", "Microsoft YaHei", sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: var(--sans); line-height: 1.7; padding-bottom: 80px; }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 0 24px; }
+  header { border-bottom: 1px solid var(--border); background: linear-gradient(180deg, #10151d 0%, var(--bg) 100%); padding: 48px 0 36px; }
+  .badge { display: inline-block; font-family: var(--mono); font-size: 11px; letter-spacing: 1px; padding: 3px 10px; border-radius: 20px; border: 1px solid var(--border); color: var(--muted); background: var(--panel); margin-bottom: 16px; }
+  h1 { font-size: 30px; font-weight: 700; letter-spacing: -0.5px; }
+  h1 .accent { color: var(--green); }
+  .meta { margin-top: 14px; color: var(--muted); font-size: 13px; display: flex; flex-wrap: wrap; gap: 8px 24px; }
+  .meta b { color: var(--text); font-weight: 600; }
+  section { margin-top: 56px; }
+  h2 { font-size: 20px; font-weight: 700; margin-bottom: 8px; display: flex; align-items: center; gap: 10px; }
+  h2 .num { font-family: var(--mono); color: var(--blue); font-size: 14px; }
+  h2::after { content: ""; flex: 1; height: 1px; background: var(--border); }
+  .sub { color: var(--muted); font-size: 14px; margin-bottom: 24px; }
+  h3 { font-size: 16px; font-weight: 600; margin: 28px 0 12px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 20px 22px; margin-bottom: 16px; }
+  .card.high { border-left: 4px solid var(--red); }
+  .card.medium { border-left: 4px solid var(--orange); }
+  .card.low { border-left: 4px solid var(--yellow); }
+  .card.info { border-left: 4px solid var(--blue); }
+  .card.good { border-left: 4px solid var(--green); }
+  .fh { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 10px; flex-wrap: wrap; }
+  .fh h4 { font-size: 15.5px; font-weight: 700; flex: 1; min-width: 260px; }
+  .sev { font-family: var(--mono); font-size: 11px; font-weight: 700; letter-spacing: 1px; padding: 3px 10px; border-radius: 5px; white-space: nowrap; }
+  .sev.high { background: rgba(248,81,73,.15); color: var(--red); border: 1px solid rgba(248,81,73,.4); }
+  .sev.medium { background: rgba(224,123,57,.15); color: var(--orange); border: 1px solid rgba(224,123,57,.4); }
+  .sev.low { background: rgba(210,153,34,.15); color: var(--yellow); border: 1px solid rgba(210,153,34,.4); }
+  .sev.info { background: rgba(88,166,255,.15); color: var(--blue); border: 1px solid rgba(88,166,255,.4); }
+  .sev.good { background: rgba(63,185,80,.15); color: var(--green); border: 1px solid rgba(63,185,80,.4); }
+  p, li { font-size: 14px; color: var(--text); }
+  .card p { margin-bottom: 8px; }
+  .card p:last-child { margin-bottom: 0; }
+  code { font-family: var(--mono); font-size: 12.5px; background: var(--panel2); border: 1px solid var(--border); border-radius: 5px; padding: 1px 6px; color: var(--purple); }
+  .loc { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 13.5px; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: var(--panel2); font-weight: 600; white-space: nowrap; }
+  td code { white-space: nowrap; }
+  .muted { color: var(--muted); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin: 16px 0; }
+  .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .stat .n { font-family: var(--mono); font-size: 24px; font-weight: 700; color: var(--green); }
+  .stat .l { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  footer { margin-top: 64px; border-top: 1px solid var(--border); padding-top: 20px; color: var(--muted); font-size: 12.5px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <span class="badge">DUAL REVIEW · 5 HEAVY + 4 LIGHT ROUNDS</span>
+    <h1>五轮高精度双审核<span class="accent">报告</span></h1>
+    <div class="meta">
+      <span>仓库：<b>alas-launcher</b>（本报告随代码一同提交）</span>
+      <span>审核区间：<b>3c28a4f → 11cae90</b></span>
+      <span>日期：<b>2026-10-09</b></span>
+      <span>方法：<b>每轮 2 名独立 findings-only 审核员 + 轮间修复 + 回归专责</b></span>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+<!-- ============ 0 执行摘要 ============ -->
+<section>
+  <h2><span class="num">§0</span> 执行摘要</h2>
+  <p class="sub">对整个仓库（17 个 Rust 源文件约 1.1 万行 + 2 个 Python 注入补丁 + 4 份部署模板 + 文档面）执行 5 轮重审，每轮 2 名独立审核员分管不相交范围；每轮发现经主审逐条对照源码反证后修复并提交，下一轮审核员看到的是修复后的状态；重审完成后进入轻量双审核循环直至连续收敛。</p>
+  <div class="grid">
+    <div class="stat"><div class="n">57</div><div class="l">累计发现（重审 50 + 轻量 7）</div></div>
+    <div class="stat"><div class="n">55</div><div class="l">采纳修复（含 4 处降级为防御性对齐）</div></div>
+    <div class="stat"><div class="n">2</div><div class="l">经依赖源码反证否决</div></div>
+    <div class="stat"><div class="n">1×P0</div><div class="l">退出死锁（已修）</div></div>
+    <div class="stat"><div class="n">8×P1</div><div class="l">编译破坏 / 识别链失效 / UX 正确性（已修）</div></div>
+    <div class="stat"><div class="n">215/0</div><div class="l">终态测试 通过/失败</div></div>
+  </div>
+  <p>终态验证矩阵：<code>cargo test</code> 215 通过 / 0 失败 / 3 忽略（忽略项均为需真实 payload 的 <code>#[ignore]</code> 集成测试）；<code>cargo clippy --all-targets</code> 零告警；<code>cargo doc --no-deps</code> 零告警；debug 与 release 构建均通过；<code>python3 -m py_compile</code> 两个补丁资产通过；CI 新增补丁语法门禁。轻量循环第 4 轮（L4）收敛确认、零新发现。</p>
+</section>
+
+<!-- ============ 1 方法论 ============ -->
+<section>
+  <h2><span class="num">§1</span> 方法论</h2>
+  <div class="card info">
+    <p><b>轮次结构</b>：重审五轮的范围依次为 ①后端生命周期 / ②托盘菜单 + 跨语言契约 / ③配置构建 + 跨文件一致性 / ④并发红队 + 平台差异 / ⑤执行走查 + 构建验证。每轮 2 名审核员、findings-only（禁止编辑）、每条发现必须附 <code>file:line</code> 证据与触发推演、按 P0/P1/P2 定级、限额防凑数。</p>
+    <p><b>轮间修复</b>：主审逐条反证（对照上下游代码与依赖源码）后才动手修复；修复独立成批次提交，下一轮审核员看到的是修复后的树。</p>
+    <p><b>回归专责</b>：从第 2 轮起，每轮固定安排一名审核员只审上一轮修复提交的全量 diff。该机制三轮连续抓到上轮修复自身引入的真问题（详见 §3），是本次最大单项方法论收益。</p>
+    <p><b>锁定源码核证</b>：凡涉及依赖行为的主张（command-group 的 waitpid 语义、tauri 菜单 API 的主线程汇合、rfd 的线程约束），一律对照 <b>Cargo.lock 实际锁定的版本</b>的 registry 源码核实，不采信审核员引用的其它版本——本轮有一次引用与锁定版本不符（结论碰巧成立）与一次结论错误（见 §4）。</p>
+    <p><b>轻量收敛循环</b>：重审结束后以轻量双审核迭代，发现收敛到纯文档级后再跑一轮零发现确认即终止（L4）。</p>
+  </div>
+</section>
+
+<!-- ============ 2 各轮成果 ============ -->
+<section>
+  <h2><span class="num">§2</span> 各轮发现与修复</h2>
+
+  <h3>第 1 轮 — 后端生命周期 / 补丁与清理（11 条：9 实、1 否、1 降级）</h3>
+  <div class="card high">
+    <div class="fh"><h4>stale-cleanup 身份识别链对 fork payload 整链失效</h4><span class="sev high">P1</span></div>
+    <p>两名审核员独立命中。PR-5885 fork（无 <code>gui.py</code>、入口 <code>python -m module.cli run web</code>、uv 管理的 <code>.venv</code> 解释器）上，残留进程的识别证据链每一条都断了：F 锚点只认 <code>&lt;repo&gt;/toolkit</code>、E2/L-B 只认 <code>gui.py</code> argv——崩溃/强杀遗留的后端会被判为「非 ALAS 进程占口」，永久堵死启动。<b>修复</b>：F 锚点扩展为 <code>toolkit ∪ .venv</code>（<code>is_repo_interpreter</code>），E2/L-B/降级模式同步认 <code>module.cli</code> 形态，附 6 个新单测的识别矩阵。<span class="loc">src/stale_cleanup.rs</span></p>
+  </div>
+  <div class="card medium">
+    <div class="fh"><h4>deploy 语言键路径错位 + WebuiPort 越界静默截断</h4><span class="sev medium">P1/P2</span></div>
+    <p>语言键实际在 <code>Deploy.Webui.Language</code>（对照真实 payload 树与全部模板核实，<code>Gui:</code> 节不存在），en-US 安装的语言恒回落 zh-CN——改主路径 + 旧键回退；<code>WebuiPort: 70000</code> 按 <code>as u16</code> 截断成 4464——改 <code>u16::try_from</code> + 越界告警回落默认端口。<span class="loc">src/deploy_config.rs</span></p>
+    <p>同批：setup 在 patch 步骤之前早退时 <code>PATCH_FAILED</code> 不置位（fail-closed 缺口）；<code>AlreadyApplied</code> 不校验注入模块存在（<code>git clean -fd</code> 后 webui 必 ImportError，改为修复性重写）；Windows job 对象缺 <code>KILL_ON_JOB_CLOSE</code>（补 <code>kill_on_drop(true)</code>）；裸树 panic 路径改为原生错误对话框；清理脚本退出码静默丢弃（补 warn）；windows 模板 RequirementsFile 与 unix 统一。</p>
+  </div>
+
+  <h3>第 2 轮 — 托盘菜单 / 控制 API 契约 + R1 回归专责（10 条：2 P1 + 8 P2）</h3>
+  <div class="card high">
+    <div class="fh"><h4>R1 修复引入 Windows 编译破坏（回归专责命中 #1）</h4><span class="sev high">P1</span></div>
+    <p>R1 的 terminate 尾部注销对齐在 <code>#[cfg(unix)]</code> 块之外裸引用 <code>nix::errno::Errno::ESRCH</code>，而 <code>nix</code> 是 unix-only 依赖——任何 Windows 目标 E0433。<b>修复</b>：平台分哨兵常量 <code>ESRCH_RAW</code>（Windows 侧 -1 永不命中，保持「kill 失败不注销」语义）。<span class="loc">src/backend.rs</span></p>
+  </div>
+  <div class="card high">
+    <div class="fh"><h4>降级模式开关「显示启动、点击杀后端」</h4><span class="sev high">P1</span></div>
+    <p>开关标签只看调度器死活，行为在降级模式（凭据/补丁）下无条件是进程级 <code>StopBackend</code>——「Running + 调度器死 + 降级」一格上点「启动」实为杀整个后端，且降级模式下该格稳态必现。<b>修复</b>：<code>toggle_label_for_control()</code> 降级感知标签 + 全仓统一谓词 <code>scheduler_control_available()</code>（此前状态行漏了 <code>!patch_failed()</code> 合取，与点击行为互相矛盾）。<span class="loc">src/menu_model.rs、src/tray.rs</span></p>
+  </div>
+  <div class="card medium">
+    <div class="fh"><h4>同批 P2</h4><span class="sev medium">8 条</span></div>
+    <p>点击路径单发端口探测可把健康后端折成 crashed（对齐轮询的双击判定）；语言切换后任务显示名永久停留旧语言（语言指纹强制冲缓存）；8 条托盘铬文案硬编码中英混杂（入四语言标签表）；Python 网关 <code>_locked()</code> 漏查 <code>WebuiSSLCert</code>（跨语言契约漂移）；通知发送失败零诊断（补 warn）。</p>
+  </div>
+
+  <h3>第 3 轮 — 配置构建面 / 一致性 + R2 回归专责（11 条：2 P1 + 9 P2）</h3>
+  <div class="card high">
+    <div class="fh"><h4>R2 修复引入 macOS 对话框必现 panic（回归专责命中 #2）+ winapi 缺 feature</h4><span class="sev high">P1×2</span></div>
+    <p>对照 rfd 0.15.3 源码实锤：macOS 后端 <code>show()</code> 经 <code>run_on_main</code>，NSApp 未运行且非主线程时直接 <code>panic!</code>——R2 的「工作线程弹窗」让对话框 100% 不出现。<b>修复</b>：平台分叉——macOS 主线程同步 <code>show()</code>（天然命中 rfd 快路径）、Windows 工作线程 + 5 分钟有界等待、SSH 无头会话跳过。另：<code>winapi</code> features 不含 <code>wincon</code> 而 main.rs 用 <code>AttachConsole</code>（审核员逐一核对了 winapi 全部 7 个依赖方的 feature 单元化，确认传递依赖救不了）——Windows 目标整体编译失败；<code>image-png</code> feature 仅 macOS target 声明，win/linux <code>cargo test</code> 编译不过——上移到 base features。<span class="loc">src/main.rs、Cargo.toml</span></p>
+  </div>
+  <div class="card medium">
+    <div class="fh"><h4>同批 P2</h4><span class="sev medium">9 条</span></div>
+    <p>StopBackend worker 与事件线程尾部重建的 <code>set_menu</code> 落序竞态（败者把托盘钉死在「处理中…」且 diff 门控不自愈——该臂跳过尾部重建）；语言指纹在 fetch 失败拍被吞（改为冲刷成功才提交）；R3 扩大置位面后状态行降级提示归因文案失实（改成因中性四语言）；死文件 <code>Info.plist</code>（bundler 自生成且内容已漂移）与 <code>requirements.in</code>（pip 时代快照、pin 与 uv payload 矛盾）删除；5 处注释 file:line 漂移重锚为函数名引用；WS 时代注释批量更新为控制 API 表述；README 语言键陈述修正。</p>
+  </div>
+
+  <h3>第 4 轮 — 并发红队 / 平台差异 + R3 回归专责（11 条：1 P0 + 2 P1 + 8 P2）</h3>
+  <div class="card high">
+    <div class="fh"><h4>P0：退出死锁——主线程 join ⟷ 轮询线程的主线程汇合</h4><span class="sev high">P0</span></div>
+    <p>tauri 菜单 API（<code>MenuItem::with_id</code> / <code>set_menu</code> / <code>set_icon</code>）从非主线程是「投递主线程 + <code>rx.recv()</code> 同步等待」（<b>对照锁定的 tauri 2.5.1 源码证实</b>——审核员引用的是 registry 里 2.11.5，结论碰巧一致）。退出处理运行期间事件循环不再泵消息：主线程 <code>join</code> 轮询线程 ⟷ 轮询线程正卡在菜单调用等主线程泵消息，循环等待，只能强杀——且强杀跳过全部后端清算。<b>修复</b>：join 移交 janitor 线程 + 3 秒有界等待（超时放弃继续清算、卡住线程随进程回收）；<code>poll_once</code> 入口与重建前双重 stop 复查把窗口压到 ms 级；两条「永不阻塞主线程」的不实注释修正。<span class="loc">src/child_process.rs、src/tray.rs</span></p>
+  </div>
+  <div class="card high">
+    <div class="fh"><h4>P1：重启后端菜单在其设计场景下不可见 + Windows 控制台闪窗</h4><span class="sev high">P1×2</span></div>
+    <p>重启 worker 成功路径只导航不 show——splash 停在 setup 失败错误页、主窗从未 show 时，用户「点了没反应」；stop+begin_start 同步跑在菜单事件线程（stop 可阻塞 ~1s，与 StopBackend 臂双标准）。<b>修复</b>：<code>stop_first</code> 标志把重启语义整体挪入 worker，成功路径销毁 splash + show 主窗。另：Windows GUI 子系统下 sparse-checkout git / netstat / taskkill 三处裸 Command 每次启动闪可见黑窗——补 <code>create_no_window()</code>。</p>
+  </div>
+  <div class="card medium">
+    <div class="fh"><h4>同批 P2</h4><span class="sev medium">8 条</span></div>
+    <p>调度器两臂与 StopBackend 同型的尾部重建竞态（统一跳过）；控制 API 调用失败不回滚 <code>SchedulerIntent</code>（陈旧 Stop 意图永久压制死亡通知主通道——失败回滚 None，两侧渲染语义均恰正确）；<code>atomic_failure_cleanup</code> 未注册退出 registry；进程级 <code>set_var</code> 改 <code>Command::env</code>（worker 线程改 C environ 在 glibc 是数据竞争）；凭据真值精确对齐 Python 网关（<code>Password: 0/false</code> 不降级、<code>123</code> 降级）；退出 vs 在飞 start 的孤儿窗口注释修正；windows 模板 toolkit 解释器加注。</p>
+  </div>
+
+  <h3>第 5 轮 — 执行走查 / 构建验证 + 终审（7 条：2 P1 + 5 P2）</h3>
+  <div class="card high">
+    <div class="fh"><h4>P1：非 stale 类启动失败 splash 永冻 + 裸树错误无指向性</h4><span class="sev high">P1×2</span></div>
+    <p>60s 超时/后端早退等普通启动失败此前只落日志——splash 永冻「Starting GUI」、主窗永不出现。<b>修复</b>：抽共享助手 <code>start_error_url()</code>，Ready 线程与托盘 start/restart worker 的<b>所有</b>失败臂统一导航可行动错误页（stale 类保留幸存者 pid / 换端口指引）。裸目录 PATH 无 unversioned <code>python</code> 时只有 os error 2——<code>explain_spawn_error()</code> 注入可行动上下文。</p>
+  </div>
+  <div class="card medium">
+    <div class="fh"><h4>同批 P2 + 终审确认</h4><span class="sev medium">5 条</span></div>
+    <p>tray-show 在非 Running 时先导航本地化停止页（否则弹出纯白空白窗）；<code>control_api.py</code> 的 <code>router</code> 符号契约无守护（补测试：改名即 webui import 失效而 cargo test 全绿）；CI 补 <code>py_compile</code> 步骤（唯一的 roundtrip 测试是 <code>#[ignore]</code>）；2 处 rustdoc 死链修复；1 条不实测试注释修正。构建验证侧：debug/release 构建、214→215 测试、py_compile 全部实跑通过；R4 六个回归疑点逐项反向验证全部自洽。</p>
+  </div>
+</section>
+
+<!-- ============ 3 回归专责战果 ============ -->
+<section>
+  <h2><span class="num">§3</span> 回归专责：连续三轮抓到「修复自身引入的回归」</h2>
+  <div class="card good">
+    <p>这是本次方法论上最有价值的单项证据——单遍审核结构性地漏掉这类问题：</p>
+    <table>
+      <tr><th>轮次</th><th>上轮修复</th><th>引入的回归</th><th>后果</th></tr>
+      <tr><td>R2 审 R1</td><td>terminate 尾部 ESRCH 注销对齐</td><td><code>nix</code> 常量未加 <code>cfg(unix)</code></td><td>Windows 目标编译失败（本机 macOS 不可见）</td></tr>
+      <tr><td>R3 审 R2</td><td>错误对话框挪入工作线程（为修 Windows 无头挂死）</td><td>rfd macOS 后端非主线程必 panic</td><td>对话框 100% 不出现，坏安装静默退化</td></tr>
+      <tr><td>R4 审 R3</td><td>StopBackend 挪入 worker（为修事件线程冻结）</td><td>尾部 rebuild 与 wake-poll 的 <code>set_menu</code> 落序竞态</td><td>托盘钉死「处理中…」且不可自愈</td></tr>
+    </table>
+    <p class="muted">三轮的根因同构：每个修复都在修 A 平台/路径时对 B 平台/路径做出了未验证的假设。<b>推广结论：任何「修一处、动共享面」的改动，下一轮必须有一双眼睛只盯着这个 diff。</b></p>
+  </div>
+</section>
+
+<!-- ============ 4 被否决的发现 ============ -->
+<section>
+  <h2><span class="num">§4</span> 经反证否决的发现</h2>
+  <div class="card low">
+    <div class="fh"><h4>「整组 try_wait 使早退检测退化为 60s 全额等待」——否决</h4><span class="sev low">误报</span></div>
+    <p>该主张认为 leader 死后 multiprocessing Manager 长期占组导致 <code>try_wait</code> 持续 None。对照 command-group 5.0.1 源码反证：<code>waitpid(-pgid)</code> 只匹配<b>调用者自己的子进程</b>，组内孙进程在 leader 死后即被 launchd/init 收养、从不计入——leader 退出后 ECHILD 立即到达，早退检测成立。Windows 侧更是 leader 语义。<b>未修改</b>。</p>
+    <p class="muted">另：R5 走查中「save_as IPC 被 ACL 拒绝」候选经审核员自行对照 tauri 2.5.1 ACL 逻辑证伪剔除（无 app-manifest 时 app 命令不受 ACL 门控）。引用版本与锁定版本不符一次（tauri 2.11.5 vs 2.5.1，结论碰巧成立）。</p>
+  </div>
+</section>
+
+<!-- ============ 5 遗留与接受风险 ============ -->
+<section>
+  <h2><span class="num">§5</span> 遗留事项与接受的风险</h2>
+  <div class="card info">
+    <p><b>tauri capability/ACL 未配置（建议单独立项）</b>：项目零 capability、无 CSP、release 带 devtools。<code>save_as</code> 靠「无 app-manifest 免检」旁路工作，安全姿态是隐式的而非声明的。加固需设计 capability 边界并回归 webui 的 saveAs 链路，不宜在本轮顺手动。</p>
+    <p><b>docs/ 目录被 .gitignore 忽略</b>：<code>docs/pr5885-implementation-plan.md</code> 等四份 runbook 是未跟踪的本地文件，换机即失。是否豁免入库属仓库策略决定，本轮未动（仅修正了其中两处陈旧陈述）。</p>
+    <p><b>Windows 交叉编译本机不可验证</b>：无 rustup/Windows target，CI 亦仅 macOS。R3/R4 的 Windows 侧改动（wincon feature、ESRCH_RAW、create_no_window×3）经静态读码 + 符号级核对（winapi docs.rs）验证，但属验证盲区——建议首次 Windows 出包前跑一次 <code>cargo check --target x86_64-pc-windows-msvc</code>。</p>
+    <p><b>冻结快照报告的行号漂移保留</b>：<code>tray-icon-redesign-report(-v2).html</code> 与 <code>deepsec-security-report.html</code> 是 2026-09 冻结的审计/提案快照（非活文档），其 file:line 引用未随本轮改动刷新——保持冻结。</p>
+    <p><b>已知可接受取舍（有注释背书）</b>：端口所有权探测 fail-open、语言切换 ~1s worker 窗口内的停止页旧语言一帧、退出 vs 在飞 start 的 ms 级孤儿窗口（下次启动 stale-cleanup 自愈）、「POST 已生效但响应丢失」时意图回滚的极低概率误渲染。</p>
+  </div>
+</section>
+
+<!-- ============ 6 提交链 ============ -->
+<section>
+  <h2><span class="num">§6</span> 提交链与推送状态</h2>
+  <div class="card info">
+    <p>截至本报告提交，本地 main 领先 <code>origin/main</code> 共 9 个提交，尚未推送：</p>
+    <table>
+      <tr><th>提交</th><th>内容</th></tr>
+      <tr><td><code>d0d5fc8</code></td><td>R1 批次：stale-cleanup fork 识别、fail-closed 补丁、job kill-on-close、语言键/端口截断/panic 路径</td></tr>
+      <tr><td><code>b19bf7b</code></td><td>R2 批次：降级开关标签、统一控制谓词、铬文案 i18n、双击探测、ESRCH_RAW</td></tr>
+      <tr><td><code>75b0346</code></td><td>R3 批次：wincon feature、rfd 主线程、stop-worker 竞态、凭据真值、死文件清理</td></tr>
+      <tr><td><code>97fb49a</code></td><td>R4 批次：退出死锁（janitor + 双重查）、重启 UX、Windows 闪窗、意图回滚</td></tr>
+      <tr><td><code>37552aa</code></td><td>R5 批次：start_error_url 统一错误页、可行动 spawn 错误、router 契约测试、CI py_compile</td></tr>
+      <tr><td><code>9b48a35</code> / <code>24d2bc6</code> / <code>11cae90</code></td><td>轻量轮文档修复：注释引用重锚、内部指南行为同步、README 锚点/降级文案修正</td></tr>
+    </table>
+    <p class="muted">推送前建议：确认 CI（macOS test + clippy + tauri debug bundle + 新增 py_compile 门禁）在 push 后绿。报告本身（本文件）随最后一批文档提交入库。</p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <p>alas-launcher 五轮高精度双审核报告 · 2026-10-09 · 审核区间 3c28a4f..11cae90 · 轻量循环 L4 收敛确认零新发现</p>
+  </div>
+</footer>
+
+</div>
+</body>
+</html>
