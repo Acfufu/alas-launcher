@@ -50,10 +50,10 @@ macOS 专属的原生适配：菜单栏常驻 ALAS 舰船图标，调度器状�
 
 ## 快速开始
 
-到 [Releases 页面](https://github.com/Acfufu/alas-launcher/releases) 下载对应系统和 CPU 架构的压缩包，解压后按平台启动。
+发布是手动流程；若 [Releases 页面](https://github.com/Acfufu/alas-launcher/releases) 已有对应系统和 CPU 架构的压缩包，下载解压后按平台启动。
 
 > [!IMPORTANT]
-> 当前远程 Release（`v0.1.0`）是手动构建的草稿版本，尚未声明为稳定公开安装包，使用前请自行验证。
+> 历史安装包（`v0.1.0`，2026-08 旧代码的手动构建草稿）已归档下架，Releases 可能为空；使用任何发布包前请自行验证。
 
 | 平台 | 启动方式 | 注意事项 |
 | --- | --- | --- |
@@ -78,7 +78,7 @@ Web UI 默认监听端口为 `22267`，启动器启动时读取 `config/deploy.y
 
 ## 构建与发布
 
-> 面向维护者。终端用户不需要构建——直接从 [Releases](https://github.com/Acfufu/alas-launcher/releases) 下载即可。
+> 面向维护者。终端用户通常不需要构建——若 [Releases](https://github.com/Acfufu/alas-launcher/releases) 有可用包，直接下载即可。
 
 <details>
 <summary>构建 macOS 启动器外壳</summary>
@@ -144,7 +144,7 @@ gh release create v0.1.0 release/AzurLaneAutoScript.app --title "v0.1.0" --notes
 - 调度器启停依赖对 ALAS 的 control API 补丁（锚点为 `module/webui/api/__init__.py` 的 `create_api_app()`，PR-5885 webui 重写引入；旧锚点 `module/webui/fastapi.py` 已随该重写删除）；若锚点失效，托盘调度器开关降级为进程级控制（非静默 no-op）。
 - Linux 依赖 `libwebkit2gtk-4.1` 与较新的 `glibc`。
 - adb 重启/替换未实现；pip 自动更新已禁用。
-- 远程 Release 为草稿，尚未声明为稳定公开安装包。
+- Releases 为手动发布，可能暂无可用包；历史包基于旧代码（见[快速开始](#快速开始)）。
 
 ### 故障排查
 
@@ -159,3 +159,5 @@ gh release create v0.1.0 release/AzurLaneAutoScript.app --title "v0.1.0" --notes
 ### 许可
 
 因为 ALAS 使用 GPLv3，本启动器也使用 GPLv3。多数依赖为 Apache-2.0、BSD-3-Clause 等宽松许可，具体请查阅各上游仓库。
+
+本项目由 [swordfeng/alas-launcher](https://github.com/swordfeng/alas-launcher) 的早期版本发展而来，遵循同一 GPLv3 并保留原作者署名，现为独立维护的仓库；启动器运行时同步的 ALAS 代码来自 `config/deploy.yaml` 指定的上游仓库（当前为 [Joxos/AzurLaneAutoScript](https://github.com/Joxos/AzurLaneAutoScript) fork）。

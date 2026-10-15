@@ -50,10 +50,10 @@ The directory layout is also adjusted — see [Directory structure and environme
 
 ## Quick start
 
-Download the archive for your OS and CPU architecture from the [Releases page](https://github.com/Acfufu/alas-launcher/releases), unpack it, and start it on your platform.
+Releases are published manually; if the [Releases page](https://github.com/Acfufu/alas-launcher/releases) has an archive for your OS and CPU architecture, download it, unpack it, and start it on your platform.
 
 > [!IMPORTANT]
-> The current remote Release (`v0.1.0`) is a manually built draft, not yet declared a stable public install package — verify it yourself before use.
+> The historical install packages (`v0.1.0`, manually built drafts from 2026-08 code) have been archived and taken down — Releases may be empty. Verify any published package yourself before use.
 
 | Platform | Start | Notes |
 | --- | --- | --- |
@@ -78,7 +78,7 @@ The Web UI listens on port `22267` by default; the launcher reads `config/deploy
 
 ## Build and release
 
-> For maintainers. End users do not need to build — download from [Releases](https://github.com/Acfufu/alas-launcher/releases).
+> For maintainers. End users usually do not need to build — if a package is available on [Releases](https://github.com/Acfufu/alas-launcher/releases), just download it.
 
 <details>
 <summary>Build the macOS launcher shell</summary>
@@ -144,7 +144,7 @@ The launcher adds the following environment variables:
 - The scheduler toggle depends on the ALAS control API patch (anchor: `create_api_app()` in `module/webui/api/__init__.py`, introduced by the PR-5885 webui rewrite; the old anchor `module/webui/fastapi.py` no longer exists on that payload line); if the anchor breaks, the tray scheduler toggle degrades to process-level control (not a silent no-op).
 - Linux requires `libwebkit2gtk-4.1` and a recent `glibc`.
 - adb restart/replacement is not implemented; pip auto-update is disabled.
-- The remote Release is a draft, not yet declared a stable public install package.
+- Releases are manual and may be empty at times; historical packages were built from older code (see [Quick start](#quick-start)).
 
 ### Troubleshooting
 
@@ -159,3 +159,5 @@ The launcher adds the following environment variables:
 ### License
 
 Because ALAS uses GPLv3, this launcher is also GPLv3. Most dependencies are permissively licensed (Apache-2.0, BSD-3-Clause, etc.); see each upstream repository for details.
+
+This project grew out of an early version of [swordfeng/alas-launcher](https://github.com/swordfeng/alas-launcher), keeps the original author attribution under the same GPLv3, and is now maintained as an independent repository. The ALAS code the launcher syncs at runtime comes from the upstream configured in `config/deploy.yaml` (currently the [Joxos/AzurLaneAutoScript](https://github.com/Joxos/AzurLaneAutoScript) fork).
