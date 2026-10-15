@@ -51,7 +51,12 @@ const TRAY_POLL_INTERVAL_SECS: Duration = Duration::from_secs(3);
 /// label (`build_menu`). R2 审计（B3）：状态行此前漏了 `!patch_failed()` 合取，
 /// d0d5fc8 把置位面扩到"git 瞬断"后，状态行会显示正常而点击走进程级停止。
 fn scheduler_control_available() -> bool {
-    crate::deploy_config::ws_control_available() && !crate::patch::patch_failed()
+    // Protocol mismatch is latched only by a CONFIRMED wrong version from the
+    // handshake (control_api::run_protocol_handshake) — unknown/transport
+    // errors stay fail-open.
+    crate::deploy_config::ws_control_available()
+        && !crate::patch::patch_failed()
+        && !crate::control_api::protocol_mismatch()
 }
 
 /// Everything the tray menu needs beyond the AppHandle: the backend state
@@ -631,6 +636,10 @@ fn spawn_start_worker(
             }
             match backend.start(port, &|_| {}) {
                 Ok(()) => {
+                    // Re-handshake the control API after (re)start — the patch
+                    // is reapplied by setup on this path only when the repo
+                    // updated, but a cheap fail-open GET settles it either way.
+                    std::thread::spawn(move || crate::control_api::run_protocol_handshake(port));
                     navigate_main(&app, main_page_url(BackendStatus::Running, port, &labels));
                     // R4 审计（P1）：重启场景的成功路径必须自己收拾 UI——
                     // splash 可能停在 setup 失败错误页（main 从未 show），只

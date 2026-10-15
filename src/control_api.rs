@@ -2,17 +2,43 @@
 //! Deliberately dependency-free: one-shot TcpStream per call, JSON bodies,
 //! localhost only (no TLS — password/SSL degrades client-side via
 //! deploy_config::ws_control_available, and the server also 401s).
+//!
+//! Cross-platform (not macOS-gated): `update_restart.rs` also consumes the
+//! protocol handshake on every platform.
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde::Deserialize;
+use tracing::{info, warn};
+
+/// Protocol version the launcher expects from the patched-in control API.
+/// MUST match `PROTOCOL_VERSION` in assets/patches/control_api.py — both ship
+/// inside this binary, so in production they cannot drift; the handshake
+/// exists to catch a payload-side file that survived from a different
+/// launcher version (git reset timing, hand-edited trees, future direct
+/// commits in the payload repo).
+pub const EXPECTED_PROTOCOL_VERSION: u32 = 2;
+
+/// Confirmed protocol mismatch — set ONLY by a completed handshake that saw
+/// the wrong version; connection errors stay fail-open (unknown ≠ wrong).
+static PROTOCOL_MISMATCH: AtomicBool = AtomicBool::new(false);
+
+pub fn protocol_mismatch() -> bool {
+    PROTOCOL_MISMATCH.load(Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct InstanceState {
     pub name: String,
     pub state: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ProtocolState {
+    pub version: u32,
 }
 
 /// Scheduler control direction (moved here from the deleted pywebio.rs).
@@ -83,6 +109,33 @@ pub fn api_instances(port: u16) -> Result<Vec<InstanceState>, ApiError> {
     serde_json::from_slice(&body).map_err(|e| ApiError::Protocol(e.to_string()))
 }
 
+pub fn api_protocol(port: u16) -> Result<ProtocolState, ApiError> {
+    let body = request(port, "GET", "/api/alas/protocol")?;
+    serde_json::from_slice(&body).map_err(|e| ApiError::Protocol(e.to_string()))
+}
+
+/// One-shot handshake after the backend is ready: a confirmed version
+/// mismatch latches `protocol_mismatch` (tray toggle degrades via
+/// `scheduler_control_available`); transport errors only warn — the API may
+/// just not be up yet, and the next backend start retries.
+pub fn run_protocol_handshake(port: u16) {
+    match api_protocol(port) {
+        Ok(state) if state.version == EXPECTED_PROTOCOL_VERSION => {
+            info!(target: "control_api", "protocol handshake ok (v{})", state.version);
+        }
+        Ok(state) => {
+            warn!(
+                "control API protocol mismatch: payload reports v{}, launcher expects v{EXPECTED_PROTOCOL_VERSION}; scheduler control degrades",
+                state.version
+            );
+            PROTOCOL_MISMATCH.store(true, Ordering::Relaxed);
+        }
+        Err(e) => {
+            warn!("control API protocol handshake skipped (fail-open): {e}");
+        }
+    }
+}
+
 pub fn api_scheduler_start(port: u16, name: &str) -> Result<InstanceState, ApiError> {
     let body = request(port, "POST", &format!("/api/alas/{name}/scheduler/start"))?;
     parse_instance(&body)
@@ -118,6 +171,8 @@ mod tests {
 
     const OK_INSTANCES: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 27\r\n\r\n[{\"name\":\"alas\",\"state\":1}]";
     const LOCKED: &str = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 18\r\n\r\n{\"error\":\"locked\"}";
+    const OK_PROTOCOL: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 12\r\n\r\n{\"version\":2}";
+    const BAD_PROTOCOL: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 12\r\n\r\n{\"version\":1}";
 
     #[test]
     fn instances_parses_json_array() {
@@ -130,6 +185,31 @@ mod tests {
     fn locked_returns_api_error_locked() {
         let (port, _rx) = mock_server(LOCKED);
         assert!(matches!(api_scheduler_start(port, "alas"), Err(ApiError::Locked)));
+    }
+
+    #[test]
+    fn protocol_parses_version() {
+        let (port, _rx) = mock_server(OK_PROTOCOL);
+        assert_eq!(api_protocol(port).unwrap(), ProtocolState { version: 2 });
+    }
+
+    /// PATCH test serialization: the mismatch flag is a process global.
+    static HANDSHAKE_FLAG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn handshake_latches_only_on_confirmed_mismatch() {
+        let _g = HANDSHAKE_FLAG_TEST_LOCK.lock().unwrap();
+        PROTOCOL_MISMATCH.store(false, Ordering::Relaxed);
+        let (port, _rx) = mock_server(OK_PROTOCOL);
+        run_protocol_handshake(port);
+        assert!(!protocol_mismatch(), "matching version must stay fail-open");
+        let (port, _rx) = mock_server(BAD_PROTOCOL);
+        run_protocol_handshake(port);
+        assert!(protocol_mismatch(), "wrong version must latch the flag");
+        PROTOCOL_MISMATCH.store(false, Ordering::Relaxed);
+        // Transport error: fail-open — unknown ≠ wrong.
+        run_protocol_handshake(1);
+        assert!(!protocol_mismatch(), "io error must NOT latch the flag");
     }
 }
 
@@ -145,7 +225,7 @@ mod tests {
 /// `state == 1` immediately would race).
 ///
 /// Run: `cargo test api_roundtrip_real_payload -- --ignored --nocapture`
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))] // nix + std::os::unix + real /Applications payload
 mod real_payload_tests {
     use super::*;
     use std::os::unix::process::CommandExt;

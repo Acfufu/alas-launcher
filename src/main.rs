@@ -33,13 +33,16 @@ mod shell_settings;
 // ShellSettings + ShellMenuLabels); gated so win/linux builds stay untouched.
 #[cfg(target_os = "macos")]
 mod shell_menu;
-// Dependency-free HTTP client for the ALAS control API; macOS-only because
-// its sole consumer is the tray.
-#[cfg(target_os = "macos")]
+// Dependency-free HTTP client for the ALAS control API; consumed by the
+// macOS tray AND the cross-platform update_restart watcher (protocol
+// handshake), so it compiles everywhere.
 mod control_api;
 // Control-API patch applier (anchor-verified, idempotent, fail-closed).
 // Cross-platform — setup.rs calls it ungated, so this module is too.
 mod patch;
+// Webui-requested pull & restart (更新器 tab); cross-platform — the request
+// file watcher runs wherever the launcher runs.
+mod update_restart;
 // Pure notification event detection (no tauri); macOS-only until the tray
 // wires it up — win/linux builds must not compile it.
 #[cfg(target_os = "macos")]
@@ -219,6 +222,19 @@ fn main() -> Result<()> {
             if let Some(refresh) = &tray_refresh {
                 *setup_tray_refresh_slot.lock().unwrap() = Some(refresh.clone());
             }
+            // 更新器 tab 的「重启更新」请求 watcher（跨平台）。macOS 把托盘
+            // 轮询的 refresh 通道递进去，worker 结束时唤醒重绘；其他平台没有
+            // 托盘可唤醒。放在 slot 填充之后，clone 到的才是已填充的通道。
+            #[cfg(target_os = "macos")]
+            let watcher_refresh = setup_tray_refresh_slot.lock().unwrap().clone();
+            #[cfg(not(target_os = "macos"))]
+            let watcher_refresh: Option<std::sync::mpsc::Sender<()>> = None;
+            crate::update_restart::spawn_watcher(
+                app.handle().clone(),
+                setup_backend.clone(),
+                port,
+                watcher_refresh,
+            );
             #[cfg(target_os = "macos")]
             {
                 // App menu bar: build the 外壳设置 menu from the shared
@@ -487,6 +503,12 @@ fn main() -> Result<()> {
                             } else {
                                 splash.destroy().unwrap();
                                 info!("Webview is ready");
+                                // Control API protocol handshake (cross-platform,
+                                // fail-open): confirm the patched-in control API
+                                // matches this launcher before anyone relies on it.
+                                std::thread::spawn(move || {
+                                    crate::control_api::run_protocol_handshake(port)
+                                });
                                 let window = app_handle.get_webview_window("main").unwrap();
                                 window
                                     .navigate(Url::parse(&crate::backend::webui_url(port)).unwrap())
@@ -659,7 +681,7 @@ pub(crate) fn start_error_url(e: &anyhow::Error) -> Url {
     Url::parse(&text_to_splash(&content)).unwrap()
 }
 
-fn text_to_splash(s: &str) -> String {
+pub(crate) fn text_to_splash(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {

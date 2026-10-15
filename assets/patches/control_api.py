@@ -1,9 +1,15 @@
 # module/webui/control_api.py
-# Added by alas-launcher (GPLv3). Control API for scheduler start/stop.
+# Added by alas-launcher (GPLv3). Control API for scheduler start/stop,
+# protocol handshake and update-restart requests.
 # FastAPI router form for the PR-5885 webui: injected via
 # `app.include_router` into module/webui/api/__init__.py (the old
 # starlette-routes form anchored on the now-deleted fastapi.py).
 # Paths mirror the Rust client (src/control_api.rs) verbatim.
+import json
+import os
+import time
+from pathlib import Path
+
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
@@ -12,6 +18,22 @@ from module.webui.process_manager import ProcessManager
 from module.webui.setting import State
 
 router = APIRouter(tags=["alas-launcher-control"])
+
+# Bump on ANY endpoint/semantic change. The launcher ships this file and
+# verifies the version once the backend is ready (run_protocol_handshake in
+# src/control_api.rs); a mismatch degrades the tray toggle fail-open-side —
+# only a CONFIRMED mismatch disables control calls.
+PROTOCOL_VERSION = 2
+
+# Payload root (module/webui/control_api.py -> module/webui -> module -> root).
+# cwd-independent on purpose: the webui process cwd is the payload root today,
+# but the request file must land next to config/ regardless.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+# Signal channel to the launcher (src/update_restart.rs watcher): the
+# launcher runs no HTTP server, so the webui drops a file and the watcher
+# consumes it. Cleared by setup_alas_repo at startup, so only requests made
+# while THIS launcher instance lives are honored.
+UPDATE_RESTART_REQUEST = REPO_ROOT / "config" / ".update-restart-request"
 
 
 def _locked() -> bool:
@@ -59,6 +81,33 @@ async def instances(request: Request):
         pm = ProcessManager.get_manager(name)
         out.append({"name": name, "state": pm.state})
     return JSONResponse(out)
+
+
+@router.get("/api/alas/protocol")
+async def protocol(request: Request):
+    # Read-only handshake: the launcher compares PROTOCOL_VERSION against the
+    # version it shipped. Not locked (mirrors /instances).
+    return JSONResponse({"version": PROTOCOL_VERSION})
+
+
+@router.post("/api/alas/app/update-restart")
+async def update_restart(request: Request):
+    """Ask the launcher to git-pull the payload and restart the backend.
+
+    Used by the webui updater tab (更新器): the launcher re-runs its startup
+    setup (pull + sparse checkout + control patch) between stop and start,
+    so a restart IS the update. File write failure is a 500 — the tab shows
+    it; nothing else is affected."""
+    if _locked() or not _local_host(request):
+        return JSONResponse({"error": "locked"}, status_code=401)
+    try:
+        UPDATE_RESTART_REQUEST.parent.mkdir(parents=True, exist_ok=True)
+        UPDATE_RESTART_REQUEST.write_text(
+            json.dumps({"pid": os.getpid(), "time": time.time()}), encoding="utf-8"
+        )
+    except OSError as e:
+        return JSONResponse({"error": f"request file write failed: {e}"}, status_code=500)
+    return JSONResponse({"ok": True, "version": PROTOCOL_VERSION})
 
 
 @router.post("/api/alas/{name}/scheduler/start")

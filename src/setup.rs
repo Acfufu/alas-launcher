@@ -151,6 +151,10 @@ pub fn setup_alas_repo(mut status_updater: impl FnMut(&str)) -> Result<()> {
     info!("Starting setup for ALAS repository...");
     #[cfg(target_os = "linux")]
     setup_git_ca_bundle();
+    // A webui-initiated update-restart request from a PREVIOUS session must
+    // never fire on this launch (update_restart.rs consumes only requests
+    // made while this instance lives).
+    crate::update_restart::clear_stale_request();
     // Similar setup to deploy/installer.py
     // Fail-closed (R1 审计)：patch 步骤之前的任何早退都意味着 control API
     // 从未被确认就绪——PATCH_FAILED 若保持 false，托盘 WS 门控会放行一个
