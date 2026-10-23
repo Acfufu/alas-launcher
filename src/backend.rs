@@ -3,7 +3,7 @@ use std::{
     net::TcpStream,
     path::Path,
     process::{Command, ExitStatus},
-    sync::Mutex,
+    sync::{atomic::AtomicBool, Arc, Mutex},
     thread::sleep,
     time::{Duration, Instant},
 };
@@ -315,6 +315,7 @@ impl Drop for ManagedBackend {
 /// discipline (brief reads, no lock across the long spawn) cannot leak out.
 pub struct BackendLifecycle {
     state: Mutex<BackendState>,
+    operation: Arc<AtomicBool>,
     // Internal seam so `start()` is testable without spawning python: tests
     // inject a fake spawner; production wraps ManagedBackend::spawn.
     spawner: Box<dyn Fn(u16) -> Result<ManagedBackend> + Send + Sync>,
@@ -346,6 +347,7 @@ impl BackendLifecycle {
     ) -> Self {
         Self {
             state: Mutex::new(BackendState::default()),
+            operation: Arc::new(AtomicBool::new(false)),
             spawner: Box::new(spawner),
             #[cfg(test)]
             wait_override: std::sync::Mutex::new(None),
@@ -357,6 +359,12 @@ impl BackendLifecycle {
             #[cfg(test)]
             cleanup_override: std::sync::Mutex::new(Some(Box::new(|_| Ok(())))),
         }
+    }
+
+    /// Shared permit for all user-facing control and setup workers. Low-level
+    /// stop remains available to exit cleanup even while a worker holds it.
+    pub(crate) fn operation_flag(&self) -> &Arc<AtomicBool> {
+        &self.operation
     }
 
     /// Current lifecycle status (brief lock, no handle out).

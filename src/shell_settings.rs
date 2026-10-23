@@ -81,10 +81,25 @@ impl Default for ShellSettings {
 /// would be the payload's `./config` tree, wiped by `atomic_failure_cleanup`
 /// (setup.rs) on every launch.
 pub fn settings_path() -> PathBuf {
+    // Explicit isolation for QA/portable launches; never redirect HOME or
+    // overwrite the daily installation's shell preferences.
+    if let Some(dir) = isolated_settings_dir(std::env::var_os("ALAS_LAUNCHER_SETTINGS_DIR")) {
+        return dir.join("settings.json");
+    }
     dirs::config_dir()
         .unwrap_or_default()
         .join("alas-launcher")
         .join("settings.json")
+}
+
+fn isolated_settings_dir(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let dir = PathBuf::from(value?);
+    if dir.is_absolute() {
+        Some(dir)
+    } else {
+        warn!("ALAS_LAUNCHER_SETTINGS_DIR must be absolute; ignoring override");
+        None
+    }
 }
 
 /// Load settings from [`settings_path`].
@@ -188,6 +203,15 @@ impl ShellSettings {
 mod tests {
     use super::*;
 
+    #[test]
+    fn settings_isolation_requires_an_explicit_absolute_directory() {
+        let dir = std::env::temp_dir().join("alas-isolated-settings");
+        assert_eq!(isolated_settings_dir(Some(dir.clone().into_os_string())), Some(dir));
+        assert_eq!(isolated_settings_dir(None), None);
+        assert_eq!(isolated_settings_dir(Some("relative-settings".into())), None);
+        assert_eq!(isolated_settings_dir(Some("".into())), None);
+    }
+
     /// Isolated settings path for a test (no tempfile dep; keyed by pid +
     /// test name so parallel tests never collide).
     fn temp_settings_path(name: &str) -> PathBuf {
@@ -224,8 +248,17 @@ mod tests {
     #[test]
     fn settings_path_points_at_config_dir() {
         // Validates the dirs::config_dir base + join chain without doing I/O
-        // on the real file.
+        // on the real file. The isolation override (ALAS_LAUNCHER_SETTINGS_DIR,
+        // exported by GUI parallel-verification runs per the README) would
+        // redirect this chain, so mask it for the duration — no other test
+        // reads the variable, so the save/restore window races nothing.
+        const OVERRIDE: &str = "ALAS_LAUNCHER_SETTINGS_DIR";
+        let saved = std::env::var_os(OVERRIDE);
+        std::env::remove_var(OVERRIDE);
         let path = settings_path();
+        if let Some(saved) = saved {
+            std::env::set_var(OVERRIDE, saved);
+        }
         assert_eq!(path.file_name().unwrap(), "settings.json");
         assert_eq!(path.parent().unwrap().file_name().unwrap(), "alas-launcher");
     }

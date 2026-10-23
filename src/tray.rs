@@ -39,6 +39,7 @@ use crate::{
         toggle_enabled, toggle_label_for_control,
         ControlLabels, TaskMenuItem, TaskSection,
     },
+    operation::{try_acquire_in_flight, InFlightGuard},
 };
 
 /// Poll cadence for the task section; also bounds each idle wait of the poll
@@ -51,9 +52,8 @@ const TRAY_POLL_INTERVAL_SECS: Duration = Duration::from_secs(3);
 /// label (`build_menu`). R2 审计（B3）：状态行此前漏了 `!patch_failed()` 合取，
 /// d0d5fc8 把置位面扩到"git 瞬断"后，状态行会显示正常而点击走进程级停止。
 fn scheduler_control_available() -> bool {
-    // Protocol mismatch is latched only by a CONFIRMED wrong version from the
-    // handshake (control_api::run_protocol_handshake) — unknown/transport
-    // errors stay fail-open.
+    // Only a confirmed wrong version disables protocol control. A later
+    // matching handshake recovers it; transport errors preserve the result.
     crate::deploy_config::ws_control_available()
         && !crate::patch::patch_failed()
         && !crate::control_api::protocol_mismatch()
@@ -65,8 +65,10 @@ fn scheduler_control_available() -> bool {
 /// build / poll so a live language switch re-renders the tray), the stop
 /// flag (shared with main.rs so ExitRequested can halt the poll thread),
 /// the refresh signal channel (manual Refresh menu item, and the todo-4
-/// language-switch wake) and the control-API in-flight flag (dedups concurrent
-/// toggles — only one scheduler click session at a time). `port_fail_count`
+/// language-switch wake) and the shared operation permit (operation.rs — one
+/// in-flight backend operation at a time across startup, menu controls and
+/// update-restart; the low-level stop used by exit cleanup stays exempt).
+/// `port_fail_count`
 /// is the poll thread's CONSECUTIVE failed-probe streak (MINOR-5): two
 /// misses mark the backend crashed, a success resets it.
 /// `icon_running` mirrors the icon currently shown (true = filled 实心 /
@@ -130,13 +132,14 @@ pub fn build_tray(
     poll_handle: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
 ) -> tauri::Result<(tauri::tray::TrayIcon, mpsc::Sender<()>)> {
     let (refresh_tx, refresh_rx) = mpsc::channel::<()>();
+    let in_flight = backend.operation_flag().clone();
     let shared = TrayShared {
         backend,
         tasks: Arc::new(Mutex::new(Vec::new())),
         settings,
         stop,
         refresh: refresh_tx.clone(),
-        in_flight: Arc::new(AtomicBool::new(false)),
+        in_flight,
         port_fail_count: Arc::new(AtomicU8::new(0)),
         // Startup state is Stopped (the initial snapshot below), so the
         // outlined icon matches — filled only once the scheduler scan
@@ -503,7 +506,6 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
                 labels.clone(),
                 guard,
                 Some(shared.refresh.clone()),
-                ws_available,
                 false,
             );
         }
@@ -549,27 +551,6 @@ fn handle_toggle(app: &AppHandle, shared: &TrayShared, port: u16) {
     }
 }
 
-/// RAII in-flight guard: clears the shared flag on drop, so the flag can
-/// never stick even when the worker thread fails to spawn or panics (the
-/// closure — and with it the guard — is dropped in both cases).
-struct InFlightGuard(Arc<AtomicBool>);
-
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
-
-/// Try to mark the in-flight flag; `Some(guard)` on success (the guard owns a
-/// clone of the flag and clears it when dropped), `None` when a toggle is
-/// already in flight. `compare_exchange(false, true, Acquire, Relaxed)` is
-/// atomic — a fast double-click cannot race two workers in (TOCTOU-free).
-fn try_acquire_in_flight(flag: &Arc<AtomicBool>) -> Option<InFlightGuard> {
-    flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .ok()
-        .map(|_| InFlightGuard(flag.clone()))
-}
-
 /// Worker-thread scheduler control via the control API. The in-flight guard
 /// moves into the closure; the refresh wake forces a poll rebuild so the
 /// 处理中… toggle is replaced by the real state (same contract as the old
@@ -607,11 +588,9 @@ fn spawn_scheduler_call(port: u16, action: crate::control_api::SchedulerAction, 
 /// of the timed poll's diff gates (Degraded == Degraded, scheduler
 /// None → None), so without the wake the tray would stay on 启动中… with
 /// the toggle disabled forever. When control is available, a bounded retry
-/// thread starts the scheduler through the control API after the backend is
-/// ready; the guard is released right after spawning it (the process-tree
-/// scan corrects the status within two polls, and the SchedulerIntent::Start
-/// TTL covers the window).
-#[allow(clippy::too_many_arguments)] // start 的正交输入；结构体会遮蔽调用点
+/// loop starts the scheduler through the control API after the backend is
+/// ready, on the same worker with the permit still held. This prevents a
+/// delayed retry from controlling a backend started by a later operation.
 fn spawn_start_worker(
     app: AppHandle,
     backend: Arc<BackendLifecycle>,
@@ -619,13 +598,16 @@ fn spawn_start_worker(
     labels: ControlLabels,
     guard: InFlightGuard,
     refresh: Option<mpsc::Sender<()>>,
-    ws_available: bool,
     // R4 审计（P1）：true = 重启语义——stop()（epoch bump）与 begin_start()
     // 都在 worker 内做（stop 可阻塞 ~1s，不能冻结菜单事件线程，与 StopBackend
     // 臂同一 MAJOR-2 理由）；false = 托盘 start 语义——调用方已在事件线程
     // begin_start（即时 Initializing 渲染）。
     stop_first: bool,
 ) {
+    // Clones for the spawn-failure arm below: the closure moves the originals,
+    // so the arm cannot reference them.
+    let fail_backend = Arc::clone(&backend);
+    let fail_refresh = refresh.clone();
     if let Err(e) = std::thread::Builder::new()
         .name("backend-start".into())
         .spawn(move || {
@@ -638,8 +620,9 @@ fn spawn_start_worker(
                 Ok(()) => {
                     // Re-handshake the control API after (re)start — the patch
                     // is reapplied by setup on this path only when the repo
-                    // updated, but a cheap fail-open GET settles it either way.
-                    std::thread::spawn(move || crate::control_api::run_protocol_handshake(port));
+                    // updated. Keep the permit until the result is recorded,
+                    // so an old handshake cannot overwrite a newer session.
+                    crate::control_api::run_protocol_handshake(port);
                     navigate_main(&app, main_page_url(BackendStatus::Running, port, &labels));
                     // R4 审计（P1）：重启场景的成功路径必须自己收拾 UI——
                     // splash 可能停在 setup 失败错误页（main 从未 show），只
@@ -653,28 +636,27 @@ fn spawn_start_worker(
                         let _ = window.set_focus();
                     }
                     // 后端就绪后，经控制 API 启动调度器（控制可用时）。有界重试（10×1.5s，
-                    // 镜像旧 SCHEDULER_CLICK_TIMEOUT 15s 预算）；耗尽仅 warn——用户可再点托盘开关。
-                    if ws_available {
-                        let port = port;
-                        std::thread::spawn(move || {
-                            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-                            loop {
-                                match crate::control_api::api_scheduler_start(port, "alas") {
-                                    Ok(state) => {
-                                        info!(target: "control_api", "scheduler start-after-backend ok, state={}", state.state);
-                                        break;
-                                    }
-                                    Err(e) if std::time::Instant::now() < deadline => {
-                                        warn!("control API start-after-backend retry: {e}");
-                                        std::thread::sleep(std::time::Duration::from_millis(1500));
-                                    }
-                                    Err(e) => {
-                                        warn!("control API start-after-backend failed after retries: {e}");
-                                        break;
-                                    }
+                    // 镜像旧 SCHEDULER_CLICK_TIMEOUT 15s 预算；deadline 在单次调用后
+                    // 检查，单次 api_scheduler_start 最长 ~10s，故许可实际持有上界
+                    // ~25s）；耗尽仅 warn——用户可再点托盘开关。
+                    if scheduler_control_available() {
+                        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                        loop {
+                            match crate::control_api::api_scheduler_start(port, "alas") {
+                                Ok(state) => {
+                                    info!(target: "control_api", "scheduler start-after-backend ok, state={}", state.state);
+                                    break;
+                                }
+                                Err(e) if std::time::Instant::now() < deadline => {
+                                    warn!("control API start-after-backend retry: {e}");
+                                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                                }
+                                Err(e) => {
+                                    warn!("control API start-after-backend failed after retries: {e}");
+                                    break;
                                 }
                             }
-                        });
+                        }
                     }
                 }
                 Err(e) => {
@@ -700,6 +682,16 @@ fn spawn_start_worker(
         })
     {
         warn!("Failed to spawn backend-start worker: {e}");
+        // The closure dropped without running: the guard released itself, but
+        // for the tray-start path begin_start already ran on the event thread
+        // and nothing will ever move the state out of Initializing. Release
+        // the toggle again. (Restart path: nothing ran, state is untouched.)
+        if !stop_first {
+            fail_backend.mark_stopped();
+        }
+        if let Some(sender) = fail_refresh {
+            let _ = sender.send(());
+        }
     }
 }
 
@@ -717,23 +709,17 @@ pub(crate) fn spawn_restart_worker(
     refresh: Option<mpsc::Sender<()>>,
 ) {
     let labels = load_control_labels(settings);
-    // Local in-flight flag: the worker's exit wake is all we need — the
-    // tray's own guard stays untouched (the poll thread rebuilds from the
-    // snapshot, which stop()/begin_start() already updated).
-    let flag = Arc::new(AtomicBool::new(false));
-    let Some(guard) = try_acquire_in_flight(&flag) else {
+    let Some(guard) = try_acquire_in_flight(backend.operation_flag()) else {
         warn!("restart skipped: in-flight guard busy");
         return;
     };
-    // Same gating as handle_toggle (shared predicate): a failed/anchor-
-    // mismatched patch means the start-after-backend call would just spin
-    // the 15s retry thread against a dead endpoint.
-    let ws_available = scheduler_control_available();
+    // Control availability is checked after the worker's handshake so a
+    // recovered protocol mismatch immediately enables scheduler control.
     // R4 审计（P1）：stop+begin_start 挪进 worker（stop_first=true）——原先
     // 同步跑在菜单事件线程，stop 的 ~1s SIGTERM 宽限直接冻结 UI，与
     // StopBackend 臂双标准；成功路径另有 splash.destroy + main.show 收拾
     // setup 失败后的卡死画面（见 spawn_start_worker）。
-    spawn_start_worker(app, backend, port, labels, guard, refresh, ws_available, true);
+    spawn_start_worker(app, backend, port, labels, guard, refresh, true);
 }
 
 /// Rebuild the menu from the current state + task cache and re-attach it to

@@ -117,6 +117,19 @@ gh release create v0.1.0 release/AzurLaneAutoScript.app --title "v0.1.0" --notes
 <!-- end of build and release -->
 </details>
 
+### Isolated verification (macOS)
+
+The real-payload test accepts only a separate copy under the system temporary directory. Prepare a working Python environment, built frontend, and test configuration without a real device connection; the test starts and stops the scheduler. Do not point it at your daily installation.
+
+```bash
+# ALAS_TEST_PAYLOAD points to a prepared temporary copy; the marker permits test mutations
+: "${ALAS_TEST_PAYLOAD:?Export the temporary payload copy path first}"
+printf 'disposable-alas-payload\n' > "$ALAS_TEST_PAYLOAD/.alas-launcher-test-root"
+cargo test --locked api_roundtrip_real_payload -- --ignored --nocapture --test-threads=1
+```
+
+The test uses port `22367` and refuses to reuse an occupied port. Concurrent GUI verification also requires a separate application identifier and another free port. Set `ALAS_LAUNCHER_SETTINGS_DIR` to an absolute directory to isolate shell preferences in its `settings.json` without changing daily preferences.
+
 ## Directory structure and environment variables
 
 Paths below are relative to the ALAS root; `toolkit` is the Python environment directory (venv-like):

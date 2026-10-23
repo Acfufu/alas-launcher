@@ -10,7 +10,7 @@
 //! __init__.py LAST** (a failed __init__ write leaves a harmless unused
 //! module; the reverse would leave __init__ importing a missing module and
 //! break the webui at startup). Both writes are atomic-replace via tmp +
-//! rename (Windows-safe: remove the destination before rename).
+//! rename, keeping the existing destination until replacement.
 //!
 //! Injection shape (mirrors `create_api_app()` in the payload):
 //!   1. import fragment inserted directly ABOVE `def create_api_app() -> FastAPI:`
@@ -89,13 +89,11 @@ fn inject_api_init(content: &str) -> Result<String> {
     Ok(with_include)
 }
 
-/// Atomic replace; Windows-safe (rename over an existing file fails on
-/// Windows, so the destination is removed first — the tiny non-atomic window
-/// is acceptable: a crash here just means the next launch re-applies).
+/// Stage alongside the destination, then replace it via std::fs::rename.
+/// Never unlink the working module before its replacement is ready.
 fn atomic_write(path: &Path, content: &str) -> Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, content).with_context(|| format!("write {}", tmp.display()))?;
-    let _ = std::fs::remove_file(path);
     std::fs::rename(&tmp, path).with_context(|| format!("rename onto {}", path.display()))
 }
 
@@ -111,19 +109,16 @@ pub fn apply_patch(alas_dir: &Path) -> Result<PatchOutcome> {
         }
     };
     if is_already_patched(&api_init) {
-        // Marker present — but the injected module itself can go missing:
-        // control_api.py is untracked (a user `git clean -fd` drops it), and
-        // a future fork shipping its own control_api.py would overwrite it
-        // on `git reset --hard`. api/__init__.py imports the module
-        // unconditionally, so a missing file breaks the whole webui at
-        // import time while the launcher believes it is patched. Repair by
-        // re-writing the module; keep the AlreadyApplied fast path otherwise.
-        if !control_path.exists() {
-            info!("control API marker present but control_api.py missing; re-writing module");
+        // The marker only proves registration. The module belongs to the
+        // launcher and must match this binary, including on launcher upgrades.
+        if std::fs::read_to_string(&control_path).ok().as_deref() != Some(CONTROL_API_SRC) {
+            info!("control API module missing or outdated; replacing with bundled source");
             atomic_write(&control_path, CONTROL_API_SRC)
                 .inspect_err(|_| mark_patch_failed())?;
+            PATCH_FAILED.store(false, Ordering::Relaxed);
             return Ok(PatchOutcome::Applied);
         }
+        PATCH_FAILED.store(false, Ordering::Relaxed);
         info!("control API patch already applied");
         return Ok(PatchOutcome::AlreadyApplied);
     }
@@ -143,6 +138,7 @@ pub fn apply_patch(alas_dir: &Path) -> Result<PatchOutcome> {
                 .inspect_err(|_| mark_patch_failed())?;
             atomic_write(&init_path, &injected)
                 .inspect_err(|_| mark_patch_failed())?;
+            PATCH_FAILED.store(false, Ordering::Relaxed);
             info!("control API patch applied");
             Ok(PatchOutcome::Applied)
         }
@@ -235,6 +231,7 @@ def create_api_app() -> FastAPI:
 
     #[test]
     fn apply_patch_is_idempotent_and_writes_both_files() {
+        let _g = PATCH_FLAG_TEST_LOCK.lock().unwrap();
         let tmp = std::env::temp_dir().join(format!("patch-apply-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let api_dir = tmp.join("module").join("webui").join("api");
@@ -325,5 +322,75 @@ def create_api_app() -> FastAPI:
         assert!(patch_failed());
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn upgrades_stale_or_corrupt_module_without_duplicate_registration() {
+        let _g = PATCH_FLAG_TEST_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("patch-upgrade-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let api_dir = tmp.join("module/webui/api");
+        std::fs::create_dir_all(&api_dir).unwrap();
+        let init_path = api_dir.join("__init__.py");
+        std::fs::write(&init_path, PRISTINE).unwrap();
+        apply_patch(&tmp).unwrap();
+        let importer = std::fs::read_to_string(&init_path).unwrap();
+        let module = tmp.join("module/webui/control_api.py");
+        for stale in [
+            b"PROTOCOL_VERSION = 1\n".as_slice(),
+            b"PROTOCOL_VERSION = 2\n# same version, different semantics\n".as_slice(),
+            &[0xff, 0xfe],
+        ] {
+            std::fs::write(&module, stale).unwrap();
+            assert_eq!(apply_patch(&tmp).unwrap(), PatchOutcome::Applied);
+            assert_eq!(std::fs::read_to_string(&module).unwrap(), CONTROL_API_SRC);
+            assert_eq!(std::fs::read_to_string(&init_path).unwrap(), importer);
+            assert_eq!(importer.matches(MARKER).count(), 1);
+            assert_eq!(apply_patch(&tmp).unwrap(), PatchOutcome::AlreadyApplied);
+        }
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn successful_apply_repair_and_verification_clear_previous_failure() {
+        let _g = PATCH_FLAG_TEST_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("patch-recover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let api_dir = tmp.join("module/webui/api");
+        std::fs::create_dir_all(&api_dir).unwrap();
+        assert!(apply_patch(&tmp).is_err());
+        assert!(patch_failed());
+        std::fs::write(api_dir.join("__init__.py"), PRISTINE).unwrap();
+        assert_eq!(apply_patch(&tmp).unwrap(), PatchOutcome::Applied);
+        assert!(!patch_failed(), "fresh injection recovers after read failure");
+        mark_patch_failed();
+        assert_eq!(apply_patch(&tmp).unwrap(), PatchOutcome::AlreadyApplied);
+        assert!(!patch_failed(), "verified current patch recovers after setup failure");
+        mark_patch_failed();
+        std::fs::remove_file(tmp.join("module/webui/control_api.py")).unwrap();
+        assert_eq!(apply_patch(&tmp).unwrap(), PatchOutcome::Applied);
+        assert!(!patch_failed(), "repair recovers the control channel");
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn failed_upgrade_preserves_old_module_and_marks_failure() {
+        let _g = PATCH_FLAG_TEST_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("patch-upgrade-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let api_dir = tmp.join("module/webui/api");
+        std::fs::create_dir_all(&api_dir).unwrap();
+        let init_path = api_dir.join("__init__.py");
+        std::fs::write(&init_path, PRISTINE).unwrap();
+        apply_patch(&tmp).unwrap();
+        let importer = std::fs::read_to_string(&init_path).unwrap();
+        let module = tmp.join("module/webui/control_api.py");
+        std::fs::write(&module, "PROTOCOL_VERSION = 1\n").unwrap();
+        std::fs::create_dir(module.with_extension("tmp")).unwrap();
+        assert!(apply_patch(&tmp).is_err());
+        assert!(patch_failed());
+        assert_eq!(std::fs::read_to_string(module).unwrap(), "PROTOCOL_VERSION = 1\n");
+        assert_eq!(std::fs::read_to_string(init_path).unwrap(), importer);
+        std::fs::remove_dir_all(tmp).unwrap();
     }
 }

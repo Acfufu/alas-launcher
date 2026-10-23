@@ -117,6 +117,19 @@ gh release create v0.1.0 release/AzurLaneAutoScript.app --title "v0.1.0" --notes
 <!-- 构建与发布结束 -->
 </details>
 
+### 隔离验证（macOS）
+
+真实 payload 测试只接受系统临时目录下的独立副本。副本需包含可运行的 Python 环境、已构建前端和无真实设备连接的测试配置；测试会启停调度器。不要直接使用日常安装目录。
+
+```bash
+# ALAS_TEST_PAYLOAD 指向事先准备好的临时副本；标记表示该副本可被测试修改
+: "${ALAS_TEST_PAYLOAD:?请先导出临时 payload 副本路径}"
+printf 'disposable-alas-payload\n' > "$ALAS_TEST_PAYLOAD/.alas-launcher-test-root"
+cargo test --locked api_roundtrip_real_payload -- --ignored --nocapture --test-threads=1
+```
+
+测试固定使用 `22367`，端口已占用时拒绝复用。GUI 并行验证还需使用独立应用标识和另一空闲端口；设置 `ALAS_LAUNCHER_SETTINGS_DIR` 为绝对目录，可将外壳设置隔离到该目录的 `settings.json`，不修改日常偏好。
+
 ## 目录结构与环境变量
 
 以下路径以 ALAS 根目录为基准，`toolkit` 为 Python 环境目录（类似 venv 结构）：

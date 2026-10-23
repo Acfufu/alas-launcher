@@ -16,7 +16,6 @@
 
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     mpsc::Sender,
     Arc,
 };
@@ -26,11 +25,7 @@ use tauri::{AppHandle, Manager, Url};
 use tracing::{error, info, warn};
 
 use crate::backend::{BackendLifecycle, BackendStatus};
-
-/// One update-restart at a time, process-wide. Held by the worker; the
-/// watcher only consumes the request file when it can acquire it, so a
-/// request arriving mid-restart stays on disk for the next tick.
-static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+use crate::operation::{try_acquire_in_flight, InFlightGuard};
 
 /// Poll cadence: fast enough to feel immediate after the webui click, slow
 /// enough that the loop never shows up in anything.
@@ -92,32 +87,38 @@ pub(crate) fn spawn_watcher(
             continue;
         }
         // Acquire BEFORE consuming: while a restart runs, fresh requests
-        // stay on disk; when the worker finishes it wakes this loop and the
-        // next tick handles (or the next startup clears) the leftover.
-        if IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        // stay on disk; the worker's completion wake goes to the tray poll,
+        // so this watcher self-heals on its next tick (or the next startup
+        // clears the leftover).
+        let Some(operation) = try_acquire_in_flight(backend.operation_flag()) else {
+            continue;
+        };
+        if backend.snapshot().status != BackendStatus::Running {
             continue;
         }
         if let Err(e) = std::fs::remove_file(request_path()) {
             warn!("update-restart: consume failed: {e}");
-            IN_FLIGHT.store(false, Ordering::SeqCst);
             continue;
         }
         info!("update-restart: request consumed, restarting with update");
-        spawn_worker(app.clone(), backend.clone(), port, refresh.clone());
+        spawn_worker(app.clone(), backend.clone(), port, refresh.clone(), operation);
     }) {
         warn!("update-restart watcher failed to spawn: {e}");
     }
 }
 
-/// Runs with IN_FLIGHT held; resets it on every exit path.
+/// Owns the shared operation permit through update, start and handshake.
 fn spawn_worker(
     app: AppHandle,
     backend: Arc<BackendLifecycle>,
     port: u16,
     refresh: Option<Sender<()>>,
+    operation: InFlightGuard,
 ) {
+    let operation = operation.wake_on_release(refresh);
     let builder = std::thread::Builder::new().name("update-restart".into());
     if let Err(e) = builder.spawn(move || {
+        let operation = operation;
         navigate_main(
             &app,
             status_url(
@@ -143,16 +144,13 @@ fn spawn_worker(
                     &format!("Please run alas-launcher from terminal for detailed logs\n\n{e:#}"),
                 ),
             );
-            IN_FLIGHT.store(false, Ordering::SeqCst);
-            if let Some(sender) = refresh {
-                let _ = sender.send(());
-            }
+            drop(operation);
             return;
         }
         match backend.start(port, &|_| {}) {
             Ok(()) => {
                 // Re-handshake the (freshly re-patched) control API.
-                std::thread::spawn(move || crate::control_api::run_protocol_handshake(port));
+                crate::control_api::run_protocol_handshake(port);
                 navigate_main(
                     &app,
                     Url::parse(&crate::backend::webui_url(port)).expect("webui url parses"),
@@ -177,13 +175,9 @@ fn spawn_worker(
                 );
             }
         }
-        IN_FLIGHT.store(false, Ordering::SeqCst);
-        if let Some(sender) = refresh {
-            let _ = sender.send(());
-        }
+        drop(operation);
     }) {
         warn!("update-restart worker failed to spawn: {e}");
-        IN_FLIGHT.store(false, Ordering::SeqCst);
     }
 }
 

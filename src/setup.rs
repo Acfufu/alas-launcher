@@ -9,11 +9,11 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use crate::child_process::{
-    kill_group, register_for_exit, spawn_with_group, unregister_for_exit, wait_with_timeout,
+    register_for_exit, spawn_with_group, unregister_for_exit, wait_with_timeout,
     GIT_UPDATE_TIMEOUT,
 };
 
@@ -283,7 +283,7 @@ fn pipe_lines(read: impl Read + Send + 'static, tx: Sender<(bool, String)>, is_e
     });
 }
 
-fn git_update(mut status_updater: impl FnMut(&str)) -> Result<()> {
+fn git_update(status_updater: impl FnMut(&str)) -> Result<()> {
     // Decorate execute() to get fetch progress
     let script = r#"
 import deploy.git
@@ -305,7 +305,18 @@ gm.git_install()
     cmd.args(["-c", script])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let mut child = spawn_with_group(&mut cmd)?;
+    run_update_command(&mut cmd, GIT_UPDATE_TIMEOUT, status_updater)
+}
+
+/// The same deadline covers streaming output AND the final process wait.
+/// EOF on both pipes does not prove that the child has exited.
+fn run_update_command(
+    cmd: &mut Command,
+    timeout: Duration,
+    mut status_updater: impl FnMut(&str),
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut child = spawn_with_group(cmd)?;
     // Register with the exit registry: if the user closes the window mid-
     // update, ExitRequested group-kills this child.
     register_for_exit(&child);
@@ -340,11 +351,13 @@ gm.git_install()
 
     // Deadline-based recv_timeout (the run_git_capture pattern): the timeout
     // is TOTAL, not per line — a chatty but wedged fetch still fires.
-    let deadline = Instant::now() + GIT_UPDATE_TIMEOUT;
-
     // Receive lines and tee them to stdout/stderr and the status_updater callback.
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
+        // Even continuously queued output must not extend the deadline.
+        if remaining.is_zero() {
+            break;
+        }
         match rx.recv_timeout(remaining) {
             Ok((is_err, line)) => {
                 if line.contains("=====") {
@@ -369,25 +382,25 @@ gm.git_install()
                     info!("{line}");
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {
-                // Silent past the deadline. The child may have just exited
-                // (readers still draining buffered output): only kill the
-                // group when it is genuinely still running.
-                if child.try_wait()?.is_some() {
-                    break;
-                }
-                let _ = kill_group(&mut child);
-                let _ = child.wait();
-                return Err(anyhow!(
-                    "Repository update timed out after {GIT_UPDATE_TIMEOUT:?}"
-                ));
-            }
+            Err(RecvTimeoutError::Timeout) => break,
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
 
-    // Wait for child to exit and check status
-    let status = child.wait()?;
+    // Wait for child to exit and check status. The loop above only breaks on
+    // EOF or deadline exhaustion, so the final wait usually has zero budget;
+    // wait_with_timeout still reaps/kills, but report the timeout once instead
+    // of nesting a "timed out after 0s" inside it.
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let status = wait_with_timeout(&mut child, remaining)
+        .map_err(|e| {
+            if remaining.is_zero() {
+                // Keep the "timed out" keyword: callers (and tests) match on it.
+                anyhow!("Repository update did not finish within {timeout:?}: timed out")
+            } else {
+                anyhow!("Repository update did not finish within {timeout:?}: {e}")
+            }
+        })?;
     if !status.success() {
         if last_err.is_empty() {
             last_err = "Failed to update repository".to_owned();
@@ -447,6 +460,64 @@ fn find_percentage(s: &str) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn update_command(script: &str) -> Command {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", script])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        cmd
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_closed_output_still_times_out_and_kills_descendants() {
+        let _registry = crate::backend::REGISTRY_TEST_LOCK.lock().unwrap();
+        let pid_file = std::env::temp_dir().join(format!("update-eof-{}.pid", std::process::id()));
+        let _ = fs::remove_file(&pid_file);
+        let mut cmd = update_command(
+            "echo $$ > \"$1\"; exec 1>&- 2>&-; sleep 30 & wait",
+        );
+        cmd.arg("update-eof-test").arg(&pid_file);
+        let started = Instant::now();
+        let result = run_update_command(&mut cmd, Duration::from_millis(250), |_| {});
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(3), "EOF must not trigger an unbounded wait");
+        let pid: i32 = fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+        assert!(!crate::child_process::is_registered(pid as u32));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid), None).is_ok() {
+            assert!(Instant::now() < deadline, "update process group survived timeout");
+            thread::sleep(Duration::from_millis(20));
+        }
+        fs::remove_file(pid_file).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_continuous_output_cannot_extend_deadline() {
+        let _registry = crate::backend::REGISTRY_TEST_LOCK.lock().unwrap();
+        let mut cmd = update_command("while :; do echo fetching; sleep 0.01; done");
+        let started = Instant::now();
+        let result = run_update_command(&mut cmd, Duration::from_millis(200), |_| {});
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_success_and_nonzero_exit_keep_their_results() {
+        let _registry = crate::backend::REGISTRY_TEST_LOCK.lock().unwrap();
+        let mut success = update_command("echo '===== fetch complete ====='");
+        let mut progress = Vec::new();
+        run_update_command(&mut success, Duration::from_secs(3), |text| progress.push(text.to_string())).unwrap();
+        assert!(progress.iter().any(|text| text.contains("fetch complete")));
+        let mut failure = update_command("echo 'fetch failed' >&2; exit 7");
+        let error = run_update_command(&mut failure, Duration::from_secs(3), |_| {}).unwrap_err();
+        assert!(error.to_string().contains("fetch failed"));
+    }
+
     #[test]
     fn test_find_percentage() {
         assert_eq!(Some(8), find_percentage("8%"));

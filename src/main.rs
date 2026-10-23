@@ -10,6 +10,7 @@ mod icon_assets;
 #[cfg(target_os = "macos")]
 mod alas_tasks;
 mod backend;
+mod operation;
 // Typed reads of config/deploy.yaml (WebuiPort / Deploy.Webui.Language /
 // EnableReload / ws credentials). Cross-platform — setup.rs
 // `get_deploy_config` is ungated, so this module is too.
@@ -412,6 +413,12 @@ fn main() -> Result<()> {
                     }).expect("Error setting Ctrl-C handler");
                     let app_handle = app_handle.clone();
                     let backend = backend.clone();
+                    // Reserve before dispatch, sharing the permit with menu
+                    // controls and update-restart for the entire setup window.
+                    let Some(operation) = crate::operation::try_acquire_in_flight(backend.operation_flag()) else {
+                        warn!("startup skipped: a backend operation is already in flight");
+                        return;
+                    };
                     // todo 6: auto-start backend gate — the Ready-thread
                     // branch reads this shared settings clone (MAJOR-1: the
                     // setup closure's clone is invisible here; the run
@@ -420,7 +427,10 @@ fn main() -> Result<()> {
                     let shell_settings = run_shell_settings.clone();
                     #[cfg(target_os = "macos")]
                     let tray_refresh_slot = run_tray_refresh_slot.clone();
+                    #[cfg(target_os = "macos")]
+                    let operation = operation.wake_on_release(tray_refresh_slot.lock().unwrap().clone());
                     thread::spawn(move || {
+                        let _operation = operation;
                         // MAJOR-2 code-review invariant (plan todo 6, must-not
                         // #4): begin_start runs BEFORE the setup window in
                         // EVERY mode (auto-start on or off). BackendLifecycle
@@ -506,9 +516,7 @@ fn main() -> Result<()> {
                                 // Control API protocol handshake (cross-platform,
                                 // fail-open): confirm the patched-in control API
                                 // matches this launcher before anyone relies on it.
-                                std::thread::spawn(move || {
-                                    crate::control_api::run_protocol_handshake(port)
-                                });
+                                crate::control_api::run_protocol_handshake(port);
                                 let window = app_handle.get_webview_window("main").unwrap();
                                 window
                                     .navigate(Url::parse(&crate::backend::webui_url(port)).unwrap())

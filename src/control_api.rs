@@ -22,8 +22,9 @@ use tracing::{info, warn};
 /// commits in the payload repo).
 pub const EXPECTED_PROTOCOL_VERSION: u32 = 2;
 
-/// Confirmed protocol mismatch — set ONLY by a completed handshake that saw
-/// the wrong version; connection errors stay fail-open (unknown ≠ wrong).
+/// Last confirmed protocol result. Handshakes run under the shared operation
+/// permit so an old backend's response cannot overwrite a newer session.
+/// Transport errors preserve the last confirmed result.
 static PROTOCOL_MISMATCH: AtomicBool = AtomicBool::new(false);
 
 pub fn protocol_mismatch() -> bool {
@@ -114,13 +115,13 @@ pub fn api_protocol(port: u16) -> Result<ProtocolState, ApiError> {
     serde_json::from_slice(&body).map_err(|e| ApiError::Protocol(e.to_string()))
 }
 
-/// One-shot handshake after the backend is ready: a confirmed version
-/// mismatch latches `protocol_mismatch` (tray toggle degrades via
-/// `scheduler_control_available`); transport errors only warn — the API may
-/// just not be up yet, and the next backend start retries.
+/// Call synchronously on the worker while holding the operation permit.
+/// A matching version recovers a previous mismatch; transport errors leave
+/// the last confirmed result unchanged and the next backend start retries.
 pub fn run_protocol_handshake(port: u16) {
     match api_protocol(port) {
         Ok(state) if state.version == EXPECTED_PROTOCOL_VERSION => {
+            PROTOCOL_MISMATCH.store(false, Ordering::Relaxed);
             info!(target: "control_api", "protocol handshake ok (v{})", state.version);
         }
         Ok(state) => {
@@ -131,7 +132,7 @@ pub fn run_protocol_handshake(port: u16) {
             PROTOCOL_MISMATCH.store(true, Ordering::Relaxed);
         }
         Err(e) => {
-            warn!("control API protocol handshake skipped (fail-open): {e}");
+            warn!("control API protocol handshake failed; preserving last confirmed result: {e}");
         }
     }
 }
@@ -197,7 +198,7 @@ mod tests {
     static HANDSHAKE_FLAG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
-    fn handshake_latches_only_on_confirmed_mismatch() {
+    fn handshake_recovers_on_matching_version_and_preserves_result_on_io_error() {
         let _g = HANDSHAKE_FLAG_TEST_LOCK.lock().unwrap();
         PROTOCOL_MISMATCH.store(false, Ordering::Relaxed);
         let (port, _rx) = mock_server(OK_PROTOCOL);
@@ -206,7 +207,11 @@ mod tests {
         let (port, _rx) = mock_server(BAD_PROTOCOL);
         run_protocol_handshake(port);
         assert!(protocol_mismatch(), "wrong version must latch the flag");
-        PROTOCOL_MISMATCH.store(false, Ordering::Relaxed);
+        run_protocol_handshake(1);
+        assert!(protocol_mismatch(), "transport failure must not clear a confirmed mismatch");
+        let (port, _rx) = mock_server(OK_PROTOCOL);
+        run_protocol_handshake(port);
+        assert!(!protocol_mismatch(), "matching version must recover the control channel");
         // Transport error: fail-open — unknown ≠ wrong.
         run_protocol_handshake(1);
         assert!(!protocol_mismatch(), "io error must NOT latch the flag");
@@ -215,17 +220,19 @@ mod tests {
 
 /// Real-payload integration test, ported from the deleted src/pywebio.rs
 /// `real_payload_tests` module (commit 029e95b removed the pywebio DOM
-/// client; the helpers here are unchanged). The pywebio version guard and
+/// client). The helpers now require a disposable isolated copy, refuse port
+/// reuse and clean up only the test-owned process group. The pywebio version guard and
 /// the WebSocket `click_scheduler` are replaced by:
-///   - `crate::patch::apply_patch` (idempotent; `AnchorMismatch` skips), and
+///   - `crate::patch::apply_patch` (idempotent; anchor mismatch fails), and
 ///   - the control API `api_instances` / `api_scheduler_start` /
 ///     `api_scheduler_stop`.
 ///
 /// State assertions poll with `wait_for` (start is async — asserting
 /// `state == 1` immediately would race).
 ///
-/// Run: `cargo test api_roundtrip_real_payload -- --ignored --nocapture`
-#[cfg(all(test, target_os = "macos"))] // nix + std::os::unix + real /Applications payload
+/// Run with ALAS_TEST_PAYLOAD set to a marked disposable temp copy:
+/// `cargo test api_roundtrip_real_payload -- --ignored --nocapture --test-threads=1`
+#[cfg(all(test, target_os = "macos"))] // nix + std::os::unix + isolated real payload
 mod real_payload_tests {
     use super::*;
     use std::os::unix::process::CommandExt;
@@ -233,8 +240,38 @@ mod real_payload_tests {
     use std::process::{Child, Command};
     use std::time::Instant;
 
-    /// The real installed payload this QA targets.
-    const PAYLOAD: &str = "/Applications/AzurLaneAutoScript.app/Contents/AzurLaneAutoScript";
+    /// Only disposable copies under the system temp directory are accepted.
+    /// Running an ignored integration test must never mutate /Applications.
+    fn isolated_payload() -> std::path::PathBuf {
+        let configured = std::env::var_os("ALAS_TEST_PAYLOAD")
+            .expect("set ALAS_TEST_PAYLOAD to a disposable payload copy under the system temp directory");
+        validate_isolated_payload(Path::new(&configured))
+    }
+
+    fn validate_isolated_payload(configured: &Path) -> std::path::PathBuf {
+        let payload = configured.canonicalize().unwrap();
+        let temp = std::env::temp_dir().canonicalize().unwrap();
+        assert!(payload.starts_with(temp), "real-payload tests require an isolated temp-directory copy");
+        assert_eq!(
+            std::fs::read_to_string(payload.join(".alas-launcher-test-root")).expect(
+                ".alas-launcher-test-root marker file missing — prepare the copy per README 隔离验证（macOS）"
+            ),
+            "disposable-alas-payload\n",
+            "missing disposable-payload marker"
+        );
+        payload
+    }
+
+    #[test]
+    fn real_payload_guard_rejects_installed_paths_and_requires_disposable_marker() {
+        assert!(std::panic::catch_unwind(|| validate_isolated_payload(Path::new("/Applications"))).is_err());
+        let tmp = std::env::temp_dir().join(format!("alas-payload-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        assert!(std::panic::catch_unwind(|| validate_isolated_payload(&tmp)).is_err());
+        std::fs::write(tmp.join(".alas-launcher-test-root"), "disposable-alas-payload\n").unwrap();
+        assert_eq!(validate_isolated_payload(&tmp), tmp.canonicalize().unwrap());
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
     /// Isolated test port — NEVER 22267 (a user's live backend may be there).
     const TEST_PORT: u16 = 22367;
     /// The live backend port, probed read-only to prove we never touched it.
@@ -264,6 +301,7 @@ mod real_payload_tests {
             &payload.join("toolkit").join("libexec").join("git-core"),
         );
         prepend_path("PATH", &payload.join("toolkit").join("bin"));
+        prepend_path("PATH", &payload.join(".venv").join("bin"));
         prepend_path("LD_LIBRARY_PATH", &payload.join("toolkit").join("lib"));
     }
 
@@ -340,17 +378,6 @@ mod real_payload_tests {
             .unwrap_or(-1)
     }
 
-    /// The backend process listening on `port` (reuse path only).
-    fn backend_pid_on_port(port: u16) -> Option<u32> {
-        let mut sys = sysinfo::System::new_all();
-        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-        let needle = format!("--port {port}");
-        sys.processes()
-            .values()
-            .find(|p| p.cmd().iter().any(|c| c.to_string_lossy().contains(&needle)))
-            .map(|p| p.pid().as_u32())
-    }
-
     /// Poll `cond` every 500ms until it holds or `timeout` elapses.
     fn wait_for(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
         let deadline = Instant::now() + timeout;
@@ -420,104 +447,68 @@ mod real_payload_tests {
         }
     }
 
-    /// Kills every process spawned for the test on every exit path: SIGTERM
-    /// the whole process group (the spawned python created its own group via
-    /// `process_group(0)`; the live ALAS tree confirms the gui.py wrapper,
-    /// uvicorn and Manager all share the wrapper's pgid), SIGKILL
-    /// escalation, then a pkill fallback on the exact cmdline for anything
-    /// that escaped, then wait for the port to close.
+    /// Owns exactly one test process group; never reuses an occupied port
+    /// and never uses a process-name/port-wide pkill fallback.
     struct BackendGuard {
-        child: Option<Child>,
-        pgid: Option<i32>,
-        port: u16,
+        child: Child,
+        pgid: i32,
     }
 
     impl Drop for BackendGuard {
         fn drop(&mut self) {
-            if let Some(pgid) = self.pgid {
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(-pgid),
-                    nix::sys::signal::Signal::SIGTERM,
-                );
-            }
-            let deadline = Instant::now() + Duration::from_secs(8);
-            loop {
-                if let Some(child) = self.child.as_mut() {
-                    if child.try_wait().ok().flatten().is_some() {
-                        self.child = None;
-                    }
-                }
-                if !port_open(self.port) {
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    if let Some(pgid) = self.pgid {
-                        let _ = nix::sys::signal::kill(
-                            nix::unistd::Pid::from_raw(-pgid),
-                            nix::sys::signal::Signal::SIGKILL,
-                        );
-                    }
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(200));
-            }
-            let _ = Command::new("pkill")
-                .args(["-f", "gui.py --host 127.0.0.1 --port 22367"])
-                .status();
-            let _ = Command::new("pkill")
-                .args(["-9", "-f", "gui.py --host 127.0.0.1 --port 22367"])
-                .status();
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while Instant::now() < deadline && port_open(self.port) {
-                std::thread::sleep(Duration::from_millis(200));
-            }
-            eprintln!(
-                "cleanup: port {} open after guard drop = {}",
-                self.port,
-                port_open(self.port)
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(self.pgid),
+                nix::sys::signal::Signal::SIGTERM,
             );
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                if self.child.try_wait().ok().flatten().is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            // Also terminate descendants if the leader exited first.
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(self.pgid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+            let _ = self.child.wait();
         }
     }
 
-    /// Spawn the ALAS backend on the isolated port; reuse an already-live
-    /// 22367 (leftover from a crashed run) without spawning a second one.
     fn spawn_backend(payload: &Path) -> BackendGuard {
-        if port_open(TEST_PORT) {
-            eprintln!("port {TEST_PORT} already live; reusing (cleanup still applies)");
-            return BackendGuard {
-                child: None,
-                pgid: None,
-                port: TEST_PORT,
-            };
+        assert!(!port_open(TEST_PORT), "test port {TEST_PORT} is occupied; refusing reuse");
+        let python = [payload.join(".venv/bin/python"), payload.join("toolkit/bin/python")]
+            .into_iter().find(|path| path.exists()).expect("payload Python missing");
+        let mut cmd = Command::new(python);
+        if payload.join("gui.py").exists() {
+            cmd.arg("gui.py");
+        } else {
+            cmd.args(["-m", "module.cli", "run", "web"]);
+            cmd.arg("--no-open");
         }
-        let mut cmd = Command::new(payload.join("toolkit").join("bin").join("python"));
-        cmd.args(["gui.py", "--host", "127.0.0.1", "--port", "22367"]);
+        cmd.args(["--host", "127.0.0.1", "--port", &TEST_PORT.to_string()]);
         cmd.current_dir(payload);
         cmd.process_group(0);
+        let log = std::fs::File::create(payload.join("integration-backend.log")).unwrap();
+        cmd.stdout(log.try_clone().unwrap()).stderr(log);
         let child = cmd.spawn().expect("failed to spawn the ALAS backend");
         let pid = child.id();
         eprintln!("spawned backend pid {pid} on port {TEST_PORT} (own process group)");
-        BackendGuard {
-            child: Some(child),
-            pgid: Some(pid as i32),
-            port: TEST_PORT,
-        }
+        BackendGuard { child, pgid: pid as i32 }
     }
 
     /// End-to-end scheduler control against the real payload on an isolated
     /// port: apply the control API patch -> spawn backend -> control API
     /// instances/start/stop -> scheduler child count + state assertions.
-    /// Env mirrors the app (cwd = payload, toolkit PATH/LD_LIBRARY_PATH,
-    /// `./toolkit/bin/python`).
+    /// Env mirrors the app (cwd = isolated payload, venv/toolkit PATH).
     #[test]
     #[ignore]
     fn api_roundtrip_real_payload() {
-        let payload = Path::new(PAYLOAD);
-        if !payload.join("gui.py").exists() {
-            eprintln!("real ALAS payload not present at {PAYLOAD}; skipping");
-            return;
-        }
-        eprintln!("=== api_roundtrip_real_payload: real payload at {PAYLOAD}");
+        let isolated = isolated_payload();
+        let payload = isolated.as_path();
+        assert!(!port_open(TEST_PORT), "test port occupied; refusing to patch or reuse a running payload");
+        eprintln!("=== api_roundtrip_real_payload: isolated payload at {}", payload.display());
         eprintln!(
             "live backend ({LIVE_PORT}) listening before test = {}",
             port_open(LIVE_PORT)
@@ -546,8 +537,7 @@ mod real_payload_tests {
                 eprintln!("patch already applied (idempotent)");
             }
             Ok(crate::patch::PatchOutcome::AnchorMismatch) => {
-                eprintln!("patch anchor mismatch in api/__init__.py; control API unavailable — skipping");
-                return;
+                panic!("patch anchor mismatch in isolated real payload");
             }
             Err(e) => {
                 panic!("apply_patch failed against real payload: {e:#}");
@@ -573,16 +563,27 @@ mod real_payload_tests {
         assert!(control_path.exists(), "control_api.py missing after apply");
         eprintln!("patch idempotent: second apply AlreadyApplied, marker unique, control_api.py present");
 
+        // Exercise upgrade and a failed write/recovery on real payload files,
+        // before importing them into the backend. Nothing is mocked here.
+        let importer = std::fs::read_to_string(&init_path).unwrap();
+        std::fs::write(&control_path, "PROTOCOL_VERSION = 1\n# stale launcher module\n").unwrap();
+        let blocked = control_path.with_extension("tmp");
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(crate::patch::apply_patch(payload).is_err());
+        assert!(crate::patch::patch_failed());
+        assert!(std::fs::read_to_string(&control_path).unwrap().contains("PROTOCOL_VERSION = 1"));
+        std::fs::remove_dir(&blocked).unwrap();
+        assert_eq!(crate::patch::apply_patch(payload).unwrap(), crate::patch::PatchOutcome::Applied);
+        assert!(!crate::patch::patch_failed());
+        assert_eq!(std::fs::read_to_string(&init_path).unwrap(), importer);
+        eprintln!("real payload: old module upgrade + write failure recovery verified");
+
         setup_payload_env(payload);
         let reload = deploy_enable_reload(payload);
         eprintln!("Deploy.Update.EnableReload = {reload}");
 
         let guard = spawn_backend(payload);
-        let backend_pid = match &guard.child {
-            Some(child) => child.id(),
-            None => backend_pid_on_port(TEST_PORT)
-                .expect("reused backend not findable in the process table"),
-        };
+        let backend_pid = guard.child.id();
         eprintln!("backend pid = {backend_pid}");
 
         assert!(
@@ -591,6 +592,10 @@ mod real_payload_tests {
         );
         assert_eq!(webui_status(TEST_PORT), 200, "webui not serving HTTP 200");
         eprintln!("webui up on {TEST_PORT}: HTTP 200");
+        assert_eq!(api_protocol(TEST_PORT).unwrap().version, EXPECTED_PROTOCOL_VERSION);
+        run_protocol_handshake(TEST_PORT);
+        assert!(!protocol_mismatch());
+        eprintln!("upgraded control API protocol handshake: v{EXPECTED_PROTOCOL_VERSION}");
 
         // 3. instances: non-empty, contains "alas", state is a known value.
         assert!(
