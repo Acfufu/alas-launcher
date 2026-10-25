@@ -1,14 +1,13 @@
 //! ALAS task data source for the tray menu's task-list section.
 //!
-//! Data source (mirrors the webui, verified live — see
-//! `.omo/evidence/alas-discovery.md`): the merged scheduler file
-//! `<alas_dir>/config/alas.json` plus the display-name i18n file
+//! Data source: the merged scheduler file `<alas_dir>/config/alas.json`
+//! plus the display-name i18n file
 //! `<alas_dir>/module/config/i18n/<language>.json`.
 //!
-//! There is NO HTTP API: the ALAS webui is PyWebIO (server-rendered over a
-//! WebSocket); every previously probed JSON endpoint (`/api/tasks`,
-//! `/api/scheduler`, `/tasks`, `/api/task/list`) returns 404. This module is
-//! therefore a pure file reader.
+//! The payload webui is a FastAPI app (`module/webui/api/`) with a real
+//! REST/SSE surface, but this module stays a pure file reader by design:
+//! the tray must render the task list before/without a running backend,
+//! and the scheduler file is the same source of truth the webui edits.
 //!
 //! Parsing mirrors `module/config/config.py` (`get_next_task`): top-level
 //! keys carrying a `Scheduler` object are tasks; `Scheduler.Enable == true`
@@ -19,13 +18,13 @@
 //! order); the display name comes from `Task.<Command>.name` in the i18n
 //! file, falling back to the command key.
 //!
-//! Status classification mirrors the webui overview (`module/webui/app.py`
-//! `alas_update_overview_task`): enabled tasks whose `NextRun <= now` are
-//! past-due — the FIRST one renders as Running (运行中), the rest as Queued
-//! (队列中) — and future ones as Waiting (等待中). The launcher has no
-//! scheduler-liveness channel, so it always treats the first past-due task as
-//! Running; that is a documented approximation (the webui only does so while
-//! the ALAS scheduler process is alive).
+//! Status classification mirrors the webui overview's running/queued/waiting
+//! scopes (SPA overview fed by `/api/status` + SSE): enabled tasks whose
+//! `NextRun <= now` are past-due — the FIRST one renders as Running (运行中),
+//! the rest as Queued (队列中) — and future ones as Waiting (等待中). The
+//! launcher has no scheduler-liveness channel, so it always treats the first
+//! past-due task as Running; that is a documented approximation (the webui
+//! only does so while the ALAS scheduler process is alive).
 
 use std::{
     cmp::Ordering,

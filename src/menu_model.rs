@@ -42,7 +42,7 @@ pub enum TaskMenuItem {
 }
 
 /// Render the enabled-task list as grouped rows, mirroring the webui
-/// overview scopes (module/webui/app.py `alas_update_overview_task`):
+/// overview scopes (SPA overview fed by `/api/status` + SSE):
 /// 运行中 → 队列中 → 等待中, each non-empty group led by a header and
 /// separated from the next non-empty group by a `Separator` (never before the
 /// first group, never after the last). Each group caps at [`TASK_GROUP_MAX`]

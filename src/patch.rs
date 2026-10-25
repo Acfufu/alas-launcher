@@ -158,14 +158,32 @@ mod tests {
     /// 测试串行，否则 cargo test 的默认并行会互相污染。
     static PATCH_FLAG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Minimal-but-faithful snapshot of the payload's
+    /// `module/webui/api/__init__.py` shape (2026-10): parenthesized router
+    /// import incl. `window`, lifespan-wrapped app factory, all 11 routers
+    /// registered. Trimmed to the region the anchors live in; keep in sync
+    /// with the payload file when its router list changes.
     const PRISTINE: &str = r#""""FastAPI-based REST + SSE API for the Svelte SPA frontend."""
 
 import os
 import threading
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from module.webui.api.routers import config, control, events, i18n, remote, scheduler, schema, status, theme, updater
+from module.webui.api.routers import (
+    config,
+    control,
+    events,
+    i18n,
+    remote,
+    scheduler,
+    schema,
+    status,
+    theme,
+    updater,
+    window,
+)
 from module.webui.setting import State
 
 
@@ -174,6 +192,7 @@ def create_api_app() -> FastAPI:
 
     app.include_router(status.router)
     app.include_router(events.router)
+    app.include_router(window.router)
 
     return app
 "#;

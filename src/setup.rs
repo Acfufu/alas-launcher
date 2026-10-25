@@ -20,14 +20,24 @@ use crate::child_process::{
 /// Fallible [`alas_repo_dir`]: `None` when no portable layout matches,
 /// instead of panicking — lets stale-cleanup probe for an install first.
 pub(crate) fn try_alas_repo_dir() -> Option<PathBuf> {
-    // Always check if this is a typical same-folder portable distribution
+    // Always check if this is a typical same-folder portable distribution.
+    // Fork-stable markers (neither exists upstream LmeSzinc): pyproject.toml
+    // (the uv project file) plus module/cli (our CLI entry). The legacy
+    // deploy/installer.py marker was deleted from the payload in e2f4ea925
+    // (2026-08) and is kept only as a fallback for older payload snapshots.
     let exe_folder = std::env::current_exe()
         .ok()?
         .parent()?
         .to_path_buf();
+    let mut pyproject = exe_folder.clone();
+    pyproject.push("pyproject.toml");
+    let mut module_cli = exe_folder.clone();
+    module_cli.extend(["module", "cli"]);
     let mut installer_py = exe_folder.clone();
     installer_py.extend(["deploy", "installer.py"]);
-    if fs::exists(installer_py).unwrap() {
+    if (fs::exists(pyproject).unwrap() && fs::exists(module_cli).unwrap())
+        || fs::exists(installer_py).unwrap()
+    {
         return Some(exe_folder);
     }
     // If it's MacOS, it could be ALAS.app/Contents/AzurLaneAutoScript
@@ -57,8 +67,8 @@ pub(crate) fn alas_repo_dir() -> PathBuf {
 fn alas_repo_dir_or_err() -> Result<PathBuf> {
     try_alas_repo_dir().ok_or_else(|| {
         anyhow!(
-            "Cannot find the ALAS repo folder.\nPortable layout: deploy/installer.py next to \
-             the executable.\nmacOS: ALAS.app/Contents/AzurLaneAutoScript."
+            "Cannot find the ALAS repo folder.\nPortable layout: pyproject.toml + module/cli \
+             next to the executable.\nmacOS: ALAS.app/Contents/AzurLaneAutoScript."
         )
     })
 }
@@ -190,34 +200,35 @@ pub fn setup_alas_repo(mut status_updater: impl FnMut(&str)) -> Result<()> {
     Ok(())
 }
 
-/// Exclude the upstream Electron launcher (`webapp/`) from the worktree.
+/// Ensure the payload worktree is a full checkout.
 ///
-/// `webapp/` is dead upstream (frozen since 2022-01-16), yet every
-/// `git reset --hard` materializes it into each install. Sparse-checkout
-/// state (`.git/info/sparse-checkout` + `core.sparseCheckout`) survives both
-/// update paths in `deploy.git.GitManager`: `git_repository_init`
-/// (reset --hard + pull --ff-only) and the GitOverCdn pack download (raw git
-/// pack objects, ends in the same reset --hard) — verified empirically.
-/// Non-cone denylist (`/*` + `!webapp/`): any new upstream top-level dir is
-/// included automatically, unlike a cone-mode allowlist. Fail-soft: old git
-/// (<2.25, no sparse-checkout) or a broken repo degrades to keeping webapp/
+/// Sparse-checkout state (`.git/info/sparse-checkout` +
+/// `core.sparseCheckout`) survives both update paths in
+/// `deploy.git.GitManager`: `git_repository_init` (reset --hard +
+/// pull --ff-only) and the GitOverCdn pack download (raw git pack
+/// objects, ends in the same reset --hard) — verified empirically.
+///
+/// Sparse-checkout patterns (non-cone, gitignore semantics — the last
+/// matching pattern wins, so any future exclusion must follow `/*`).
+///
+/// `/*` includes every top-level entry so future dirs appear
+/// automatically. The old denylist (`!webapp/`, `!webapp-tauri/src-tauri/`)
+/// stripped what was then the dead upstream Electron tree — stale since the
+/// payload renamed `webapp-tauri/` -> `webapp/` (2026-09-08): the fork's
+/// `webapp/` is the ACTIVE Svelte SPA whose sources build the webui frontend
+/// (`alas build frontend`; `webapp/dist/` is gitignored, so it survives
+/// resets either way). Keeping this mechanism (instead of deleting it) is
+/// deliberate: re-running `sparse-checkout set /*` on every startup clears
+/// the stale denylist that older launcher builds wrote, re-materializing
+/// `webapp/` sources on existing installs. Fail-soft: old git (<2.25, no
+/// sparse-checkout) or a broken repo degrades to the current tree state
 /// instead of blocking the launch.
-/// Sparse-checkout denylist patterns (non-cone, gitignore semantics — the
-/// last matching pattern wins, so negations must follow `/*`).
-///
-/// `/*` includes every top-level entry so future upstream dirs appear
-/// automatically. `!webapp/` drops the dead Electron launcher (frozen
-/// upstream since 2022-01-16). `!webapp-tauri/src-tauri/` drops the PR #5885
-/// Tauri shell's Rust side while keeping `webapp-tauri/` frontend sources —
-/// the FastAPI webui serves its pages from `webapp-tauri/dist`, which is
-/// built from those sources (excluding the whole directory would leave the
-/// webui with no frontend to mount).
 fn sparse_checkout_patterns() -> Vec<&'static str> {
-    vec!["/*", "!webapp/", "!webapp-tauri/src-tauri/"]
+    vec!["/*"]
 }
 
 fn apply_sparse_checkout(status_updater: &mut impl FnMut(&str)) {
-    status_updater("Excluding webapp and webapp-tauri/src-tauri (dead shells)");
+    status_updater("Ensuring full checkout (clears legacy webapp/ exclusion)");
     let dir = alas_repo_dir();
     let mut args = vec!["sparse-checkout", "set", "--no-cone"];
     args.extend(sparse_checkout_patterns());
@@ -229,10 +240,10 @@ fn apply_sparse_checkout(status_updater: &mut impl FnMut(&str)) {
         .status();
     match status {
         Ok(s) if s.success() => {
-            info!("sparse checkout applied: excluded webapp/ and webapp-tauri/src-tauri/ in {:?}", dir)
+            info!("sparse checkout applied: full tree in {:?}", dir)
         }
-        Ok(s) => warn!("sparse checkout failed with {s}; keeping excluded dirs present"),
-        Err(e) => warn!("sparse checkout failed: {e:#}; keeping excluded dirs present"),
+        Ok(s) => warn!("sparse checkout failed with {s}; keeping current tree state"),
+        Err(e) => warn!("sparse checkout failed: {e:#}; keeping current tree state"),
     }
 }
 
@@ -545,19 +556,16 @@ mod tests {
 
     #[test]
     fn test_sparse_checkout_patterns() {
-        let patterns = sparse_checkout_patterns();
-        // `/*` first: non-cone denylist needs the include-all baseline up
+        // `/*` first: non-cone patterns need the include-all baseline up
         // front, and gitignore semantics make later negations win over it.
+        // No exclusions: `webapp/` is the ACTIVE Svelte SPA since the
+        // payload's webapp-tauri -> webapp rename (2026-09-08), and
+        // `webapp-tauri/` no longer exists — see sparse_checkout_patterns.
+        let patterns = sparse_checkout_patterns();
         assert_eq!(patterns.first(), Some(&"/*"));
-        assert!(patterns.contains(&"!webapp/"), "dead Electron launcher must stay excluded");
         assert!(
-            patterns.contains(&"!webapp-tauri/src-tauri/"),
-            "PR #5885 Tauri shell's Rust side must be excluded"
-        );
-        // Frontend sources stay so webapp-tauri/dist can be built for webui.
-        assert!(
-            !patterns.iter().any(|p| p.contains("webapp-tauri") && !p.contains("src-tauri")),
-            "webapp-tauri/ frontend sources must not be excluded"
+            !patterns.iter().any(|p| p.starts_with('!')),
+            "webapp/ is the active SPA; nothing may be excluded: {patterns:?}"
         );
     }
 }
