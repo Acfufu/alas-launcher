@@ -24,6 +24,7 @@ node_modules/
 .v2c/
 .lazyzcode/
 .video_agent/
+probe/out/
 # Local security audit report (contains exploit paths; not published to the public repo)
 deepsec-security-report.html
 __pycache__/
