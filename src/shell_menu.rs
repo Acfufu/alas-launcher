@@ -57,6 +57,7 @@ use tauri::{
     menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
     AppHandle, Manager, Wry,
 };
+use tauri_plugin_notification::NotificationExt;
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -162,6 +163,70 @@ pub fn handle_notify_task_click(settings: &Arc<Mutex<ShellSettings>>) -> ShellSe
         warn!("failed to persist shell settings: {e}; notifications apply for this session only");
     }
     updated
+}
+
+/// Apply a `settings-notify-emu` click: flip the shared `notify_emulator`,
+/// persist, return the updated settings. Mirrors
+/// [`handle_notify_master_click`].
+pub fn handle_notify_emu_click(settings: &Arc<Mutex<ShellSettings>>) -> ShellSettings {
+    let updated = {
+        let mut guard = settings.lock().unwrap();
+        guard.notify_emulator = !guard.notify_emulator;
+        guard.clone()
+    };
+    if let Err(e) = updated.save() {
+        warn!("failed to persist shell settings: {e}; notifications apply for this session only");
+    }
+    updated
+}
+
+/// Direction-2 dispatcher: deliver one emulator incident through the
+/// notification pipeline. Two channels, both best-effort:
+/// 1. native notification, gated by the shell settings (master + emulator);
+/// 2. POST /api/alas/notify on a short-lived relay thread — the payload
+///    pushes through onepush using its own Error.OnePushConfig form value.
+///    Provider left unset (渠道留空) logs "skip sending" payload-side; filling
+///    the form later activates remote push with zero code changes.
+pub fn dispatch_emu_incident(
+    app: &AppHandle,
+    settings: &Arc<Mutex<ShellSettings>>,
+    event: crate::emulators::EmuEvent,
+) {
+    let notify_event = crate::notify::NotifyEvent::EmulatorIncident {
+        name: event.avd.clone(),
+        incident: event.incident,
+    };
+    let (enabled, language) = {
+        let guard = settings.lock().unwrap();
+        (
+            crate::notify::should_notify(&notify_event, &guard),
+            guard.resolved_language(crate::deploy_config::language().as_deref()),
+        )
+    };
+    if !enabled {
+        return;
+    }
+    let labels = crate::menu_model::shell_menu_labels(&language);
+    let body = labels
+        .notify_emu_body
+        .replace("{name}", &event.avd)
+        .replace("{incident}", event.incident.as_str());
+    if let Err(e) = app.notification().builder().title("ALAS").body(&body).show() {
+        warn!("emulator incident notification send failed: {e}");
+    }
+    let port = crate::deploy_config::webui_port();
+    let spawn_result = std::thread::Builder::new()
+        .name("emu-notify-relay".into())
+        .spawn(move || {
+            if let Err(e) = crate::control_api::api_notify(port, "ALAS", &body) {
+                // Expected whenever the backend is down or the payload predates
+                // the endpoint — debug so crash waves don't spam the log.
+                debug!("emulator incident relay skipped: {e}");
+            }
+        });
+    if let Err(e) = spawn_result {
+        warn!("emulator incident relay thread spawn failed: {e}");
+    }
 }
 
 /// 模拟器控制 tier menu item ids, fixed order matching the label triple
@@ -448,6 +513,7 @@ pub struct SettingsMenuHandles {
     notify_master: CheckMenuItem<Wry>,
     notify_death: CheckMenuItem<Wry>,
     notify_task: CheckMenuItem<Wry>,
+    notify_emu: CheckMenuItem<Wry>,
     emu_control: Submenu<Wry>,
     emu_tier_items: Vec<CheckMenuItem<Wry>>,
 }
@@ -486,6 +552,8 @@ impl SettingsMenuHandles {
             .set_checked(settings.notify_scheduler_death)?;
         self.notify_task.set_text(labels.notify_task.clone())?;
         self.notify_task.set_checked(settings.notify_task_complete)?;
+        self.notify_emu.set_text(labels.notify_emu.clone())?;
+        self.notify_emu.set_checked(settings.notify_emulator)?;
         self.emu_control.set_text(labels.emu_control.clone())?;
         let tier_names = [
             &labels.emu_tier_readonly,
@@ -533,6 +601,7 @@ pub fn build_settings_menu(
         notify_enabled,
         notify_scheduler_death,
         notify_task_complete,
+        notify_emulator,
         emulator_control,
     ) = {
         let guard = settings.lock().unwrap();
@@ -542,6 +611,7 @@ pub fn build_settings_menu(
             guard.notify_enabled,
             guard.notify_scheduler_death,
             guard.notify_task_complete,
+            guard.notify_emulator,
             guard.emulator_control,
         )
     };
@@ -637,6 +707,14 @@ pub fn build_settings_menu(
         notify_task_complete,
         None::<&str>,
     )?;
+    let notify_emu = CheckMenuItem::with_id(
+        app,
+        "settings-notify-emu",
+        labels.notify_emu.clone(),
+        true,
+        notify_emulator,
+        None::<&str>,
+    )?;
 
     // 模拟器控制 submenu (direction-1): three tier items in fixed order —
     // ids match ControlTier::as_str, so exactly one renders checked for any
@@ -684,6 +762,7 @@ pub fn build_settings_menu(
         &notify_master,
         &notify_death,
         &notify_task,
+        &notify_emu,
         &sep_after_notify,
         &emu_control_submenu,
     ];
@@ -717,6 +796,7 @@ pub fn build_settings_menu(
         notify_master,
         notify_death,
         notify_task,
+        notify_emu,
         emu_control: emu_control_submenu,
         emu_tier_items,
     })

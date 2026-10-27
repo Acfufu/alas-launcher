@@ -23,7 +23,7 @@ router = APIRouter(tags=["alas-launcher-control"])
 # verifies the version once the backend is ready (run_protocol_handshake in
 # src/control_api.rs); a mismatch degrades the tray toggle fail-open-side —
 # only a CONFIRMED mismatch disables control calls.
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 
 # Payload root (module/webui/control_api.py -> module/webui -> module -> root).
 # cwd-independent on purpose: the webui process cwd is the payload root today,
@@ -108,6 +108,47 @@ async def update_restart(request: Request):
     except OSError as e:
         return JSONResponse({"error": f"request file write failed: {e}"}, status_code=500)
     return JSONResponse({"ok": True, "version": PROTOCOL_VERSION})
+
+
+def _primary_onepush_config() -> str:
+    """Error.OnePushConfig of the primary alas instance, as the scheduler's
+    handle_notify consumers would pass it. Any read/shape failure degrades to
+    the unset default (provider: null) — the notify endpoint must never 500
+    over a config read."""
+    try:
+        data = json.loads((REPO_ROOT / "config" / "alas.json").read_text(encoding="utf-8"))
+        value = data["Alas"]["Error"]["OnePushConfig"]
+        return value if isinstance(value, str) else "provider: null"
+    except Exception:  # noqa: BLE001 - any missing/odd config = unset channel
+        return "provider: null"
+
+
+@router.post("/api/alas/notify")
+async def launcher_notify(request: Request):
+    """Relay a launcher-originated notification through onepush (direction-2
+    占位：崩溃/卡死事件接通管线，渠道留空).
+
+    The launcher POSTs {title, content} for emulator crash/stuck and
+    scheduler-death incidents; the payload pushes via its own
+    Error.OnePushConfig (the webui 设置→错误表单). Provider left unset →
+    handle_notify logs "No provider specified, skip sending" and we still
+    return ok — filling the form later activates remote push with ZERO code
+    changes on either side.
+    """
+    if _locked() or not _local_host(request):
+        return JSONResponse({"error": "locked"}, status_code=401)
+    try:
+        body = await request.json()
+        title = str(body.get("title", ""))[:200]
+        content = str(body.get("content", ""))[:2000]
+    except Exception:
+        return JSONResponse({"error": "invalid body"}, status_code=400)
+    if not content:
+        return JSONResponse({"error": "empty content"}, status_code=400)
+    from module.notify import handle_notify
+
+    pushed = handle_notify(_primary_onepush_config(), title=title, content=content)
+    return JSONResponse({"ok": True, "pushed": pushed, "version": PROTOCOL_VERSION})
 
 
 @router.post("/api/alas/{name}/scheduler/start")

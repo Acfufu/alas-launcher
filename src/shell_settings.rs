@@ -88,6 +88,12 @@ pub struct ShellSettings {
     /// Notify when a task completes (NextRun bump). Default OFF (silent).
     #[serde(default = "default_false_notify")]
     pub notify_task_complete: bool,
+    /// Notify on emulator incidents: crash (with the tier's disposition —
+    /// died / auto-revived / crash-loop halt) and guest stuck (adb shell
+    /// unresponsive). Default ON — direction-2 pipeline, delivered natively
+    /// and relayed to onepush once the payload channel is configured.
+    #[serde(default = "default_true")]
+    pub notify_emulator: bool,
     /// Emulator control tier. Default manual (start/stop + mutex guard).
     /// Lives here — NOT in the remotely-editable webui config — so a future
     /// Remote page can never flip the safety boundary (2026-10-28 decision).
@@ -113,6 +119,7 @@ impl Default for ShellSettings {
             notify_enabled: true,
             notify_scheduler_death: true,
             notify_task_complete: false,
+            notify_emulator: true,
             emulator_control: ControlTier::default(),
         }
     }
@@ -395,6 +402,7 @@ mod tests {
         assert!(s.notify_enabled);
         assert!(s.notify_scheduler_death);
         assert!(!s.notify_task_complete);
+        assert!(s.notify_emulator);
     }
 
     #[test]
@@ -405,6 +413,7 @@ mod tests {
             notify_enabled: false,
             notify_scheduler_death: false,
             notify_task_complete: true,
+            notify_emulator: false,
             emulator_control: ControlTier::SelfHeal,
         };
         let json = serde_json::to_string(&s).unwrap();

@@ -20,7 +20,7 @@ use tracing::{info, warn};
 /// exists to catch a payload-side file that survived from a different
 /// launcher version (git reset timing, hand-edited trees, future direct
 /// commits in the payload repo).
-pub const EXPECTED_PROTOCOL_VERSION: u32 = 2;
+pub const EXPECTED_PROTOCOL_VERSION: u32 = 3;
 
 /// Last confirmed protocol result. Handshakes run under the shared operation
 /// permit so an old backend's response cannot overwrite a newer session.
@@ -73,6 +73,18 @@ impl std::error::Error for ApiError {}
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 fn request(port: u16, method: &str, path: &str) -> Result<Vec<u8>, ApiError> {
+    request_with_body(port, method, path, "")
+}
+
+/// Same one-shot call, with a JSON request body; Content-Type/Content-Length
+/// are always set (an empty body sends Content-Length: 0 — more correct than
+/// the historical headerless form, and uvicorn accepts both).
+fn request_with_body(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> Result<Vec<u8>, ApiError> {
     let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port);
     let mut stream = TcpStream::connect_timeout(&addr, TIMEOUT).map_err(ApiError::Io)?;
     stream
@@ -81,7 +93,10 @@ fn request(port: u16, method: &str, path: &str) -> Result<Vec<u8>, ApiError> {
     stream
         .set_write_timeout(Some(TIMEOUT))
         .map_err(ApiError::Io)?;
-    let req = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
     stream.write_all(req.as_bytes()).map_err(ApiError::Io)?;
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).map_err(ApiError::Io)?;
@@ -147,6 +162,17 @@ pub fn api_scheduler_stop(port: u16, name: &str) -> Result<InstanceState, ApiErr
     parse_instance(&body)
 }
 
+/// Relay a launcher-originated notification through the payload's onepush
+/// channel (direction-2 占位): POST /api/alas/notify {title, content}. The
+/// payload pushes via its own Error.OnePushConfig; an unset provider logs
+/// "skip sending" and still returns ok — 渠道留空 by design, filling the
+/// webui form later needs zero launcher changes.
+pub fn api_notify(port: u16, title: &str, content: &str) -> Result<(), ApiError> {
+    let body = serde_json::json!({ "title": title, "content": content }).to_string();
+    request_with_body(port, "POST", "/api/alas/notify", &body)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,7 +198,7 @@ mod tests {
 
     const OK_INSTANCES: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 27\r\n\r\n[{\"name\":\"alas\",\"state\":1}]";
     const LOCKED: &str = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 18\r\n\r\n{\"error\":\"locked\"}";
-    const OK_PROTOCOL: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 12\r\n\r\n{\"version\":2}";
+    const OK_PROTOCOL: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 12\r\n\r\n{\"version\":3}";
     const BAD_PROTOCOL: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 12\r\n\r\n{\"version\":1}";
 
     #[test]
@@ -191,7 +217,35 @@ mod tests {
     #[test]
     fn protocol_parses_version() {
         let (port, _rx) = mock_server(OK_PROTOCOL);
-        assert_eq!(api_protocol(port).unwrap(), ProtocolState { version: 2 });
+        assert_eq!(api_protocol(port).unwrap(), ProtocolState { version: EXPECTED_PROTOCOL_VERSION });
+    }
+
+    #[test]
+    fn notify_posts_json_body_to_notify_endpoint() {
+        let (port, rx) = mock_server(OK_PROTOCOL); // any 200 body works for ()
+        api_notify(port, "ALAS", "模拟器事件（Azurelane）：guest stuck").unwrap();
+        let req = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            req.starts_with("POST /api/alas/notify HTTP/1.1"),
+            "must POST the notify path: {req}"
+        );
+        assert!(req.contains("Content-Type: application/json"), "{req}");
+        // Content-Length matches the byte length of the (UTF-8) body —
+        // multibyte content must not truncate server-side.
+        let body = req.split("\r\n\r\n").nth(1).unwrap_or_default();
+        assert!(
+            req.contains(&format!("Content-Length: {}\r\n", body.len())),
+            "Content-Length must be the byte length: {req}"
+        );
+        assert!(body.contains("\"title\":\"ALAS\""), "{body}");
+        assert!(body.contains("guest stuck"), "{body}");
+    }
+
+    #[test]
+    fn notify_maps_401_to_locked() {
+        let (port, _rx) = mock_server(LOCKED);
+        let err = api_notify(port, "ALAS", "x").unwrap_err();
+        assert!(matches!(err, ApiError::Locked), "{err}");
     }
 
     /// PATCH test serialization: the mismatch flag is a process global.

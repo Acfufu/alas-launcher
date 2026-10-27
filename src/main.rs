@@ -369,6 +369,21 @@ fn main() -> Result<()> {
                             }
                         }
                     }
+                    "settings-notify-emu" => {
+                        // Direction-2: emulator incident (crash/stuck) toggle —
+                        // same flip + persist + in-place re-check pattern.
+                        let updated =
+                            crate::shell_menu::handle_notify_emu_click(&menu_shell_settings);
+                        let labels = crate::menu_model::shell_menu_labels(
+                            &updated
+                                .resolved_language(crate::deploy_config::language().as_deref()),
+                        );
+                        if let Some(handles) = &menu_handles {
+                            if let Err(e) = handles.apply_labels(&labels, &updated) {
+                                warn!("settings menu notify re-check failed: {e}");
+                            }
+                        }
+                    }
                     id if id.starts_with("settings-emu-tier-") => {
                         // Tier switch: set + persist, then relabel/re-check the
                         // installed items in place (labels at click time — same
@@ -438,7 +453,25 @@ fn main() -> Result<()> {
                     // independent of the backend operation permit — emulator
                     // lifecycle ops never block backend start/update and vice
                     // versa. Passive unless the tier is switched to selfheal.
-                    emulators::spawn_self_heal_poller();
+                    // Direction-2: every incident (crash died / auto-revived /
+                    // crash-loop halt / guest stuck) flows into the
+                    // notification pipeline (native + onepush relay).
+                    #[cfg(target_os = "macos")]
+                    let emu_notify_settings = run_shell_settings.clone();
+                    #[cfg(target_os = "macos")]
+                    let emu_notify_app = app_handle.clone();
+                    emulators::spawn_self_heal_poller(Box::new(move |event| {
+                        #[cfg(target_os = "macos")]
+                        crate::shell_menu::dispatch_emu_incident(
+                            &emu_notify_app,
+                            &emu_notify_settings,
+                            event,
+                        );
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            let _ = event;
+                        }
+                    }));
                     let app_handle = app_handle.clone();
                     let backend = backend.clone();
                     // Reserve before dispatch, sharing the permit with menu

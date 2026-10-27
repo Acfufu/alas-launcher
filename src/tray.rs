@@ -910,6 +910,9 @@ fn poll_once(
                         nlabels.notify_task_done.replace("{name}", name).replace("{next_time}", next_time),
                     crate::notify::NotifyEvent::SchedulerDeath { name } =>
                         nlabels.notify_death_body.replace("{name}", name),
+                    // Emulator incidents never arrive here — the emu poller
+                    // dispatches them via shell_menu::dispatch_emu_incident.
+                    crate::notify::NotifyEvent::EmulatorIncident { .. } => continue,
                 };
                 // R2 审计（A6）：发送失败（典型：macOS 通知权限被拒后从此
                 // 静默 no-op）至少落日志，否则设置里开关勾着而通知永不出现、
@@ -965,6 +968,20 @@ fn poll_once(
                 .show()
             {
                 warn!("death notification send failed: {e}");
+            }
+            // Direction-2: scheduler death is a crash-class incident — relay
+            // to the payload's onepush channel too (unset provider = harmless
+            // "skip sending" log). Fire-and-forget on its own thread: this
+            // poll loop must not stall on HTTP.
+            let body = nlabels.notify_death_body.replace("{name}", "alas");
+            let relay_port = port;
+            let spawned = std::thread::Builder::new().name("death-notify-relay".into()).spawn(move || {
+                if let Err(e) = crate::control_api::api_notify(relay_port, "ALAS", &body) {
+                    tracing::debug!("death notify relay skipped: {e}");
+                }
+            });
+            if let Err(e) = spawned {
+                warn!("death notify relay thread spawn failed: {e}");
             }
         }
     }

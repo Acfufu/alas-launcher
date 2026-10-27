@@ -14,6 +14,10 @@ use crate::shell_settings::ShellSettings;
 pub enum NotifyEvent {
     SchedulerDeath { name: String },
     TaskComplete { name: String, command: String, next_time: String },
+    /// Emulator crash/stuck incident (direction-2). Gated by
+    /// `notify_emulator`, delivered natively and relayed to the payload's
+    /// onepush channel by the dispatcher in shell_menu.rs.
+    EmulatorIncident { name: String, incident: crate::emulators::EmuIncident },
 }
 
 pub fn diff_tasks(prev: &[Task], now: &[Task]) -> Vec<NotifyEvent> {
@@ -67,6 +71,7 @@ pub fn should_notify(event: &NotifyEvent, settings: &ShellSettings) -> bool {
     match event {
         NotifyEvent::SchedulerDeath { .. } => settings.notify_scheduler_death,
         NotifyEvent::TaskComplete { .. } => settings.notify_task_complete,
+        NotifyEvent::EmulatorIncident { .. } => settings.notify_emulator,
     }
 }
 
@@ -202,8 +207,18 @@ mod tests {
         let s = ShellSettings::default();
         assert!(should_notify(&NotifyEvent::SchedulerDeath { name: "alas".into() }, &s));
         assert!(!should_notify(&NotifyEvent::TaskComplete { name: "日常".into(), command: "Daily".into(), next_time: "x".into() }, &s));
+        // Direction-2: emulator incidents default ON; master switch gates them too.
+        assert!(should_notify(
+            &NotifyEvent::EmulatorIncident { name: "Azurelane".into(), incident: crate::emulators::EmuIncident::Stuck },
+            &s
+        ));
         let off = ShellSettings { notify_enabled: false, ..Default::default() };
         assert!(!should_notify(&NotifyEvent::SchedulerDeath { name: "alas".into() }, &off));
+        let emu_off = ShellSettings { notify_emulator: false, ..Default::default() };
+        assert!(!should_notify(
+            &NotifyEvent::EmulatorIncident { name: "Azurelane".into(), incident: crate::emulators::EmuIncident::Died },
+            &emu_off
+        ));
     }
 
     // ---- death_notify_decision (round-1 F-MEDIUM latch + F-LOW composition) --

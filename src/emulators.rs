@@ -38,6 +38,46 @@ use tracing::{info, warn};
 
 use crate::shell_settings::{self, ControlTier};
 
+// ---------------------------------------------------------------------------
+// Incident events (direction-2: crash/stuck → notification pipeline)
+// ---------------------------------------------------------------------------
+
+/// Emulator incident kinds surfaced to the notification pipeline. Detection
+/// is passive and tier-independent; only crash HANDLING varies by tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmuIncident {
+    /// AVD died and the current disposition will not auto-revive (tier below
+    /// selfheal, or parked because MaaEnd is present) — manual pull needed.
+    Died,
+    /// AVD died and the self-heal poller relaunched it.
+    CrashRevived,
+    /// Death inside the crash-loop window — auto-revive halted until a
+    /// manual start.
+    CrashHalt,
+    /// Serial present but `adb shell` unresponsive twice in a row (guest
+    /// hang; the 2026-10-28 04:43 family — Watchdog soft-reboot follows).
+    Stuck,
+}
+
+impl EmuIncident {
+    /// Wording for the notification body `{incident}` placeholder.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Died => "crashed, no auto-revive (restart manually if unintended)",
+            Self::CrashRevived => "crashed, auto-revived",
+            Self::CrashHalt => "crash-loop halt, manual start required",
+            Self::Stuck => "guest stuck (adb unresponsive)",
+        }
+    }
+}
+
+/// One incident for one AVD, handed to the sink the poller was spawned with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmuEvent {
+    pub avd: String,
+    pub incident: EmuIncident,
+}
+
 /// Fresh tier read (the settings file is the source of truth — the menu
 /// persists every tier click immediately).
 fn current_tier() -> ControlTier {
@@ -470,6 +510,7 @@ pub fn manual_stop(name: &str) -> Result<(), String> {
     let Some(serial) = serials_by_avd().get(name).cloned() else {
         return Err("not-running".into());
     };
+    mark_expected_stop(name);
     let adb = adb_path();
     run_with_timeout(
         &adb.to_string_lossy(),
@@ -482,6 +523,40 @@ pub fn manual_stop(name: &str) -> Result<(), String> {
     // as a halt until the next manual start clears it.
     set_halt(name);
     Ok(())
+}
+
+/// Purposeful-stop markers: a death observed while a marker is fresh is a
+/// user stop (manual_stop / window close handled via manual_stop only), not
+/// a crash incident — consumed by the poller at the death sighting.
+fn expected_stops() -> &'static std::sync::Mutex<BTreeMap<String, Instant>> {
+    static STOPS: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, Instant>>> =
+        std::sync::OnceLock::new();
+    STOPS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+fn mark_expected_stop(name: &str) {
+    expected_stops()
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), Instant::now());
+}
+
+/// Whether a death of `name` right now was pre-announced by [`manual_stop`]
+/// (consuming the marker). Stale markers (>60s) expire — the kill may have
+/// failed and a later genuine crash must still notify.
+fn consume_expected_stop(name: &str) -> bool {
+    let mut stops = expected_stops().lock().unwrap();
+    match stops.get(name) {
+        Some(at) if at.elapsed() < Duration::from_secs(60) => {
+            stops.remove(name);
+            true
+        }
+        Some(_) => {
+            stops.remove(name);
+            false
+        }
+        None => false,
+    }
 }
 
 /// RAII release for [`OP_IN_FLIGHT`] (mirrors operation.rs's InFlightGuard
@@ -503,6 +578,10 @@ struct HealTrack {
     running_since: Option<Instant>,
     /// Crash-loop halt; cleared only by a manual start.
     halted: bool,
+    /// Consecutive failed adb-shell probes (stuck detection).
+    stuck_fails: u8,
+    /// Stuck incident already fired for this episode (re-armed by success).
+    stuck_fired: bool,
 }
 
 fn heal_state() -> &'static std::sync::Mutex<BTreeMap<String, HealTrack>> {
@@ -526,14 +605,47 @@ fn set_halt(name: &str) {
         .halted = true;
 }
 
+/// Stuck detection: `adb shell echo` must answer within this budget; a
+/// hung guest blocks past it (the 04:43 family: qemu alive, guest frozen).
+const STUCK_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Uptime an AVD must reach before stuck probing starts (boot grace — adbd
+/// answers shell within seconds of device-online, but give cold boots air).
+const STUCK_BOOT_GRACE: Duration = Duration::from_secs(120);
+
+/// Stuck state machine (pure): two consecutive failed shell probes fire
+/// exactly once; any success resets and re-arms. `None` = not probed this
+/// cycle (AVD down / inside the boot grace) — state kept as-is.
+pub(crate) fn stuck_decision(
+    probe_ok: Option<bool>,
+    fail_streak: &mut u8,
+    fired: &mut bool,
+) -> bool {
+    const PERSIST: u8 = 2;
+    match probe_ok {
+        Some(true) => {
+            *fail_streak = 0;
+            *fired = false;
+        }
+        Some(false) => *fail_streak = fail_streak.saturating_add(1),
+        None => {}
+    }
+    if !*fired && *fail_streak >= PERSIST {
+        *fired = true;
+        return true;
+    }
+    false
+}
+
 /// Background thread: poll the fleet, revive dead AVDs on the selfheal tier
 /// with the crash-loop guard. Owns no permits (emulator ops are independent
 /// of backend lifecycle ops) and reads the tier fresh each cycle, so a menu
-/// switch takes effect within one poll.
-pub fn spawn_self_heal_poller() {
+/// switch takes effect within one poll. `notify` receives every incident
+/// (crash died / auto-revived / crash-loop halt / guest stuck) — the
+/// direction-2 notification pipeline, passive across ALL tiers.
+pub fn spawn_self_heal_poller(notify: Box<dyn Fn(EmuEvent) + Send + 'static>) {
     std::thread::Builder::new()
         .name("emu-self-heal".into())
-        .spawn(|| {
+        .spawn(move || {
             info!(
                 "emulator self-heal poller started ({}s cycle)",
                 SELF_HEAL_POLL.as_secs()
@@ -548,6 +660,7 @@ pub fn spawn_self_heal_poller() {
                     Revive,
                     LogHalt(Duration),
                     LogHalted,
+                    Notify(EmuIncident),
                 }
                 // Decide under the lock, act after releasing it — spawn_emulator
                 // takes its time and manual_start's clear_halt must not queue
@@ -566,6 +679,8 @@ pub fn spawn_self_heal_poller() {
                                 // run, not an old wave.
                                 track.running_since = Some(Instant::now());
                                 track.halted = false;
+                                track.stuck_fails = 0;
+                                track.stuck_fired = false;
                             }
                             continue;
                         }
@@ -577,16 +692,27 @@ pub fn spawn_self_heal_poller() {
                             actions.push((name, Action::LogHalted));
                             continue;
                         }
+                        if consume_expected_stop(&name) {
+                            // manual_stop announced this death — not an incident.
+                            continue;
+                        }
                         match revive_decision(tier, maaend, uptime) {
-                            ReviveDecision::Revive => actions.push((name, Action::Revive)),
+                            ReviveDecision::Revive => {
+                                actions.push((name.clone(), Action::Revive));
+                                actions.push((name, Action::Notify(EmuIncident::CrashRevived)));
+                            }
                             // Parked on purpose (tier below selfheal / MaaEnd
                             // present): the uptime anchor is already consumed,
                             // so re-entering the tier cannot revive a long-dead
-                            // AVD by accident.
-                            ReviveDecision::Skip => {}
+                            // AVD by accident. Still an incident — nothing
+                            // will revive it, so the user must hear about it.
+                            ReviveDecision::Skip => {
+                                actions.push((name, Action::Notify(EmuIncident::Died)));
+                            }
                             ReviveDecision::Halt => {
                                 track.halted = true;
-                                actions.push((name, Action::LogHalt(uptime)));
+                                actions.push((name.clone(), Action::LogHalt(uptime)));
+                                actions.push((name, Action::Notify(EmuIncident::CrashHalt)));
                             }
                         }
                     }
@@ -598,12 +724,15 @@ pub fn spawn_self_heal_poller() {
                             if let Err(e) = spawn_emulator(&name) {
                                 warn!("self-heal: revive failed for {name}: {e}");
                             }
-                            heal_state()
-                                .lock()
-                                .unwrap()
-                                .entry(name)
-                                .or_default()
-                                .running_since = Some(Instant::now());
+                            let mut state = heal_state().lock().unwrap();
+                            let track = state.entry(name).or_default();
+                            track.running_since = Some(Instant::now());
+                            track.stuck_fails = 0;
+                            track.stuck_fired = false;
+                        }
+                        Action::Notify(incident) => {
+                            info!("emu incident: {name} — {}", incident.as_str());
+                            notify(EmuEvent { avd: name, incident });
                         }
                         Action::LogHalt(uptime) => {
                             warn!(
@@ -615,6 +744,43 @@ pub fn spawn_self_heal_poller() {
                         Action::LogHalted => {
                             info!("self-heal: {name} down (crash-loop halt active) — staying passive");
                         }
+                    }
+                }
+                // Stuck probe (passive, ALL tiers): one bounded `adb shell
+                // echo` per running AVD past the boot grace. Observation, not
+                // control — tier semantics unaffected.
+                for (name, serial) in &serials {
+                    let uptime_ready = {
+                        let state = heal_state().lock().unwrap();
+                        state
+                            .get(name)
+                            .and_then(|t| t.running_since)
+                            .is_some_and(|since| since.elapsed() >= STUCK_BOOT_GRACE)
+                    };
+                    if !uptime_ready {
+                        continue;
+                    }
+                    let adb = adb_path();
+                    let probe = run_with_timeout(
+                        &adb.to_string_lossy(),
+                        &["-s", serial, "shell", "echo", "ok"],
+                        STUCK_PROBE_TIMEOUT,
+                    );
+                    let probe_ok = probe.as_deref().map(|out| out.contains("ok"));
+                    let fire = {
+                        let mut state = heal_state().lock().unwrap();
+                        let track = state.entry(name.clone()).or_default();
+                        if track.running_since.is_none() {
+                            continue; // died between the scan and the probe
+                        }
+                        stuck_decision(probe_ok, &mut track.stuck_fails, &mut track.stuck_fired)
+                    };
+                    if fire {
+                        info!("emu incident: {name} — guest stuck (adb unresponsive)");
+                        notify(EmuEvent {
+                            avd: name.clone(),
+                            incident: EmuIncident::Stuck,
+                        });
                     }
                 }
             }
@@ -744,6 +910,68 @@ mod tests {
                     azurelane
                 );
             }
+        }
+    }
+
+    // ---- direction-2: stuck state machine --------------------------------
+
+    #[test]
+    fn stuck_fires_once_on_two_consecutive_failures() {
+        let mut streak = 0u8;
+        let mut fired = false;
+        // healthy baseline
+        assert!(!stuck_decision(Some(true), &mut streak, &mut fired));
+        // first failure: no fire
+        assert!(!stuck_decision(Some(false), &mut streak, &mut fired));
+        assert_eq!(streak, 1);
+        // second failure: fires exactly once
+        assert!(stuck_decision(Some(false), &mut streak, &mut fired));
+        // still failing: latched, no duplicate
+        assert!(!stuck_decision(Some(false), &mut streak, &mut fired));
+        // recovery resets and re-arms
+        assert!(!stuck_decision(Some(true), &mut streak, &mut fired));
+        assert_eq!(streak, 0);
+        assert!(!fired);
+        // a new hang episode fires again
+        assert!(!stuck_decision(Some(false), &mut streak, &mut fired));
+        assert!(stuck_decision(Some(false), &mut streak, &mut fired));
+    }
+
+    #[test]
+    fn stuck_not_probed_cycles_keep_state() {
+        // AVD down / boot-grace cycles (None) must neither advance nor reset
+        // the streak — e.g. probe fail, one grace cycle, probe fail → still
+        // only 2 strikes when the second FAIL lands.
+        let mut streak = 0u8;
+        let mut fired = false;
+        assert!(!stuck_decision(Some(false), &mut streak, &mut fired));
+        assert!(!stuck_decision(None, &mut streak, &mut fired));
+        assert_eq!(streak, 1);
+        assert!(stuck_decision(Some(false), &mut streak, &mut fired));
+    }
+
+    #[test]
+    fn expected_stop_marker_roundtrip_and_single_consumption() {
+        mark_expected_stop("MarkerAvd");
+        // consumed once…
+        assert!(consume_expected_stop("MarkerAvd"));
+        // …never twice — a later death of the same AVD is a real incident.
+        assert!(!consume_expected_stop("MarkerAvd"));
+        // other AVDs unaffected
+        assert!(!consume_expected_stop("OtherAvd"));
+    }
+
+    #[test]
+    fn incident_wording_is_distinct_and_nonempty() {
+        let wordings = [
+            EmuIncident::Died.as_str(),
+            EmuIncident::CrashRevived.as_str(),
+            EmuIncident::CrashHalt.as_str(),
+            EmuIncident::Stuck.as_str(),
+        ];
+        assert!(wordings.iter().all(|w| !w.is_empty()));
+        for (i, a) in wordings.iter().enumerate() {
+            assert!(wordings.iter().skip(i + 1).all(|b| a != b), "wordings must be distinct: {wordings:?}");
         }
     }
 }
