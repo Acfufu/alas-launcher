@@ -70,7 +70,7 @@ impl ControlTier {
 ///
 /// `language: None` = follow the ALAS deploy.yaml `Deploy.Webui.Language`;
 /// `Some(code)` = explicit override (zh-CN / zh-TW / en-US / ja-JP).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ShellSettings {
     /// Override language; `None` follows the ALAS deploy language.
     #[serde(default)]
@@ -99,6 +99,13 @@ pub struct ShellSettings {
     /// Remote page can never flip the safety boundary (2026-10-28 decision).
     #[serde(default)]
     pub emulator_control: ControlTier,
+    /// Log/error-screenshot retention DAYS (direction-7a). 0 = unlimited.
+    /// Enforced by the launcher's log_cleanup thread over the payload log/.
+    #[serde(default = "default_log_retention_days")]
+    pub log_retention_days: u32,
+    /// Log budget in GIGABYTES (oldest-first beyond the budget). 0 = unlimited.
+    #[serde(default = "default_log_size_limit_gb")]
+    pub log_size_limit_gb: f64,
 }
 
 /// Serde fallback for `auto_start_backend` when the field is missing from an
@@ -111,6 +118,14 @@ fn default_false_notify() -> bool {
     false
 }
 
+fn default_log_retention_days() -> u32 {
+    14
+}
+
+fn default_log_size_limit_gb() -> f64 {
+    5.0
+}
+
 impl Default for ShellSettings {
     fn default() -> Self {
         Self {
@@ -121,6 +136,8 @@ impl Default for ShellSettings {
             notify_task_complete: false,
             notify_emulator: true,
             emulator_control: ControlTier::default(),
+            log_retention_days: 14,
+            log_size_limit_gb: 5.0,
         }
     }
 }
@@ -415,6 +432,8 @@ mod tests {
             notify_task_complete: true,
             notify_emulator: false,
             emulator_control: ControlTier::SelfHeal,
+            log_retention_days: 30,
+            log_size_limit_gb: 2.5,
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: ShellSettings = serde_json::from_str(&json).unwrap();

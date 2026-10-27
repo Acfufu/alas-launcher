@@ -35,6 +35,7 @@ mod shell_settings;
 // Cross-platform compiles; ps-based detection and the SDK fallback paths are
 // unix/macOS-flavored, Windows probes degrade to adb-only status.
 mod emulators;
+mod log_cleanup;
 // macOS app menu bar shell-settings submenu (builds the 外壳设置 menu from
 // ShellSettings + ShellMenuLabels); gated so win/linux builds stay untouched.
 #[cfg(target_os = "macos")]
@@ -185,7 +186,7 @@ fn main() -> Result<()> {
 
     info!("Starting Webview...");
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![save_as, emu_list, emu_start, emu_stop])
+        .invoke_handler(tauri::generate_handler![save_as, emu_list, emu_start, emu_stop, cleanup_get, cleanup_set])
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
@@ -472,6 +473,10 @@ fn main() -> Result<()> {
                             let _ = event;
                         }
                     }));
+                    // Log/error-screenshot retention (direction-7a): one pass
+                    // after startup, then every 6h; the thread re-reads
+                    // settings.json each cycle so webui edits apply live.
+                    log_cleanup::spawn_cleanup_thread();
                     let app_handle = app_handle.clone();
                     let backend = backend.clone();
                     // Reserve before dispatch, sharing the permit with menu
@@ -660,6 +665,55 @@ fn emu_start(name: String) -> Result<(), String> {
 #[tauri::command]
 fn emu_stop(name: String) -> Result<(), String> {
     emulators::manual_stop(&name)
+}
+
+/// Cleanup policy DTO for the webapp 外壳设置区 (invoke-only, same family as
+/// emu_list — a plain remote browser has no bridge and never sees this).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CleanupPolicyDto {
+    retention_days: u32,
+    size_limit_gb: f64,
+}
+
+fn cleanup_dto(settings: &crate::shell_settings::ShellSettings) -> CleanupPolicyDto {
+    CleanupPolicyDto {
+        retention_days: settings.log_retention_days,
+        size_limit_gb: settings.log_size_limit_gb,
+    }
+}
+
+#[tauri::command]
+fn cleanup_get() -> CleanupPolicyDto {
+    cleanup_dto(&crate::shell_settings::load())
+}
+
+/// Apply + persist the retention numbers, then run one immediate pass so the
+/// effect is visible without waiting for the 6h cycle. File-based
+/// load-modify-save: the settings file is the source of truth (menu handlers
+/// persist every click immediately, same contract here).
+#[tauri::command]
+fn cleanup_set(retention_days: u32, size_limit_gb: f64) -> Result<CleanupPolicyDto, String> {
+    if retention_days > 3650 {
+        return Err("days-out-of-range".into());
+    }
+    if !size_limit_gb.is_finite() || size_limit_gb < 0.0 || size_limit_gb > 100_000.0 {
+        return Err("gb-out-of-range".into());
+    }
+    let mut settings = crate::shell_settings::load();
+    settings.log_retention_days = retention_days;
+    settings.log_size_limit_gb = size_limit_gb;
+    settings
+        .save()
+        .map_err(|e| format!("persist-failed: {e}"))?;
+    let applied = settings.clone();
+    std::thread::Builder::new()
+        .name("log-cleanup-now".into())
+        .spawn(move || {
+            log_cleanup::run_once(std::path::Path::new("./log"), &applied, std::time::SystemTime::now());
+        })
+        .map_err(|e| format!("run-failed: {e}"))?;
+    Ok(cleanup_dto(&settings))
 }
 
 #[tauri::command]
