@@ -26,6 +26,46 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Result};
 use tracing::warn;
 
+/// Emulator control tier (direction-1 minimal loop, 2026-10-28 decision):
+/// ONE escalating enum — readonly ⊂ manual ⊂ selfheal — deliberately not
+/// independent switches, so "mutex off + auto-revive on" (the crash-十号
+/// recipe) cannot be configured. Enforcement lives in emulators.rs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum ControlTier {
+    /// Monitor only: no start/stop from the launcher, ever.
+    #[serde(rename = "readonly")]
+    ReadOnly,
+    /// Manual start/stop allowed; the MaaEnd mutex auto-blocks starts
+    /// (default).
+    #[default]
+    #[serde(rename = "manual")]
+    ManualGuarded,
+    /// manual + the self-heal poller revives dead AVDs (crash-loop guarded).
+    #[serde(rename = "selfheal")]
+    SelfHeal,
+}
+
+impl ControlTier {
+    /// Stable settings/menu id (`readonly` | `manual` | `selfheal`) — shared
+    /// by settings.json, the menu item ids and the webapp DTO.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "readonly",
+            Self::ManualGuarded => "manual",
+            Self::SelfHeal => "selfheal",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "readonly" => Some(Self::ReadOnly),
+            "manual" => Some(Self::ManualGuarded),
+            "selfheal" => Some(Self::SelfHeal),
+            _ => None,
+        }
+    }
+}
+
 /// Persisted launcher shell settings.
 ///
 /// `language: None` = follow the ALAS deploy.yaml `Deploy.Webui.Language`;
@@ -48,6 +88,11 @@ pub struct ShellSettings {
     /// Notify when a task completes (NextRun bump). Default OFF (silent).
     #[serde(default = "default_false_notify")]
     pub notify_task_complete: bool,
+    /// Emulator control tier. Default manual (start/stop + mutex guard).
+    /// Lives here — NOT in the remotely-editable webui config — so a future
+    /// Remote page can never flip the safety boundary (2026-10-28 decision).
+    #[serde(default)]
+    pub emulator_control: ControlTier,
 }
 
 /// Serde fallback for `auto_start_backend` when the field is missing from an
@@ -68,6 +113,7 @@ impl Default for ShellSettings {
             notify_enabled: true,
             notify_scheduler_death: true,
             notify_task_complete: false,
+            emulator_control: ControlTier::default(),
         }
     }
 }
@@ -359,6 +405,7 @@ mod tests {
             notify_enabled: false,
             notify_scheduler_death: false,
             notify_task_complete: true,
+            emulator_control: ControlTier::SelfHeal,
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: ShellSettings = serde_json::from_str(&json).unwrap();

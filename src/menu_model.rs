@@ -467,6 +467,12 @@ pub struct ShellMenuLabels {
     pub notify_task_done: String,
     /// Scheduler-death notification body template; `{name}` placeholder.
     pub notify_death_body: String,
+    /// Emulator control tier submenu (direction-1): title + the three tier
+    /// names, order matches ControlTier::as_str ids (readonly/manual/selfheal).
+    pub emu_control: String,
+    pub emu_tier_readonly: String,
+    pub emu_tier_manual: String,
+    pub emu_tier_selfheal: String,
     pub lang_names: Vec<String>,
 }
 
@@ -489,6 +495,10 @@ pub fn shell_menu_labels(lang: &str) -> ShellMenuLabels {
         notify_task,
         notify_task_done,
         notify_death_body,
+        emu_control,
+        emu_tier_readonly,
+        emu_tier_manual,
+        emu_tier_selfheal,
     ) = match lang {
         "zh-TW" => (
             "設定",
@@ -505,6 +515,10 @@ pub fn shell_menu_labels(lang: &str) -> ShellMenuLabels {
             "任務完成時通知",
             "{name} 完成 · 下次 {next_time}",
             "調度器異常退出（{name}）",
+            "模擬器控制",
+            "唯讀監視",
+            "手動啟停＋互斥攔截",
+            "條件自癒",
         ),
         "en-US" => (
             "Settings",
@@ -521,6 +535,10 @@ pub fn shell_menu_labels(lang: &str) -> ShellMenuLabels {
             "Notify on task completion",
             "{name} done · next {next_time}",
             "Scheduler exited abnormally ({name})",
+            "Emulator control",
+            "Read-only",
+            "Manual + guard",
+            "Self-heal",
         ),
         "ja-JP" => (
             "設定",
@@ -537,6 +555,10 @@ pub fn shell_menu_labels(lang: &str) -> ShellMenuLabels {
             "タスク完了時に通知",
             "{name} 完了 · 次回 {next_time}",
             "スケジューラーが異常終了しました（{name}）",
+            "エミュレーター制御",
+            "読み取り専用",
+            "手動＋ガード",
+            "自動復帰",
         ),
         // zh-CN doubles as the fallback for any unknown or empty language.
         _ => (
@@ -554,6 +576,10 @@ pub fn shell_menu_labels(lang: &str) -> ShellMenuLabels {
             "任务完成时通知",
             "{name} 完成 · 下次 {next_time}",
             "调度器异常退出（{name}）",
+            "模拟器控制",
+            "只读监视",
+            "手动启停＋互斥拦截",
+            "条件自愈",
         ),
     };
     ShellMenuLabels {
@@ -571,6 +597,10 @@ pub fn shell_menu_labels(lang: &str) -> ShellMenuLabels {
         notify_task: notify_task.into(),
         notify_task_done: notify_task_done.into(),
         notify_death_body: notify_death_body.into(),
+        emu_control: emu_control.into(),
+        emu_tier_readonly: emu_tier_readonly.into(),
+        emu_tier_manual: emu_tier_manual.into(),
+        emu_tier_selfheal: emu_tier_selfheal.into(),
         // Self-names in fixed order, mapping 1:1 to the settings language ids
         // zh-CN, zh-TW, en-US, ja-JP — identical for every language.
         lang_names: vec![

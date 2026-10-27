@@ -164,6 +164,35 @@ pub fn handle_notify_task_click(settings: &Arc<Mutex<ShellSettings>>) -> ShellSe
     updated
 }
 
+/// 模拟器控制 tier menu item ids, fixed order matching the label triple
+/// (readonly / manual / selfheal) in [`crate::menu_model::ShellMenuLabels`].
+const EMULATOR_TIER_ITEM_IDS: [&str; 3] = [
+    "settings-emu-tier-readonly",
+    "settings-emu-tier-manual",
+    "settings-emu-tier-selfheal",
+];
+
+/// Apply a `settings-emu-tier-*` click: set the shared `emulator_control`
+/// tier, persist it, and return the updated settings. Mirrors
+/// [`handle_auto_start_click`] (save AFTER the lock drops; failed save only
+/// warns — in-memory wins this session). Unknown ids are a no-op clone (the
+/// tier enum has no fourth value to fall through to).
+pub fn handle_emu_tier_click(settings: &Arc<Mutex<ShellSettings>>, id: &str) -> ShellSettings {
+    let suffix = id.strip_prefix("settings-emu-tier-").unwrap_or_default();
+    let Some(tier) = crate::shell_settings::ControlTier::from_id(suffix) else {
+        return settings.lock().unwrap().clone();
+    };
+    let updated = {
+        let mut guard = settings.lock().unwrap();
+        guard.emulator_control = tier;
+        guard.clone()
+    };
+    if let Err(e) = updated.save() {
+        warn!("failed to persist shell settings: {e}; emulator tier applies for this session only");
+    }
+    updated
+}
+
 /// Pure: the menu id of the language item that must render CHECKED for the
 /// given setting — None → `settings-lang-follow`, each known lang → its own
 /// id, an unknown lang → follow (defensive: an unlisted language cannot be
@@ -419,6 +448,8 @@ pub struct SettingsMenuHandles {
     notify_master: CheckMenuItem<Wry>,
     notify_death: CheckMenuItem<Wry>,
     notify_task: CheckMenuItem<Wry>,
+    emu_control: Submenu<Wry>,
+    emu_tier_items: Vec<CheckMenuItem<Wry>>,
 }
 
 impl SettingsMenuHandles {
@@ -455,6 +486,17 @@ impl SettingsMenuHandles {
             .set_checked(settings.notify_scheduler_death)?;
         self.notify_task.set_text(labels.notify_task.clone())?;
         self.notify_task.set_checked(settings.notify_task_complete)?;
+        self.emu_control.set_text(labels.emu_control.clone())?;
+        let tier_names = [
+            &labels.emu_tier_readonly,
+            &labels.emu_tier_manual,
+            &labels.emu_tier_selfheal,
+        ];
+        let checked_tier = format!("settings-emu-tier-{}", settings.emulator_control.as_str());
+        for (i, item) in self.emu_tier_items.iter().enumerate() {
+            item.set_text(tier_names[i].clone())?;
+            item.set_checked(EMULATOR_TIER_ITEM_IDS[i] == checked_tier)?;
+        }
         Ok(())
     }
 
@@ -485,17 +527,24 @@ pub fn build_settings_menu(
     };
 
     // Snapshot the settings ONCE (brief lock; no I/O held).
-    let (language, auto_start_backend, notify_enabled, notify_scheduler_death, notify_task_complete) =
-        {
-            let guard = settings.lock().unwrap();
-            (
-                guard.language.clone(),
-                guard.auto_start_backend,
-                guard.notify_enabled,
-                guard.notify_scheduler_death,
-                guard.notify_task_complete,
-            )
-        };
+    let (
+        language,
+        auto_start_backend,
+        notify_enabled,
+        notify_scheduler_death,
+        notify_task_complete,
+        emulator_control,
+    ) = {
+        let guard = settings.lock().unwrap();
+        (
+            guard.language.clone(),
+            guard.auto_start_backend,
+            guard.notify_enabled,
+            guard.notify_scheduler_death,
+            guard.notify_task_complete,
+            guard.emulator_control,
+        )
+    };
     let checked_id = checked_language_id(&language);
 
     // 语言 submenu: one CheckMenuItem per fixed language id + 跟随 ALAS.
@@ -589,6 +638,40 @@ pub fn build_settings_menu(
         None::<&str>,
     )?;
 
+    // 模拟器控制 submenu (direction-1): three tier items in fixed order —
+    // ids match ControlTier::as_str, so exactly one renders checked for any
+    // settings value (an unknown persisted tier falls back to manual and
+    // checks that item — serde default, not a fourth state).
+    let sep_after_notify = PredefinedMenuItem::separator(app)?;
+    let tier_names = [
+        labels.emu_tier_readonly.clone(),
+        labels.emu_tier_manual.clone(),
+        labels.emu_tier_selfheal.clone(),
+    ];
+    let checked_tier = format!("settings-emu-tier-{}", emulator_control.as_str());
+    let mut emu_tier_items = Vec::with_capacity(EMULATOR_TIER_ITEM_IDS.len());
+    for (i, id) in EMULATOR_TIER_ITEM_IDS.iter().enumerate() {
+        emu_tier_items.push(CheckMenuItem::with_id(
+            app,
+            *id,
+            tier_names[i].clone(),
+            true,
+            *id == checked_tier,
+            None::<&str>,
+        )?);
+    }
+    let emu_tier_refs: Vec<&dyn IsMenuItem<Wry>> = emu_tier_items
+        .iter()
+        .map(|i| i as &dyn IsMenuItem<Wry>)
+        .collect();
+    let emu_control_submenu = Submenu::with_id_and_items(
+        app,
+        "settings-emu-control",
+        labels.emu_control.clone(),
+        true,
+        &emu_tier_refs,
+    )?;
+
     let items: Vec<&dyn IsMenuItem<Wry>> = vec![
         &language_submenu,
         &sep_after_language,
@@ -601,6 +684,8 @@ pub fn build_settings_menu(
         &notify_master,
         &notify_death,
         &notify_task,
+        &sep_after_notify,
+        &emu_control_submenu,
     ];
     let settings_submenu = Submenu::with_id_and_items(
         app,
@@ -632,6 +717,8 @@ pub fn build_settings_menu(
         notify_master,
         notify_death,
         notify_task,
+        emu_control: emu_control_submenu,
+        emu_tier_items,
     })
 }
 

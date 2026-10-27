@@ -26,10 +26,15 @@ mod child_process;
 mod menu_model;
 #[cfg(target_os = "macos")]
 mod tray;
-// Pure shell-settings persistence (no tauri); macOS-only until the settings
-// menu (shell_menu.rs) lands — win/linux builds must not compile it.
-#[cfg(target_os = "macos")]
+// Pure shell-settings persistence (no tauri). Ungated: emulator control
+// (emulators.rs, cross-platform) reads the tier from here on every cycle, so
+// the settings file module must compile wherever the launcher does.
 mod shell_settings;
+// Android-emulator fleet control (direction-1): AVD inventory, liveness,
+// MaaEnd mutex, manual start/stop + the conditional self-heal poller.
+// Cross-platform compiles; ps-based detection and the SDK fallback paths are
+// unix/macOS-flavored, Windows probes degrade to adb-only status.
+mod emulators;
 // macOS app menu bar shell-settings submenu (builds the 外壳设置 menu from
 // ShellSettings + ShellMenuLabels); gated so win/linux builds stay untouched.
 #[cfg(target_os = "macos")]
@@ -180,7 +185,7 @@ fn main() -> Result<()> {
 
     info!("Starting Webview...");
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![save_as])
+        .invoke_handler(tauri::generate_handler![save_as, emu_list, emu_start, emu_stop])
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
@@ -364,6 +369,24 @@ fn main() -> Result<()> {
                             }
                         }
                     }
+                    id if id.starts_with("settings-emu-tier-") => {
+                        // Tier switch: set + persist, then relabel/re-check the
+                        // installed items in place (labels at click time — same
+                        // pattern as the notify toggles). The self-heal poller
+                        // re-reads the tier from the file within one cycle, so
+                        // no wake channel is needed for it.
+                        let updated =
+                            crate::shell_menu::handle_emu_tier_click(&menu_shell_settings, id);
+                        let labels = crate::menu_model::shell_menu_labels(
+                            &updated
+                                .resolved_language(crate::deploy_config::language().as_deref()),
+                        );
+                        if let Some(handles) = &menu_handles {
+                            if let Err(e) = handles.apply_labels(&labels, &updated) {
+                                warn!("settings menu emulator tier re-check failed: {e}");
+                            }
+                        }
+                    }
                     id if id.starts_with("settings-lang-") => {
                         // (a) Apply the click: mutate the shared language +
                         // persist (in-memory wins on save failure), returns
@@ -411,6 +434,11 @@ fn main() -> Result<()> {
                         info!("Received Ctrl-C, shutting down...");
                         handle1.exit(0);
                     }).expect("Error setting Ctrl-C handler");
+                    // Emulator self-heal poller (direction-1, selfheal tier):
+                    // independent of the backend operation permit — emulator
+                    // lifecycle ops never block backend start/update and vice
+                    // versa. Passive unless the tier is switched to selfheal.
+                    emulators::spawn_self_heal_poller();
                     let app_handle = app_handle.clone();
                     let backend = backend.clone();
                     // Reserve before dispatch, sharing the permit with menu
@@ -582,9 +610,27 @@ fn main() -> Result<()> {
         });
     Ok(())
 }
+// Direction-1 emulator panel surface. Reachable only from webviews hosted by
+// this launcher (the same no-manifest invoke path as save_as — the payload
+// webapp is loaded from the backend origin); a plain browser has no __TAURI__
+// bridge, so remote clients degrade to no panel by construction.
 #[tauri::command]
-fn save_as(app_handle: tauri::AppHandle, filename: &str, data: &str) {
-    match BASE64_STANDARD.decode(data) {
+fn emu_list() -> emulators::FleetStatus {
+    emulators::fleet_snapshot()
+}
+
+#[tauri::command]
+fn emu_start(name: String) -> Result<(), String> {
+    emulators::manual_start(&name)
+}
+
+#[tauri::command]
+fn emu_stop(name: String) -> Result<(), String> {
+    emulators::manual_stop(&name)
+}
+
+#[tauri::command]
+fn save_as(app_handle: tauri::AppHandle, filename: &str, data: &str) {    match BASE64_STANDARD.decode(data) {
         Ok(decoded_data) => app_handle
             .dialog()
             .file()
