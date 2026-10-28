@@ -16,12 +16,19 @@
   4. 关联记忆 [[guest-watchdog-soft-reboot-20261028]]（guest 僵死家族），对比签名。
 - **验收**：定位到一层（网络栈/客户端/宿主）并有数据支撑；若为环境问题给出规避（如保活脚本），不写代码修复。
 
-## P1-2 IslandOrder 需求计数 OCR 误读审计
+## P1-2 IslandOrder 需求计数 OCR 误读审计 ✅ 已结（2026-10-29 追认审计）
 
 - **现象**：`error/1793220305166` 截图显示订单要求胡萝卜 0/14（红字），`is_order_satisfied` 却判满足 → 进 submit_order → 游戏 toast「资源不够啦」拒绝（已兜底驳回）。
 - **对象**：`module/island/order.py` `REQUIREMENTS_COUNTER_OCR`（IslandReversedDigitCounter，红字 sub_letter 逻辑）。
-- **推进步骤**：用 `error/1793220305166` 等截图对 counter OCR 跑正负样本，确认误读模式（红 0/14 被读成什么）；修 OCR 解析或加「红字不足→直接判不满足」的颜色门。
-- **验收**：对全部当晚截图，扫描结果与人工判读一致。
+- **审计结论（原假设被证据推翻）**：counter OCR 从未误读红字。当晚 log 里 6 处红字行全部读对（(0,24,-24)/(0,9,-9)/(0,14,-14)/(0,17,-17)/(0,1,-1)/(0,3,-3)）；`bitwise_and(main, sub)` 在"黑=0"灰度编码下实为**并集**（0&x=0），红 0 与深灰 /14 合并成完整 0/14，实现本身正确。两张事故截图走真实 OCR 路径（PIL/RGB）复扫全部与人工判读一致。
+- **真凶（两起 ISLAND_ORDER_ACCEPT 连点崩溃 04:41:46→04:42:02、04:44:46→04:45:05）**：①运行实例当时还没有 toast→驳回逃生（a28d54c4a 04:48 才提交，事故在其前）——当晚已闭环；②**面板内容滞后渲染（P1-1 卡顿家族）**：04:41:46 扫描读到白菜/大豆/大米全满足、04:42:02 截图却是实用之木 0/9；04:44:46 读到大豆/鲜肉+空行、04:45:05 截图已是胡萝卜 0/14——扫描与提交之间面板被换过，OCR 忠实读的是残影。
+- **顺带修掉的结构隐患**：真实行被遮挡/滞后读成 (0,0,0) 时旧代码 `id is not None and counter is not None` 把它当「需求 0」收进 requirements → 判满足。
+- **已上线（payload d94e85ba9 + 86a9b2478，已 push 自建仓 + rsync bundle）**：
+  1. `scan_current_order_requirements` 返回 `OrderRequirementScan(requirements, readable, red_insufficient)`：counter 区有墨无数字 / 有数字无名 / 整板全空 → readable=False 绝不提交；execute_order 等 1s 复扫一次，仍不可读走不满足路径（赛季单不清 stuck id，防错误 replan）。
+  2. 红字颜色门：counter 区红像素 >30 → red_insufficient，无视数字直接不满足（即本条原建议方案，留作 OCR 退化保险）。
+  3. 空行判定用 **counter 区墨水量**（实测：真实行 87–374px、空行恰 0、红行 red 65 vs 非红 0，门限 30 两端成立）；名字区墨水被 toast 暗条污染（空行也能量出 476px）不可作判据。
+- **验收**：当晚全部带需求面板的截图（04:42:02、04:45:05；其余 error dir 经查看均非需求面板）新逻辑复扫 = NOT satisfied 与人工判读一致；全黑/全白合成图 fail-safe（readable=False）；ruff 零告警。工具：`dev_tools/audit_island_counter_ocr.py`（真实 cached_property 网格 + object.__new__ 跳过 init）。
+- **残余风险（挂 P1-1 名下观察）**：面板内容滞后 >1s 时复扫追不上，错误提交=被拒→toast 逃生驳回→10min 冷却，有界不崩溃；等 P1-1 网络栈定位后复查。
 
 ## P2-1 COMMISSION_DAILY 连点超限——复发再诊
 
