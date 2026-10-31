@@ -231,6 +231,13 @@ pub(crate) fn parse_emu_avd_name(output: &str) -> Option<String> {
 
 /// Run a command with a hard timeout; `None` = spawn failure or timeout
 /// (killed). Stdout only; stderr discarded — these are read-only probes.
+///
+/// Stdout is drained on a helper thread WHILE we wait. Reading only after
+/// `try_wait` reports exit deadlocks any child whose output outgrows the
+/// pipe buffer: it blocks on write, never exits, and every probe burns the
+/// full timeout. A 180KB `ps axww` (845 processes) did exactly that —
+/// 2×5s per fleet snapshot on the main thread = permanent beachball
+/// (2026-10-31 incident).
 fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
     let mut child = Command::new(program)
         .args(args)
@@ -239,24 +246,29 @@ fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<S
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            Err(_) => return None,
+    let stdout = child.stdout.take();
+    let reader = std::thread::spawn(move || {
+        let mut out = String::new();
+        if let Some(mut s) = stdout {
+            let _ = s.read_to_string(&mut out);
         }
+        out
+    });
+    let deadline = Instant::now() + timeout;
+    let completed = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break true,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Ok(None) | Err(_) => break false,
+        }
+    };
+    if !completed {
+        let _ = child.kill();
+        let _ = child.wait();
     }
-    let mut out = String::new();
-    if let Some(mut stdout) = child.stdout.take() {
-        let _ = stdout.read_to_string(&mut out);
-    }
-    Some(out)
+    // The kill above closed the pipe, so the reader always reaches EOF.
+    let out = reader.join().ok()?;
+    completed.then_some(out)
 }
 
 /// Android SDK root: ANDROID_HOME → ANDROID_SDK_ROOT → the macOS default.
@@ -323,14 +335,30 @@ fn ps_lines() -> Vec<String> {
 }
 
 /// Running qemu processes keyed by AVD name → optional console port.
+/// Callers needing BOTH this and MaaEnd presence must go through
+/// [`fleet_snapshot`]'s shared single `ps` pass instead (each pass is a
+/// process spawn; two per snapshot doubled the beachball window).
 fn running_qemus() -> BTreeMap<String, Option<u16>> {
+    #[cfg(unix)]
+    {
+        running_qemus_from(&ps_lines())
+    }
+    #[cfg(not(unix))]
+    {
+        BTreeMap::new()
+    }
+}
+
+/// Pure core of [`running_qemus`] over an existing `ps` pass.
+fn running_qemus_from(lines: &[String]) -> BTreeMap<String, Option<u16>> {
     let mut map = BTreeMap::new();
     #[cfg(unix)]
-    for line in ps_lines() {
-        if let Some((name, port)) = parse_qemu_line(&line) {
+    for line in lines {
+        if let Some((name, port)) = parse_qemu_line(line) {
             map.insert(name, port);
         }
     }
+    let _ = lines; // silence unused on Windows
     map
 }
 
@@ -338,10 +366,23 @@ fn running_qemus() -> BTreeMap<String, Option<u16>> {
 fn maaend_present() -> bool {
     #[cfg(unix)]
     {
-        ps_lines().iter().any(|l| is_maaend_line(l))
+        maaend_from(&ps_lines())
     }
     #[cfg(not(unix))]
     {
+        false
+    }
+}
+
+/// Pure core of [`maaend_present`] over an existing `ps` pass.
+fn maaend_from(lines: &[String]) -> bool {
+    #[cfg(unix)]
+    {
+        lines.iter().any(|l| is_maaend_line(l))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = lines;
         false
     }
 }
@@ -399,8 +440,14 @@ pub struct FleetStatus {
 /// settings FILE (fresh read — the menu persists every change immediately).
 pub fn fleet_snapshot() -> FleetStatus {
     let tier = current_tier();
-    let maaend = maaend_present();
-    let running = running_qemus();
+    // ONE ps pass feeds both MaaEnd detection and qemu liveness.
+    #[cfg(unix)]
+    let (maaend, running) = {
+        let lines = ps_lines();
+        (maaend_from(&lines), running_qemus_from(&lines))
+    };
+    #[cfg(not(unix))]
+    let (maaend, running) = (false, running_qemus());
     let serials = serials_by_avd();
     let avds = avd_inventory()
         .into_iter()

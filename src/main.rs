@@ -652,19 +652,30 @@ fn main() -> Result<()> {
 // this launcher (the same no-manifest invoke path as save_as — the payload
 // webapp is loaded from the backend origin); a plain browser has no __TAURI__
 // bridge, so remote clients degrade to no panel by construction.
+// Emulator commands MUST stay async: on macOS a sync command executes
+// inline inside the WKURLSchemeHandler on the MAIN thread, so the ps/adb
+// probe chain behind fleet_snapshot used to freeze the whole app on every
+// 5s emu_list poll (2026-10-31 beachball: 2×5s ps-probe timeouts per
+// snapshot, poll interval 5s). spawn_blocking keeps probes on the pool.
 #[tauri::command]
-fn emu_list() -> emulators::FleetStatus {
-    emulators::fleet_snapshot()
+async fn emu_list() -> Result<emulators::FleetStatus, String> {
+    tauri::async_runtime::spawn_blocking(emulators::fleet_snapshot)
+        .await
+        .map_err(|e| format!("task-join-failed: {e}"))
 }
 
 #[tauri::command]
-fn emu_start(name: String) -> Result<(), String> {
-    emulators::manual_start(&name)
+async fn emu_start(name: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || emulators::manual_start(&name))
+        .await
+        .map_err(|e| format!("task-join-failed: {e}"))?
 }
 
 #[tauri::command]
-fn emu_stop(name: String) -> Result<(), String> {
-    emulators::manual_stop(&name)
+async fn emu_stop(name: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || emulators::manual_stop(&name))
+        .await
+        .map_err(|e| format!("task-join-failed: {e}"))?
 }
 
 /// Cleanup policy DTO for the webapp 外壳设置区 (invoke-only, same family as
