@@ -93,6 +93,12 @@ if [[ "$MODE" == "update" ]]; then
   fi
   install -m 0755 "$BIN" "$APP/Contents/MacOS/alas-launcher"
   rsync -a --delete "$DIST/" "$APP/Contents/AzurLaneAutoScript/webapp/dist/"
+  # The icns is shell-owned (payload fetch can never ship it) — sync it too,
+  # otherwise icon fixes land only on --full rebuilds (2026-10-31 dock fix).
+  if ! cmp -s "$LAUNCHER_ROOT/icons/icon.icns" "$APP/Contents/Resources/icon.icns"; then
+    install -m 0644 "$LAUNCHER_ROOT/icons/icon.icns" "$APP/Contents/Resources/icon.icns"
+    log "icon.icns updated in bundle"
+  fi
   log "updated. verify with:"
   echo "  md5 -q \"$BIN\" vs $(md5_of "$APP/Contents/MacOS/alas-launcher")"
   echo "  ls \"$APP/Contents/AzurLaneAutoScript/webapp/dist/\""
@@ -109,6 +115,7 @@ else
 <plist version="1.0">
 <dict>
     <key>CFBundleExecutable</key><string>alas-launcher</string>
+    <key>CFBundleIconFile</key><string>icon</string>
     <key>CFBundleIdentifier</key><string>moe.taiho.alas-launcher</string>
     <key>CFBundleName</key><string>AzurLaneAutoScript</string>
     <key>CFBundleDisplayName</key><string>AzurLaneAutoScript</string>
