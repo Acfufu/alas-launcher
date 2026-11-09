@@ -99,6 +99,18 @@ if [[ "$MODE" == "update" ]]; then
     install -m 0644 "$LAUNCHER_ROOT/icons/icon.icns" "$APP/Contents/Resources/icon.icns"
     log "icon.icns updated in bundle"
   fi
+  # The icns alone is NOT the whole icon story: Tauri embeds tauri.conf.json
+  # icons into the BINARY at build time and setApplicationIconImage's them at
+  # runtime, overriding the bundle icns in the Dock. 2026-11-09: binary built
+  # 12:17 with pre-fix icons, icns cp'd 13:25 after the squircle fix — the
+  # running Dock kept the old full-bleed art for 9 days (Finder/recents showed
+  # the new one, hence "icon looks different before/after quit").
+  if [[ "$LAUNCHER_ROOT/icons/icon.icns" -nt "$BIN" ]]; then
+    log "WARNING: icons/icon.icns is newer than the built binary."
+    log "         If cargo did not rebuild (icons are build-time inputs), the"
+    log "         binary still embeds the OLD icon — force a rebuild:"
+    log "         touch build.rs && cargo build --release"
+  fi
   log "updated. verify with:"
   echo "  md5 -q \"$BIN\" vs $(md5_of "$APP/Contents/MacOS/alas-launcher")"
   echo "  ls \"$APP/Contents/AzurLaneAutoScript/webapp/dist/\""
