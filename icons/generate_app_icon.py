@@ -30,6 +30,10 @@ ICNS = os.path.join(HERE, "icon.icns")
 
 PLATE = 824            # Apple grid: 824/1024
 RADIUS_RATIO = 0.225   # squircle corner radius / plate
+ART_RATIO = 0.70       # artwork width / plate — inset so it never reads full-bleed
+                       # (2026-11-09: cover-to-plate made hair touch all four edges,
+                       #  indistinguishable from the original bleed at Dock size)
+ART_RADIUS_RATIO = 0.12  # art card corner radius / art size
 GRAD_TOP = (52, 52, 58)
 GRAD_BOTTOM = (26, 26, 30)
 SHADOW_OFFSET = 18
@@ -41,7 +45,11 @@ ICO_SIZES = [(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256,
 
 
 def extract_master(path=ICNS):
-    """Largest PNG layer inside an .icns (ic10/ic14 = 1024)."""
+    """Largest PNG layer inside an .icns (ic10/ic14 = 1024).
+
+    Crops to the near-opaque bbox so re-harvesting an already-composed icon
+    (plate + margins + shadow) yields just the artwork, keeping compose()
+    idempotent across regeneration rounds."""
     data = open(path, "rb").read()
     assert data[:4] == b"icns", f"{path}: not an icns"
     off, best = 8, None
@@ -55,7 +63,12 @@ def extract_master(path=ICNS):
     tag, n, o = best
     png = data[o + 8:o + n]
     open("/tmp/_app_icon_master.png", "wb").write(png)
-    return Image.open("/tmp/_app_icon_master.png").convert("RGBA")
+    art = Image.open("/tmp/_app_icon_master.png").convert("RGBA")
+    solid = art.getchannel("A").point(lambda a: 255 if a > 200 else 0)
+    bbox = solid.getbbox()
+    if bbox and (bbox[2] - bbox[0]) < art.width * 0.98:
+        art = art.crop(bbox)
+    return art
 
 
 def squircle_mask(size):
@@ -74,8 +87,15 @@ def compose(art):
         gd.line([(0, y), (PLATE, y)],
                 fill=tuple(int(GRAD_TOP[i] + (GRAD_BOTTOM[i] - GRAD_TOP[i]) * t)
                            for i in range(3)) + (255,))
-    cover = art.resize((PLATE, PLATE), Image.LANCZOS)
-    composed = Image.composite(cover, grad, squircle_mask(PLATE))
+    # artwork inset as a rounded card on the plate (never edge-to-edge)
+    side = int(PLATE * ART_RATIO)
+    cover = art.resize((side, side), Image.LANCZOS)
+    card = Image.new("L", (side, side), 0)
+    ImageDraw.Draw(card).rounded_rectangle(
+        [0, 0, side - 1, side - 1], radius=int(side * ART_RADIUS_RATIO), fill=255)
+    plate = grad.copy()
+    plate.paste(cover, ((PLATE - side) // 2, (PLATE - side) // 2), card)
+    composed = Image.composite(plate, grad, squircle_mask(PLATE))
     off = (1024 - PLATE) // 2
     shadow = Image.new("RGBA", (1024, 1024), (0, 0, 0, 0))
     shadow.paste((0, 0, 0, SHADOW_ALPHA),
