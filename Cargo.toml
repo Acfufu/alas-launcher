@@ -13,7 +13,15 @@ tauri-build = { version = "2", features = [] }
 # icon_assets.rs compiles ungated and its tests decode PNGs via
 # tauri::image::Image::from_bytes, which is feature-gated — without this,
 # `cargo test` fails to compile on win/linux (R3 审计 A2).
-tauri = { version = "2", features = ["devtools", "webview-data-url", "image-png"] }
+# custom-protocol flips tauri out of "dev" mode even for plain `cargo build`
+# (tauri build.rs: dev = !custom-protocol). Without it, codegen embeds
+# app_icon (icons/icon.icns) and tauri's Ready hook setApplicationIconImage's
+# it at runtime — macOS renders that injected NSImage raw/scale-to-fill with
+# NO legacy plate, so the Dock showed a full-bleed blob while Finder/pinned
+# (bundle icns file pipeline) showed the correct plated icon. With the
+# feature on, app_icon = None and the bundle icns governs the Dock in every
+# state (2026-11-09 dock icon incident, third root cause).
+tauri = { version = "2", features = ["devtools", "webview-data-url", "image-png", "custom-protocol"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
