@@ -102,11 +102,14 @@ if [[ "$MODE" == "update" ]]; then
   # Dock icon pipeline (2026-11-09 final): the tauri dep carries the
   # custom-protocol feature, so the binary neither embeds app_icon nor calls
   # setApplicationIconImage at Ready — the bundle Resources/icon.icns governs
-  # the Dock in every state (running and pinned), and macOS applies its
-  # legacy-icon plate to it as long as the artwork keeps transparent margins
-  # (opaque content must stay inside the Apple grid, <=824/1024). Rebuilding
-  # the binary is NOT required for icon changes; this cp + an app restart is
-  # the whole deployment.
+  # the Dock in every state (running and pinned) via the AppKit default-icon
+  # file pipeline, which applies macOS 27's legacy plate (plate + one inset
+  # to ~70%). Ship the artwork square FULL-CANVAS (upstream icon.icns as-is):
+  # the plate does the only inset. Do NOT pre-inset the content (Apple-grid
+  # 824/1024 double-insets to ~56% = "too small" user report), and do NOT
+  # re-enable runtime injection (it renders raw with no plate = full-bleed
+  # blob). Rebuilding the binary is NOT required for icon changes; this cp +
+  # an app restart is the whole deployment.
   install -m 0644 "$LAUNCHER_ROOT/icons/icon.icns" "$APP/Contents/Resources/icon.icns"
   log "updated. verify with:"
   echo "  md5 -q \"$BIN\" vs $(md5_of "$APP/Contents/MacOS/alas-launcher")"
